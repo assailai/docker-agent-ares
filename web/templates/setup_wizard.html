@@ -64,15 +64,24 @@
         {% elif step == 3 %}
         <!-- Step 3: Internal Networks -->
         <h2>Internal Networks</h2>
-        <p>Enter the internal networks you want Ares to scan (CIDR notation).</p>
-        <p class="hint">These are the networks that are reachable from this agent.</p>
+        <p>Enter the internal network blocks you want Ares to scan for APIs (CIDR notation).</p>
+        <p class="hint">These are the network subnets reachable from this agent that will be used for API hunting.</p>
+
+        <div class="info-box">
+            <p><strong>Important:</strong> Enter network blocks only, not individual IP addresses.</p>
+            <ul>
+                <li>Use subnet notation like /24, /16, or /8 (e.g., 192.168.1.0/24)</li>
+                <li>Single IP addresses (/32) are not allowed for API hunts</li>
+                <li>For scanning a single target, use the Pentest feature in the Ares dashboard instead</li>
+            </ul>
+        </div>
 
         <form method="POST" action="/setup/step3">
             <div class="form-group">
-                <label for="internal_networks">Networks (one per line)</label>
+                <label for="internal_networks">Network Blocks (one per line)</label>
                 <textarea id="internal_networks" name="internal_networks" rows="5"
                           placeholder="10.0.0.0/8&#10;192.168.1.0/24&#10;172.16.0.0/12" required>{{ saved_networks }}</textarea>
-                <small>Example: 10.0.0.0/8, 192.168.1.0/24</small>
+                <small>Examples: 10.0.0.0/8, 192.168.1.0/24, 172.16.0.0/12</small>
             </div>
 
             <div class="btn-group">

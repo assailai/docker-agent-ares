@@ -127,7 +127,22 @@ async def setup_step3(request: Request, internal_networks: str = Form(...)):
 
         try:
             # Validate CIDR notation
-            ipaddress.ip_network(network, strict=False)
+            parsed_network = ipaddress.ip_network(network, strict=False)
+
+            # Reject single-IP CIDRs (/32 for IPv4, /128 for IPv6)
+            # API hunts are designed for network blocks, not individual IPs
+            # For single target scanning, use the dashboard pentest feature instead
+            if parsed_network.version == 4 and parsed_network.prefixlen == 32:
+                return RedirectResponse(
+                    url=f"/setup?step=3&error=Single+IP+addresses+(/32)+are+not+allowed.+API+hunts+require+network+blocks+(e.g.,+/24,+/16).+For+single+targets,+use+the+dashboard+pentest+feature.",
+                    status_code=302
+                )
+            if parsed_network.version == 6 and parsed_network.prefixlen == 128:
+                return RedirectResponse(
+                    url=f"/setup?step=3&error=Single+IP+addresses+(/128)+are+not+allowed.+API+hunts+require+network+blocks.+For+single+targets,+use+the+dashboard+pentest+feature.",
+                    status_code=302
+                )
+
             networks.append(network)
         except ValueError:
             return RedirectResponse(
