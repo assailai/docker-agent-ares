@@ -60,7 +60,8 @@ async def poll_wake_signals():
             wake_url = f"{base_url}/api/v1/agent/wake-signal"
 
             try:
-                async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+                # SECURITY: Use proper TLS verification for platform communication
+                async with httpx.AsyncClient(verify=True, timeout=10.0) as client:
                     response = await client.get(
                         wake_url,
                         headers={"Authorization": f"Bearer {auth_token}"}

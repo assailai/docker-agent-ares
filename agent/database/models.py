@@ -159,11 +159,24 @@ def get_session():
 
 # Configuration helper functions
 def get_config(key: str, default: Optional[str] = None) -> Optional[str]:
-    """Get configuration value by key"""
+    """
+    Get configuration value by key.
+    Automatically decrypts values that were stored with encrypted=True.
+    """
     session = get_session()
     try:
         config = session.query(AgentConfig).filter(AgentConfig.key == key).first()
         if config:
+            if config.encrypted and config.value:
+                # Decrypt the value using the encryption module
+                try:
+                    from agent.security.encryption import decrypt_value
+                    return decrypt_value(config.value, context=key)
+                except Exception as e:
+                    # If decryption fails, log and return None for security
+                    import logging
+                    logging.getLogger(__name__).error(f"Failed to decrypt config {key}: {e}")
+                    return None
             return config.value
         return default
     finally:
@@ -171,16 +184,31 @@ def get_config(key: str, default: Optional[str] = None) -> Optional[str]:
 
 
 def set_config(key: str, value: str, encrypted: bool = False):
-    """Set configuration value"""
+    """
+    Set configuration value.
+    If encrypted=True, the value will be encrypted before storage.
+    """
     session = get_session()
     try:
+        # Encrypt value if requested
+        store_value = value
+        if encrypted and value:
+            try:
+                from agent.security.encryption import encrypt_value
+                store_value = encrypt_value(value, context=key)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).error(f"Failed to encrypt config {key}: {e}")
+                # Don't store sensitive data unencrypted - raise error
+                raise ValueError(f"Failed to encrypt sensitive value for {key}") from e
+
         config = session.query(AgentConfig).filter(AgentConfig.key == key).first()
         if config:
-            config.value = value
+            config.value = store_value
             config.encrypted = encrypted
             config.updated_at = datetime.utcnow()
         else:
-            config = AgentConfig(key=key, value=value, encrypted=encrypted)
+            config = AgentConfig(key=key, value=store_value, encrypted=encrypted)
             session.add(config)
         session.commit()
     finally:

@@ -94,7 +94,8 @@ def initialize_agent():
         create_admin_user(password_hash, must_change_password=True)
 
         # Store initial password for display (will be cleared after first login)
-        set_config(AgentConfig.INITIAL_PASSWORD, initial_password)
+        # SECURITY: Store encrypted - will be auto-decrypted when retrieved
+        set_config(AgentConfig.INITIAL_PASSWORD, initial_password, encrypted=True)
 
         return initial_password
 
