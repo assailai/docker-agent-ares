@@ -13,7 +13,8 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
 from agent.config import settings
-from agent.database.models import init_database, is_setup_completed
+from agent.database.models import init_database, is_setup_completed, get_config, AgentConfig
+from agent.registration.client import is_registered
 from agent.security.tls import ensure_tls_cert
 from agent.security.session import generate_secret_key, validate_session, get_admin_user
 from agent.health.checker import get_health_status
@@ -37,7 +38,6 @@ async def poll_wake_signals():
     """
     import httpx
     import asyncio
-    from agent.database.models import get_config, AgentConfig
     from agent.wireguard.manager import get_manager
 
     logger.info("🔔 Wake signal polling started")
@@ -47,16 +47,16 @@ async def poll_wake_signals():
             await asyncio.sleep(60)  # Poll every 60 seconds
 
             # Check if we're registered
-            gateway_url = get_config(AgentConfig.GATEWAY_URL)
-            auth_token = get_config(AgentConfig.AUTH_TOKEN)
+            platform_url = get_config(AgentConfig.PLATFORM_URL)
+            auth_token = get_config(AgentConfig.JWT_TOKEN)
 
-            if not gateway_url or not auth_token:
+            if not platform_url or not auth_token:
                 logger.debug("Agent not registered, skipping wake signal poll")
                 continue
 
             # Build the wake signal URL
-            # Gateway URL is like "https://ares.assailai.com"
-            base_url = gateway_url.rstrip('/')
+            # Platform URL is like "https://ares.assailai.com"
+            base_url = platform_url.rstrip('/')
             wake_url = f"{base_url}/api/v1/agent/wake-signal"
 
             try:
@@ -105,6 +105,22 @@ async def lifespan(app: FastAPI):
     settings.ensure_directories()
     init_database()
     ensure_tls_cert()
+
+    # Auto-start WireGuard if setup is completed and agent is registered
+    if is_setup_completed() and is_registered():
+        logger.info("🔗 Setup completed and agent registered - auto-starting WireGuard tunnel...")
+        try:
+            from agent.wireguard.manager import get_manager
+            manager = get_manager()
+            tunnel_started = await manager.start()
+            if tunnel_started:
+                logger.info("✅ WireGuard tunnel auto-started successfully")
+            else:
+                logger.warning("⚠️ WireGuard tunnel auto-start failed - manual restart may be required")
+        except Exception as e:
+            logger.error(f"❌ WireGuard auto-start error: {e}")
+    else:
+        logger.info("ℹ️ Setup not completed or not registered - skipping WireGuard auto-start")
 
     # Start wake signal polling in background
     _wake_signal_task = asyncio.create_task(poll_wake_signals())
