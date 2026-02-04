@@ -166,3 +166,32 @@ async def proxy_request(request: Request, proxy_req: ProxyRequest):
 async def proxy_health():
     """Health check for proxy endpoint"""
     return {"status": "healthy", "service": "proxy"}
+
+
+@router.post("/wake")
+async def wake_tunnel(request: Request):
+    """
+    Wake up the WireGuard tunnel before hunt operations.
+
+    This endpoint is called by Ares before starting hunt operations
+    to ensure the tunnel is active and reachable.
+    """
+    client_ip = _get_client_ip(request)
+
+    # Security: Only allow requests from overlay network
+    if not _is_from_overlay_network(client_ip):
+        logger.warning(f"Wake request from non-overlay IP: {client_ip}")
+        raise HTTPException(status_code=403, detail="Access denied: request must come from overlay network")
+
+    logger.info(f"Tunnel wake request from {client_ip}")
+
+    try:
+        from agent.wireguard.manager import get_manager
+        manager = get_manager()
+        result = await manager.wake_tunnel()
+
+        logger.info(f"Tunnel wake result: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"Wake tunnel error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to wake tunnel: {str(e)}")

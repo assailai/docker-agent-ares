@@ -455,6 +455,53 @@ class WireGuardManager:
         await asyncio.sleep(1)
         return await self.start()
 
+    async def wake_tunnel(self) -> Dict[str, Any]:
+        """
+        Wake up the tunnel by sending traffic to the gateway.
+        This is useful before hunt operations to ensure the tunnel is active.
+        Returns status dict with success and details.
+        """
+        result = {
+            "success": False,
+            "tunnel_running": self.is_running(),
+            "ping_successful": False,
+            "handshake_active": False,
+            "message": ""
+        }
+
+        if not self.is_running():
+            # Try to start the tunnel
+            logger.info("Tunnel not running, attempting to start...")
+            started = await self.start()
+            if not started:
+                result["message"] = "Failed to start tunnel"
+                return result
+            result["tunnel_running"] = True
+            # Wait a moment for interface to be ready
+            await asyncio.sleep(2)
+
+        # Send multiple pings to ensure handshake is established
+        ping_success = False
+        for attempt in range(3):
+            if await self._ping_gateway():
+                ping_success = True
+                break
+            await asyncio.sleep(1)
+
+        result["ping_successful"] = ping_success
+
+        # Check tunnel status after pinging
+        status = self.get_status()
+        result["handshake_active"] = status.get("last_handshake") not in [None, "none"]
+
+        if ping_success:
+            result["success"] = True
+            result["message"] = "Tunnel is active and gateway is reachable"
+        else:
+            result["message"] = "Tunnel is up but gateway ping failed"
+
+        return result
+
     def is_running(self) -> bool:
         """Check if tunnel is currently running"""
         if not self._running:
@@ -523,11 +570,39 @@ class WireGuardManager:
 
         return status
 
+    async def _ping_gateway(self) -> bool:
+        """
+        Ping the gateway overlay IP to keep the WireGuard tunnel warm.
+        This ensures NAT mappings stay active and triggers handshakes.
+        Returns True if ping succeeds.
+        """
+        gateway_ip = "10.200.0.1"  # Gateway's overlay IP
+        try:
+            result = subprocess.run(
+                ["ping", "-c", "1", "-W", "5", gateway_ip],
+                capture_output=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                logger.debug(f"Gateway ping successful ({gateway_ip})")
+                return True
+            else:
+                logger.warning(f"Gateway ping failed ({gateway_ip}): no response")
+                return False
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Gateway ping timed out ({gateway_ip})")
+            return False
+        except Exception as e:
+            logger.warning(f"Gateway ping error: {e}")
+            return False
+
     async def _monitor_loop(self):
         """Background task to monitor tunnel health and auto-recover"""
         consecutive_failures = 0
         max_auto_recovery_attempts = 3
         auto_recovery_cooldown = 60  # seconds between recovery attempts
+        ping_interval = 30  # Ping gateway every 30 seconds to keep tunnel warm
+        last_ping_time = 0
 
         while self._running:
             try:
@@ -539,6 +614,13 @@ class WireGuardManager:
                     bytes_received=status.get("bytes_received", 0),
                     error=status.get("error")
                 )
+
+                # Proactively ping gateway to keep tunnel warm
+                import time
+                current_time = time.time()
+                if status["connected"] and (current_time - last_ping_time) >= ping_interval:
+                    asyncio.create_task(self._ping_gateway())
+                    last_ping_time = current_time
 
                 # Check tunnel health
                 if status["connected"]:
