@@ -26,20 +26,103 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Background task for wake signal polling
+_wake_signal_task = None
+
+
+async def poll_wake_signals():
+    """
+    Background task that polls for wake signals from Ares.
+    If a wake signal is received, refreshes the WireGuard tunnel.
+    """
+    import httpx
+    import asyncio
+    from agent.database.models import get_config, AgentConfig
+    from agent.wireguard.manager import get_manager
+
+    logger.info("🔔 Wake signal polling started")
+
+    while True:
+        try:
+            await asyncio.sleep(60)  # Poll every 60 seconds
+
+            # Check if we're registered
+            gateway_url = get_config(AgentConfig.GATEWAY_URL)
+            auth_token = get_config(AgentConfig.AUTH_TOKEN)
+
+            if not gateway_url or not auth_token:
+                logger.debug("Agent not registered, skipping wake signal poll")
+                continue
+
+            # Build the wake signal URL
+            # Gateway URL is like "https://ares.assailai.com"
+            base_url = gateway_url.rstrip('/')
+            wake_url = f"{base_url}/api/v1/agent/wake-signal"
+
+            try:
+                async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+                    response = await client.get(
+                        wake_url,
+                        headers={"Authorization": f"Bearer {auth_token}"}
+                    )
+
+                    if response.status_code == 200:
+                        data = response.json()
+                        if data.get("wake_requested"):
+                            logger.info("🔔 Received wake signal! Refreshing WireGuard tunnel...")
+                            manager = get_manager()
+                            result = await manager.wake_tunnel()
+                            logger.info(f"🔔 Tunnel wake result: {result}")
+                    elif response.status_code == 401:
+                        logger.warning("Wake signal poll: auth token invalid or expired")
+                    else:
+                        logger.debug(f"Wake signal poll: {response.status_code}")
+
+            except httpx.TimeoutException:
+                logger.debug("Wake signal poll: timeout (server may be unavailable)")
+            except httpx.ConnectError:
+                logger.debug("Wake signal poll: connection failed")
+            except Exception as e:
+                logger.debug(f"Wake signal poll error: {e}")
+
+        except asyncio.CancelledError:
+            logger.info("Wake signal polling stopped")
+            break
+        except Exception as e:
+            logger.error(f"Wake signal poll loop error: {e}")
+            await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events"""
+    global _wake_signal_task
+    import asyncio
+
     # Startup
     logger.info("Starting Ares Docker Agent...")
     settings.ensure_directories()
     init_database()
     ensure_tls_cert()
+
+    # Start wake signal polling in background
+    _wake_signal_task = asyncio.create_task(poll_wake_signals())
+
     logger.info("Ares Docker Agent started successfully")
 
     yield
 
     # Shutdown
     logger.info("Shutting down Ares Docker Agent...")
+
+    # Stop wake signal polling
+    if _wake_signal_task:
+        _wake_signal_task.cancel()
+        try:
+            await _wake_signal_task
+        except asyncio.CancelledError:
+            pass
+
     # Stop WireGuard if running
     from agent.wireguard.manager import get_manager
     manager = get_manager()
