@@ -106,6 +106,32 @@ You'll see output like:
 3. Log in with the initial password from the logs
 4. Complete the setup wizard
 
+## Upgrading
+
+To upgrade an existing agent to the latest version while preserving your configuration:
+
+```bash
+# Stop and remove current container
+docker stop ares-agent && docker rm ares-agent
+
+# Pull latest image
+docker pull assailai/ares-agent:latest
+
+# Start upgraded agent (with all required flags)
+docker run -d --name ares-agent \
+  --user root \
+  --cap-add=NET_ADMIN \
+  --device /dev/net/tun:/dev/net/tun \
+  --sysctl net.ipv4.ip_forward=1 \
+  -e ARES_RUN_AS_ROOT=true \
+  -p 8443:8443 \
+  -v ares-agent-data:/data \
+  --restart unless-stopped \
+  assailai/ares-agent:latest
+```
+
+Your registration, WireGuard keys, and settings are stored in the `ares-agent-data` volume and will be preserved across upgrades.
+
 ## Requirements
 
 | Requirement | Details |
