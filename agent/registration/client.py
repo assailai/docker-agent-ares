@@ -120,7 +120,10 @@ async def register_with_platform(
             set_config(AgentConfig.OVERLAY_IP, result.overlay_ip)
             set_config(AgentConfig.GATEWAY_PUBLIC_KEY, result.gateway_public_key)
             set_config(AgentConfig.GATEWAY_ENDPOINT, result.gateway_endpoint)
-            set_config(AgentConfig.JWT_TOKEN, result.jwt_token, encrypted=True)
+            # Store jwt_token unencrypted - it's already a cryptographically secure random token
+            # Encrypting it adds complexity without security benefit and causes issues on reinstall
+            # when the encryption key changes
+            set_config(AgentConfig.JWT_TOKEN, result.jwt_token, encrypted=False)
             set_config_json(AgentConfig.INTERNAL_NETWORKS, internal_networks)
             if agent_name:
                 set_config(AgentConfig.AGENT_NAME, agent_name)
