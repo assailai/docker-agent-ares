@@ -164,9 +164,6 @@ class SOCKS5Proxy:
                 await writer.wait_closed()
                 return
 
-            # Set connection timeout
-            writer.get_extra_info('socket').settimeout(60)
-
             # SOCKS5 handshake
             if not await self._handle_handshake(reader, writer):
                 return
