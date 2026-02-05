@@ -115,6 +115,18 @@ async def lifespan(app: FastAPI):
             tunnel_started = await manager.start()
             if tunnel_started:
                 logger.info("✅ WireGuard tunnel auto-started successfully")
+
+                # Start SOCKS5 proxy for internal network access
+                try:
+                    from agent.socks5_proxy import get_proxy
+                    proxy = get_proxy()
+                    proxy_started = await proxy.start()
+                    if proxy_started:
+                        logger.info("✅ SOCKS5 proxy started for internal network access")
+                    else:
+                        logger.warning("⚠️ SOCKS5 proxy failed to start - internal scanning may not work")
+                except Exception as proxy_err:
+                    logger.error(f"❌ SOCKS5 proxy error: {proxy_err}")
             else:
                 logger.warning("⚠️ WireGuard tunnel auto-start failed - manual restart may be required")
         except Exception as e:
@@ -139,6 +151,16 @@ async def lifespan(app: FastAPI):
             await _wake_signal_task
         except asyncio.CancelledError:
             pass
+
+    # Stop SOCKS5 proxy if running
+    try:
+        from agent.socks5_proxy import get_proxy
+        proxy = get_proxy()
+        if proxy.is_running():
+            await proxy.stop()
+            logger.info("✅ SOCKS5 proxy stopped")
+    except Exception as e:
+        logger.warning(f"SOCKS5 proxy stop error: {e}")
 
     # Stop WireGuard if running
     from agent.wireguard.manager import get_manager
