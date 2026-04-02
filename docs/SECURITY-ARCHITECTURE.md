@@ -39,9 +39,9 @@ Customer A Network          Customer B Network
 
 ## Concurrent operation limits
 
-There aren't any enforced right now.
+The HTTP proxy enforces `MAX_REQUESTS_PER_MINUTE = 1000` via `_check_rate_limit()` in `proxy_request()`. Requests beyond the limit get a 429 response.
 
-The SOCKS5 proxy tracks `_active_connections` but never caps it. The HTTP proxy defines `MAX_REQUESTS_PER_MINUTE = 1000` and has `_request_counts` / `_last_reset` variables ready to go, but the check is never called in `proxy_request()`. Both should be wired up.
+The SOCKS5 proxy enforces `MAX_SOCKS5_CONNECTIONS = 200`. New connections are rejected when at capacity.
 
 All traffic goes through a single WireGuard tunnel per agent.
 
