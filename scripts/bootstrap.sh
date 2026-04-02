@@ -144,7 +144,7 @@ pull_image() {
     step "Pulling Ares Agent image"
     info "Image: $IMAGE"
 
-    if ! docker pull "$IMAGE"; then
+    if ! docker pull --platform linux/amd64 "$IMAGE"; then
         error "Failed to pull image. Check your internet connection and try again."
         error "Alternative registry: ghcr.io/assailai/ares-agent:latest"
         exit 1
@@ -157,6 +157,7 @@ start_container() {
     step "Starting Ares Agent"
 
     if ! docker run -d --name "$CONTAINER_NAME" \
+        --platform linux/amd64 \
         --user root \
         --cap-add=NET_ADMIN \
         --device /dev/net/tun:/dev/net/tun \

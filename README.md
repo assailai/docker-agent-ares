@@ -65,6 +65,7 @@ Works on macOS, Linux, and Windows (Git Bash / WSL).
 
 ```bash
 docker run -d --name ares-agent \
+  --platform linux/amd64 \
   --user root \
   --cap-add=NET_ADMIN \
   --device /dev/net/tun:/dev/net/tun \
@@ -213,6 +214,7 @@ spec:
 | Requirement | Docker Flag | Why |
 |-------------|-------------|-----|
 | Docker 20.10+ | — | Minimum supported version |
+| Platform | `--platform linux/amd64` | Image is built for amd64 only |
 | Root user | `--user root` | WireGuard needs root to create network interfaces |
 | NET_ADMIN | `--cap-add=NET_ADMIN` | Required for network interface management |
 | TUN device | `--device /dev/net/tun:/dev/net/tun` | WireGuard userspace implementation |
@@ -314,6 +316,7 @@ docker pull assailai/ares-agent:latest
 
 # Start with the same docker run command from Getting Started
 docker run -d --name ares-agent \
+  --platform linux/amd64 \
   --user root \
   --cap-add=NET_ADMIN \
   --device /dev/net/tun:/dev/net/tun \

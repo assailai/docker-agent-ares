@@ -42,6 +42,9 @@ SOCKS5_REP_CONN_REFUSED = 0x05
 
 SOCKS5_PROXY_PORT = 1080
 
+# max concurrent SOCKS5 connections before rejecting new ones
+MAX_SOCKS5_CONNECTIONS = 200
+
 
 class SOCKS5Proxy:
     """
@@ -149,11 +152,16 @@ class SOCKS5Proxy:
         writer: asyncio.StreamWriter
     ):
         """Handle a new SOCKS5 client connection."""
+        if self._active_connections >= MAX_SOCKS5_CONNECTIONS:
+            logger.warning(f"[SOCKS5] Connection limit reached ({MAX_SOCKS5_CONNECTIONS}), rejecting")
+            writer.close()
+            await writer.wait_closed()
+            return
+
         self._active_connections += 1
         client_addr = writer.get_extra_info('peername')
 
         try:
-            # SECURITY CHECK 1: Validate source IP is from gateway network
             client_ip = ipaddress.ip_address(client_addr[0])
             if client_ip not in self._gateway_network:
                 logger.warning(
@@ -298,11 +306,11 @@ class SOCKS5Proxy:
             port_data = await asyncio.wait_for(reader.readexactly(2), timeout=10.0)
             target_port = struct.unpack('!H', port_data)[0]
 
-            # SECURITY CHECK 2: Validate destination is in allowed internal networks
+            # resolve domain names to IPs so we validate and connect to the same address
+            # (prevents DNS rebinding between validation and connection)
             try:
                 target_ip = ipaddress.ip_address(target_host)
             except ValueError:
-                # It's a domain name - resolve it
                 try:
                     info = await asyncio.wait_for(
                         asyncio.get_event_loop().getaddrinfo(
@@ -315,20 +323,16 @@ class SOCKS5Proxy:
                         logger.warning(f"[SOCKS5] Failed to resolve {target_host}")
                         await self._send_reply(writer, SOCKS5_REP_HOST_UNREACH)
                         return None, None
-                    target_ip = ipaddress.ip_address(info[0][4][0])
+                    resolved_ip = info[0][4][0]
+                    target_ip = ipaddress.ip_address(resolved_ip)
+                    # pin to resolved IP for the actual connection
+                    target_host = resolved_ip
                 except Exception as e:
                     logger.warning(f"[SOCKS5] DNS resolution failed for {target_host}: {e}")
                     await self._send_reply(writer, SOCKS5_REP_HOST_UNREACH)
                     return None, None
 
-            # Check if target IP is in any allowed internal network
-            allowed = False
-            for network in self._internal_networks:
-                if target_ip in network:
-                    allowed = True
-                    break
-
-            if not allowed:
+            if not any(target_ip in network for network in self._internal_networks):
                 logger.warning(
                     f"[SOCKS5] BLOCKED: Destination {target_host}:{target_port} "
                     f"not in allowed networks (from {source_ip})"

@@ -66,12 +66,12 @@ Main bottlenecks are network latency to the gateway and asyncio event loop satur
 | SOCKS5 uses `NO_AUTH` | It only listens on the overlay IP and validates source IPs. WireGuard already encrypts the traffic. |
 | JWT token stored unencrypted in the DB | The DB file is on a permissioned volume. Encrypting it adds complexity without real benefit. |
 
-### Should be fixed
-| Finding | Risk | What to do |
-|---------|------|------------|
-| Rate limiting defined but not enforced | Medium | Wire `MAX_REQUESTS_PER_MINUTE` into `proxy_request()` |
-| No SOCKS5 connection cap | Medium | Add a configurable limit to `SOCKS5Proxy` |
-| Domain resolution trusts agent's DNS | Low | If an attacker controls DNS, they could redirect to unintended IPs within allowed networks. Consider pinning resolved IPs. |
+### Fixed
+| Finding | Fix |
+|---------|-----|
+| Rate limiting was defined but not enforced | `_check_rate_limit()` now enforces `MAX_REQUESTS_PER_MINUTE` (1000/min) in `proxy_request()` |
+| No SOCKS5 connection cap | `MAX_SOCKS5_CONNECTIONS` (200) rejects new connections at capacity |
+| Domain resolution trusted agent's DNS | Resolved IPs are pinned — the validated IP is used for the connection, preventing DNS rebinding |
 
 ---
 
@@ -101,8 +101,8 @@ The agent relies on implicit isolation (unique keys, overlay IPs, network valida
 | Area | Status | Risk |
 |------|--------|------|
 | Cross-tenant isolation | Three layers of enforcement | Low |
-| Concurrent operations | No limits enforced | Medium |
+| Concurrent operations | Rate limiting + connection caps enforced | Low |
 | VPN performance | Solid, but no benchmarks | Low |
-| Agent vulnerabilities | Reviewed, mostly acceptable | Low-Medium |
+| Agent vulnerabilities | Reviewed and addressed | Low |
 | Overlapping networks | Works by design | Low |
 | Tenant ID filtering | Not implemented | Medium |
