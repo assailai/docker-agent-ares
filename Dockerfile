@@ -83,7 +83,7 @@ FROM python:3.12-alpine
 # Security labels
 LABEL maintainer="Assail AI <support@assail.ai>"
 LABEL description="Ares Docker Agent - Secure agent for internal API scanning"
-LABEL version="2.2.0"
+LABEL version="2.3.0"
 LABEL org.opencontainers.image.source="https://github.com/assailai/ares-agent"
 LABEL org.opencontainers.image.licenses="Proprietary"
 LABEL org.opencontainers.image.vendor="Assail AI"

@@ -43,12 +43,27 @@ The Ares Agent establishes a secure WireGuard VPN tunnel from your internal netw
 - **Health Monitoring** - Built-in health checks for container orchestration
 - **Audit Logging** - All administrative actions logged locally
 
-## Quick Start
+## Getting Started
 
-### Pull and Run
+### Option A: Bootstrap Script (Recommended)
+
+The bootstrap script handles everything — pulls the image, starts the container, retrieves your password, and opens the browser:
 
 ```bash
-# Using Docker Hub
+bash <(curl -fsSL https://raw.githubusercontent.com/assailai/ares-agent/main/scripts/bootstrap.sh)
+```
+
+Or clone the repo and run locally:
+```bash
+git clone https://github.com/assailai/ares-agent.git
+bash ares-agent/scripts/bootstrap.sh
+```
+
+Works on macOS, Linux, and Windows (Git Bash / WSL).
+
+### Option B: Docker Run
+
+```bash
 docker run -d --name ares-agent \
   --user root \
   --cap-add=NET_ADMIN \
@@ -59,156 +74,39 @@ docker run -d --name ares-agent \
   -v ares-agent-data:/data \
   --restart unless-stopped \
   assailai/ares-agent:latest
-
-# Or using GitHub Container Registry
-docker run -d --name ares-agent \
-  --user root \
-  --cap-add=NET_ADMIN \
-  --device /dev/net/tun:/dev/net/tun \
-  --sysctl net.ipv4.ip_forward=1 \
-  -e ARES_RUN_AS_ROOT=true \
-  -p 8443:8443 \
-  -v ares-agent-data:/data \
-  --restart unless-stopped \
-  ghcr.io/assailai/ares-agent:latest
 ```
 
-> **Note:** The flags above are **required** for WireGuard VPN to function:
-> - `--user root` - WireGuard needs root to create network interfaces
-> - `--cap-add=NET_ADMIN` - Required capability for network interface management
-> - `--device /dev/net/tun` - TUN device for WireGuard userspace implementation
-> - `--sysctl net.ipv4.ip_forward=1` - Enable IP forwarding for routing to internal networks
-> - `-e ARES_RUN_AS_ROOT=true` - Tells entrypoint to keep running as root
+Using GitHub Container Registry instead:
+```bash
+# Replace assailai/ares-agent:latest with:
+ghcr.io/assailai/ares-agent:latest
+```
 
-### Get Initial Password
+Then get your initial password and open the web interface:
 
 ```bash
+# Get the initial password
 docker logs ares-agent
+
+# Open https://localhost:8443 in your browser
 ```
 
-You'll see output like:
-
-```
-╔══════════════════════════════════════════════════════════════════════╗
-║                    ARES DOCKER AGENT v1.1.0                          ║
-╠══════════════════════════════════════════════════════════════════════╣
-║  Web Interface:  https://192.168.1.50:8443                           ║
-║  Initial Password:  xK9#mP2$vL5@nQ8                                  ║
-║                                                                      ║
-║  NOTE: You MUST change this password on first login.                 ║
-╚══════════════════════════════════════════════════════════════════════╝
-```
-
-### Access Web Interface
-
-1. Navigate to `https://<your-host>:8443` in your browser
-2. Accept the self-signed certificate warning
-3. Log in with the initial password from the logs
-4. Complete the setup wizard
-
-## Upgrading
-
-To upgrade an existing agent to the latest version while preserving your configuration:
+### Option C: Docker Compose
 
 ```bash
-# Stop and remove current container
-docker stop ares-agent && docker rm ares-agent
+# Uses the included docker-compose.yml
+docker compose up -d
 
-# Pull latest image
-docker pull assailai/ares-agent:latest
-
-# Start upgraded agent (with all required flags)
-docker run -d --name ares-agent \
-  --user root \
-  --cap-add=NET_ADMIN \
-  --device /dev/net/tun:/dev/net/tun \
-  --sysctl net.ipv4.ip_forward=1 \
-  -e ARES_RUN_AS_ROOT=true \
-  -p 8443:8443 \
-  -v ares-agent-data:/data \
-  --restart unless-stopped \
-  assailai/ares-agent:latest
+# Get the initial password
+docker compose logs ares-agent | grep "Initial Password"
 ```
 
-Your registration, WireGuard keys, and settings are stored in the `ares-agent-data` volume and will be preserved across upgrades.
+See [docker-compose.yml](docker-compose.yml) for the full configuration.
 
-## Requirements
+### Option D: Kubernetes
 
-| Requirement | Details |
-|-------------|---------|
-| **Docker** | Version 20.10 or later |
-| **Root User** | `--user root` (required for WireGuard VPN) |
-| **NET_ADMIN** | `--cap-add=NET_ADMIN` (required for network interface creation) |
-| **TUN Device** | `--device /dev/net/tun:/dev/net/tun` |
-| **IP Forwarding** | `--sysctl net.ipv4.ip_forward=1` (required for routing to internal networks) |
-| **Environment** | `-e ARES_RUN_AS_ROOT=true` (keeps agent running as root) |
-| **Outbound UDP** | Port 51820 to Ares platform (WireGuard) |
-| **Outbound TCP** | Port 443 to Ares platform (Registration) |
-| **Memory** | Minimum 256MB |
-| **Disk** | Minimum 100MB for data volume |
-
-> **No host WireGuard installation required** - The agent includes wireguard-go (userspace WireGuard implementation).
-
-## Installation
-
-### Docker Run
-
-```bash
-docker run -d --name ares-agent \
-  --user root \
-  --cap-add=NET_ADMIN \
-  --device /dev/net/tun:/dev/net/tun \
-  --sysctl net.ipv4.ip_forward=1 \
-  -e ARES_RUN_AS_ROOT=true \
-  -p 8443:8443 \
-  -v ares-agent-data:/data \
-  --restart unless-stopped \
-  assailai/ares-agent:latest
-```
-
-### Docker Compose
-
-Create a `docker-compose.yml` file:
-
-```yaml
-version: '3.8'
-
-services:
-  ares-agent:
-    image: assailai/ares-agent:latest
-    container_name: ares-agent
-    user: root
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    sysctls:
-      - net.ipv4.ip_forward=1
-    environment:
-      - ARES_RUN_AS_ROOT=true
-    ports:
-      - "8443:8443"
-    volumes:
-      - ares-agent-data:/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "--no-check-certificate", "https://localhost:8443/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-
-volumes:
-  ares-agent-data:
-```
-
-Then run:
-
-```bash
-docker-compose up -d
-```
-
-### Kubernetes
+<details>
+<summary>Click to expand Kubernetes manifests</summary>
 
 ```yaml
 apiVersion: apps/v1
@@ -301,6 +199,32 @@ spec:
   type: ClusterIP
 ```
 
+</details>
+
+### First Login
+
+1. Navigate to `https://<your-host>:8443` in your browser
+2. Accept the self-signed certificate warning
+3. Log in with the initial password from the logs
+4. Complete the setup wizard
+
+## Requirements
+
+| Requirement | Docker Flag | Why |
+|-------------|-------------|-----|
+| Docker 20.10+ | — | Minimum supported version |
+| Root user | `--user root` | WireGuard needs root to create network interfaces |
+| NET_ADMIN | `--cap-add=NET_ADMIN` | Required for network interface management |
+| TUN device | `--device /dev/net/tun:/dev/net/tun` | WireGuard userspace implementation |
+| IP forwarding | `--sysctl net.ipv4.ip_forward=1` | Routing to internal networks |
+| Root env | `-e ARES_RUN_AS_ROOT=true` | Keeps agent running as root for WireGuard |
+| Outbound UDP 51820 | — | WireGuard VPN tunnel |
+| Outbound TCP 443 | — | Registration and API |
+| 256MB memory | — | Minimum recommended |
+| 100MB disk | — | For data volume |
+
+> **No host WireGuard installation required** - The agent includes wireguard-go (userspace WireGuard implementation).
+
 ## Configuration
 
 ### Setup Wizard Steps
@@ -312,31 +236,6 @@ spec:
 5. **Internal Networks** - Define which CIDR ranges can be scanned (e.g., `10.0.0.0/8`, `172.16.0.0/12`)
 6. **Agent Name** - Give your agent a descriptive name for the dashboard
 7. **Connect** - Establish the WireGuard tunnel
-
-### Restarting the Agent After Configuration Changes
-
-After making changes to agent settings (such as updating internal networks, agent name, or other configuration), you need to restart the agent for changes to take effect.
-
-**Via the Web Interface (Recommended):**
-1. Navigate to **Settings** in the web interface
-2. Click the **Restart Agent** button
-3. Wait for the tunnel to reconnect (usually takes 5-10 seconds)
-
-**Via Docker Command Line:**
-```bash
-# Restart the container (preserves configuration)
-docker restart ares-agent
-
-# View logs to confirm successful restart
-docker logs -f ares-agent
-```
-
-**Via Docker Compose:**
-```bash
-docker-compose restart ares-agent
-```
-
-> **Note:** Restarting the agent will briefly disconnect the WireGuard tunnel. Any in-progress scans will automatically resume once the tunnel is re-established.
 
 ### Environment Variables
 
@@ -355,12 +254,6 @@ docker-compose restart ares-agent
 | `/data/wireguard` | WireGuard VPN configuration |
 | `/data/db` | SQLite database |
 
-### Ports
-
-| Port | Protocol | Description |
-|------|----------|-------------|
-| 8443 | TCP | Web interface (HTTPS) |
-
 ## Network Requirements
 
 ### Outbound (Required)
@@ -376,7 +269,7 @@ docker-compose restart ares-agent
 
 ## Security
 
-The Ares Agent is built with security as a top priority:
+The Ares Agent is built with security as a top priority. For detailed architecture analysis, see [Security Architecture](docs/SECURITY-ARCHITECTURE.md).
 
 ### Container Security
 - **Root + NET_ADMIN required** - WireGuard VPN requires root and NET_ADMIN capability for network interface management
@@ -408,14 +301,18 @@ The Ares Agent is built with security as a top priority:
 - **Docker Scout compliant** - Passes Docker security scanning
 - **CVE monitoring** - Dependencies pinned to versions with known CVE fixes
 
-## Troubleshooting
+## Upgrading
 
-### Container Won't Start
+To upgrade while preserving your configuration:
 
-**Symptom:** Container exits immediately
-
-**Solution:** Ensure all required flags are provided:
 ```bash
+# Stop and remove current container (data volume is preserved)
+docker stop ares-agent && docker rm ares-agent
+
+# Pull latest image
+docker pull assailai/ares-agent:latest
+
+# Start with the same docker run command from Getting Started
 docker run -d --name ares-agent \
   --user root \
   --cap-add=NET_ADMIN \
@@ -428,11 +325,36 @@ docker run -d --name ares-agent \
   assailai/ares-agent:latest
 ```
 
+Or with Docker Compose:
+```bash
+docker compose pull && docker compose up -d
+```
+
+Your registration, WireGuard keys, and settings are stored in the `ares-agent-data` volume and will be preserved across upgrades.
+
+## Restarting
+
+After making configuration changes, restart the agent:
+
+**Via Docker:**
+```bash
+docker restart ares-agent
+```
+
+**Via Docker Compose:**
+```bash
+docker compose restart
+```
+
+> Restarting briefly disconnects the WireGuard tunnel. In-progress scans will resume once the tunnel is re-established.
+
+## Troubleshooting
+
+### Container Won't Start
+
+Ensure all required flags are present. See the [Requirements](#requirements) table — every Docker flag listed there is mandatory.
+
 ### WireGuard Tunnel Failed to Start
-
-**Symptom:** Error message "Failed to start WireGuard tunnel"
-
-**Common causes and solutions:**
 
 | Cause | Solution |
 |-------|----------|
@@ -442,69 +364,32 @@ docker run -d --name ares-agent \
 | Missing IP forwarding | Add `--sysctl net.ipv4.ip_forward=1` flag |
 | Missing environment variable | Add `-e ARES_RUN_AS_ROOT=true` flag |
 
-The agent now performs pre-flight checks and will log specific errors indicating which flag is missing.
-
 ### Can't Access Web Interface
 
-**Checklist:**
 1. Verify container is running: `docker ps | grep ares-agent`
 2. Check container logs: `docker logs ares-agent`
 3. Verify port mapping: `docker port ares-agent`
-4. Test local access from host: `curl -k https://localhost:8443/health`
+4. Test local access: `curl -k https://localhost:8443/health`
 
 ### WireGuard Tunnel Not Connecting
 
-**Checklist:**
 1. Verify outbound UDP 51820 is allowed by your firewall
 2. Check registration token hasn't expired (24-hour validity)
 3. Verify platform URL is correct
 4. Check agent logs in web interface (Dashboard > Logs)
 
-### Remove and Reinstall (Complete Reset)
+### Complete Reset
 
-Use this when you forgot your password, need to re-register with a new token, or encounter any issues:
-
-```bash
-# One-liner: Stop, remove container and data, pull latest, and run
-docker rm -f ares-agent; \
-docker volume rm ares-agent-data; \
-docker pull assailai/ares-agent:latest && \
-docker run -d --name ares-agent \
-  --user root \
-  --cap-add=NET_ADMIN \
-  --device /dev/net/tun:/dev/net/tun \
-  --sysctl net.ipv4.ip_forward=1 \
-  -e ARES_RUN_AS_ROOT=true \
-  -p 8443:8443 \
-  -v ares-agent-data:/data \
-  --restart unless-stopped \
-  assailai/ares-agent:latest
-```
-
-Then get the new initial password:
-```bash
-docker logs ares-agent
-```
-
-### Update to Latest Version
+Remove everything and start fresh (you'll need a new registration token):
 
 ```bash
-# Pull latest image and recreate container (preserves data)
-docker pull assailai/ares-agent:latest && \
-docker rm -f ares-agent && \
-docker run -d --name ares-agent \
-  --user root \
-  --cap-add=NET_ADMIN \
-  --device /dev/net/tun:/dev/net/tun \
-  --sysctl net.ipv4.ip_forward=1 \
-  -e ARES_RUN_AS_ROOT=true \
-  -p 8443:8443 \
-  -v ares-agent-data:/data \
-  --restart unless-stopped \
-  assailai/ares-agent:latest
+docker rm -f ares-agent
+docker volume rm ares-agent-data
 ```
 
-### Health Check Failing
+Then run the agent again using any method from [Getting Started](#getting-started).
+
+### Health Check
 
 View detailed health status:
 ```bash
@@ -517,9 +402,9 @@ We use [Semantic Versioning](https://semver.org/). For available versions, see t
 
 | Version | Status | Notes |
 |---------|--------|-------|
-| 2.0.x | Current | Improved WireGuard diagnostics, pre-flight checks, auto-recovery, simplified docker run |
-| 1.1.x | Legacy | WireGuard fixes, required privileged mode |
-| 1.0.x | Legacy | May have WireGuard connectivity issues |
+| 2.3.x | Current | SOCKS5 proxy, improved security, bug fixes |
+| 2.0.x - 2.2.x | Legacy | Upgrade recommended |
+| 1.x | Legacy | Security vulnerabilities — upgrade immediately |
 
 ## Support
 
