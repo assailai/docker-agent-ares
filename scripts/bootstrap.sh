@@ -106,11 +106,11 @@ check_existing_container() {
     state="$(docker inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "unknown")"
     info "Current state: $state"
 
-    # When stdin is not a terminal (e.g. curl | bash), default to remove
+    # When stdin is not a terminal (e.g. curl | bash), only remove the container
+    # but preserve the data volume (WireGuard keys, TLS certs, database)
     if [ ! -t 0 ]; then
-        warn "Non-interactive mode: removing existing container."
+        warn "Non-interactive mode: removing existing container (data volume preserved)."
         docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-        docker volume rm "$VOLUME_NAME" >/dev/null 2>&1 || true
         return
     fi
 

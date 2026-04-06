@@ -28,6 +28,7 @@ services:
       - NET_ADMIN
     sysctls:
       - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
     environment:
       - ARES_RUN_AS_ROOT=true
     restart: unless-stopped

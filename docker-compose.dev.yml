@@ -11,8 +11,9 @@
 services:
   ares-agent:
     build: .
-    container_name: ares-docker-agent
+    container_name: ares-agent
     hostname: ares-agent
+    user: root
     ports:
       - "8443:8443"
     volumes:
@@ -28,6 +29,7 @@ services:
     environment:
       - DATA_DIR=/data
       - LOG_LEVEL=INFO
+      - ARES_RUN_AS_ROOT=true
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "--no-check-certificate", "https://localhost:8443/health"]
       interval: 30s
