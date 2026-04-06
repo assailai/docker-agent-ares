@@ -259,17 +259,27 @@ trust_certificate() {
             fi
             ;;
         linux|wsl)
-            info "Trusting the certificate requires sudo. You may be prompted for your password."
+            # chrome/chromium on linux uses its own NSS database, not the system CA store
+            if command -v certutil >/dev/null 2>&1 && [ -d "$HOME/.pki/nssdb" ]; then
+                if certutil -d "sql:$HOME/.pki/nssdb" -A \
+                    -t "CT,c,c" -n "Ares Agent" -i "$cert_file" 2>/dev/null; then
+                    info "Certificate trusted in Chrome/Chromium."
+                    CERT_TRUSTED=true
+                fi
+            fi
+
+            # also add to system store for curl/wget/other tools
+            info "Adding to system trust store may require your password."
             if command -v update-ca-certificates >/dev/null 2>&1; then
                 if sudo cp "$cert_file" /usr/local/share/ca-certificates/ares-agent.crt 2>/dev/null \
                     && sudo update-ca-certificates 2>/dev/null; then
                     info "Certificate trusted system-wide."
                     CERT_TRUSTED=true
-                else
-                    warn "Could not add certificate (needs sudo). Accept the browser warning manually."
                 fi
-            else
-                warn "update-ca-certificates not found. Accept the browser warning manually."
+            fi
+
+            if [ "$CERT_TRUSTED" = "false" ]; then
+                warn "Could not auto-trust certificate. Accept the browser warning manually."
             fi
             ;;
         *)
