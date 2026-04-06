@@ -16,6 +16,8 @@ Security:
 - X-Forwarded-For headers are NOT trusted for security checks
 """
 
+import time
+
 import httpx
 import ipaddress
 import logging
@@ -24,7 +26,6 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
-import asyncio
 
 from agent.database.models import get_config, AgentConfig
 
@@ -55,10 +56,10 @@ BLOCKED_HOSTNAMES = [
     "kubernetes.default.svc.cluster.local",
 ]
 
-# Rate limiting
-_request_counts: Dict[str, int] = {}
-_last_reset = asyncio.get_event_loop().time() if asyncio.get_event_loop().is_running() else 0
+# rate limiting: max proxy requests per minute from all sources combined
 MAX_REQUESTS_PER_MINUTE = 1000
+_rate_limit_count = 0
+_rate_limit_window_start = 0.0
 
 
 class ProxyRequest(BaseModel):
@@ -241,6 +242,19 @@ def _is_target_allowed(target_url: str) -> bool:
         return False
 
 
+def _check_rate_limit() -> bool:
+    """Returns True if the request is within the rate limit."""
+    global _rate_limit_count, _rate_limit_window_start
+
+    now = time.monotonic()
+    if now - _rate_limit_window_start >= 60.0:
+        _rate_limit_count = 0
+        _rate_limit_window_start = now
+
+    _rate_limit_count += 1
+    return _rate_limit_count <= MAX_REQUESTS_PER_MINUTE
+
+
 @router.post("/request")
 async def proxy_request(request: Request, proxy_req: ProxyRequest):
     """
@@ -250,12 +264,14 @@ async def proxy_request(request: Request, proxy_req: ProxyRequest):
     """
     client_ip = _get_client_ip(request)
 
-    # Security: Only allow requests from overlay network
     if not _is_from_overlay_network(client_ip):
         logger.warning(f"Proxy request from non-overlay IP: {client_ip}")
         raise HTTPException(status_code=403, detail="Access denied: request must come from overlay network")
 
-    # Security: Check if target is in allowed networks
+    if not _check_rate_limit():
+        logger.warning(f"Rate limit exceeded ({MAX_REQUESTS_PER_MINUTE}/min)")
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
     if not _is_target_allowed(proxy_req.target_url):
         logger.warning(f"Proxy request to disallowed target: {proxy_req.target_url}")
         raise HTTPException(status_code=403, detail="Access denied: target not in internal networks")

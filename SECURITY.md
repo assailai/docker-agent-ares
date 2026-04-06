@@ -4,11 +4,11 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 2.1.x   | :white_check_mark: |
-| 2.0.x   | :x: (security vulnerabilities - upgrade immediately) |
-| 1.0.x   | :x: |
+| 2.3.x   | :white_check_mark: |
+| 2.0.x - 2.2.x | :x: (security vulnerabilities - upgrade immediately) |
+| 1.x     | :x: |
 
-> **IMPORTANT**: Version 2.1.0 contains critical security fixes. All users should upgrade immediately.
+> **IMPORTANT**: Version 2.3.0 contains critical security fixes. All users should upgrade immediately.
 
 ## Reporting a Vulnerability
 
