@@ -271,7 +271,7 @@ spec:
 
 ## Security
 
-The Ares Agent is built with security as a top priority. For detailed architecture analysis, see [Security Architecture](docs/SECURITY-ARCHITECTURE.md).
+The Ares Agent is built with security as a top priority:
 
 ### Container Security
 - **Root + NET_ADMIN required** - WireGuard VPN requires root and NET_ADMIN capability for network interface management
