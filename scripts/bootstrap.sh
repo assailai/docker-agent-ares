@@ -235,6 +235,51 @@ extract_password() {
     fi
 }
 
+CERT_TRUSTED=false
+
+trust_certificate() {
+    step "Trusting TLS certificate"
+
+    local cert_file="/tmp/ares-agent-cert.pem"
+    if ! docker cp "${CONTAINER_NAME}:/data/tls/server.crt" "$cert_file" 2>/dev/null; then
+        warn "Could not extract certificate. You'll need to accept the browser warning manually."
+        return
+    fi
+
+    case "$PLATFORM" in
+        macos)
+            info "Your system may prompt you to allow the certificate to be trusted."
+            if security add-trusted-cert -r trustRoot \
+                -k "$HOME/Library/Keychains/login.keychain-db" \
+                "$cert_file" 2>/dev/null; then
+                info "Certificate trusted in macOS login keychain. No browser warning!"
+                CERT_TRUSTED=true
+            else
+                warn "Could not add certificate to keychain. Accept the browser warning manually."
+            fi
+            ;;
+        linux|wsl)
+            info "Trusting the certificate requires sudo. You may be prompted for your password."
+            if command -v update-ca-certificates >/dev/null 2>&1; then
+                if sudo cp "$cert_file" /usr/local/share/ca-certificates/ares-agent.crt 2>/dev/null \
+                    && sudo update-ca-certificates 2>/dev/null; then
+                    info "Certificate trusted system-wide."
+                    CERT_TRUSTED=true
+                else
+                    warn "Could not add certificate (needs sudo). Accept the browser warning manually."
+                fi
+            else
+                warn "update-ca-certificates not found. Accept the browser warning manually."
+            fi
+            ;;
+        *)
+            warn "Auto-trust not supported on $PLATFORM. Accept the browser warning manually."
+            ;;
+    esac
+
+    rm -f "$cert_file"
+}
+
 open_browser() {
     local url="https://localhost:${PORT}"
 
@@ -258,10 +303,14 @@ print_summary() {
     fi
     printf "\n"
     info "Next steps:"
-    info "  1. Accept the self-signed certificate warning"
-    info "  2. Log in with the initial password"
-    info "  3. Change your password (required)"
-    info "  4. Complete the setup wizard"
+    local n=1
+    if [ "$CERT_TRUSTED" = "false" ]; then
+        info "  $n. Accept the self-signed certificate warning in your browser"
+        n=$((n + 1))
+    fi
+    info "  $n. Log in with the initial password"; n=$((n + 1))
+    info "  $n. Change your password (required)"; n=$((n + 1))
+    info "  $n. Complete the setup wizard"
     printf "\n"
     info "Useful commands:"
     info "  docker logs ares-agent        View logs"
@@ -280,6 +329,7 @@ main() {
     start_container
     wait_for_healthy
     extract_password
+    trust_certificate
     open_browser
     print_summary
 }
