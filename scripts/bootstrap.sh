@@ -156,18 +156,25 @@ pull_image() {
 start_container() {
     step "Starting Ares Agent"
 
-    if ! docker run -d --name "$CONTAINER_NAME" \
-        --platform linux/amd64 \
-        --user root \
-        --cap-add=NET_ADMIN \
-        --device /dev/net/tun:/dev/net/tun \
-        --sysctl net.ipv4.ip_forward=1 \
-        -e ARES_RUN_AS_ROOT=true \
-        -p "${PORT}:8443" \
-        -v "${VOLUME_NAME}:/data" \
-        --restart unless-stopped \
-        "$IMAGE" >/dev/null; then
+    local run_args=(
+        -d --name "$CONTAINER_NAME"
+        --platform linux/amd64
+        --user root
+        --cap-add=NET_ADMIN
+        -e ARES_RUN_AS_ROOT=true
+        -p "${PORT}:8443"
+        -v "${VOLUME_NAME}:/data"
+        --restart unless-stopped
+    )
 
+    if [ "$PLATFORM" = "windows" ]; then
+        warn "Windows detected: WireGuard VPN requires WSL 2."
+        warn "Skipping TUN device — the web UI will work but VPN tunnels will not."
+    else
+        run_args+=(--device /dev/net/tun:/dev/net/tun --sysctl net.ipv4.ip_forward=1)
+    fi
+
+    if ! docker run "${run_args[@]}" "$IMAGE" >/dev/null; then
         error "Failed to start container."
         error "Check that port ${PORT} is not in use: lsof -i :${PORT}"
         exit 1
@@ -208,6 +215,7 @@ wait_for_healthy() {
     printf "\n"
     warn "Health check timed out after ${HEALTH_TIMEOUT}s. The agent may still be starting."
     warn "Check status: docker logs $CONTAINER_NAME"
+    info "Monitor startup: docker logs -f $CONTAINER_NAME"
 }
 
 extract_password() {
@@ -259,27 +267,66 @@ trust_certificate() {
             fi
             ;;
         linux|wsl)
-            # chrome/chromium on linux uses its own NSS database, not the system CA store
-            if command -v certutil >/dev/null 2>&1 && [ -d "$HOME/.pki/nssdb" ]; then
-                if certutil -d "sql:$HOME/.pki/nssdb" -A \
-                    -t "CT,c,c" -n "Ares Agent" -i "$cert_file" 2>/dev/null; then
-                    info "Certificate trusted in Chrome/Chromium."
-                    CERT_TRUSTED=true
+            # Chrome/Chromium on Linux uses its own NSS database, not the system CA store.
+            # The certutil tool (from libnss3-tools) is required to import into it.
+            if command -v certutil >/dev/null 2>&1; then
+                # Create the NSS database if it doesn't exist yet (e.g. fresh install)
+                if [ ! -d "$HOME/.pki/nssdb" ]; then
+                    info "Creating Chrome certificate database..."
+                    mkdir -p "$HOME/.pki/nssdb"
+                    certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
                 fi
+
+                if [ -d "$HOME/.pki/nssdb" ]; then
+                    if certutil -d "sql:$HOME/.pki/nssdb" -A \
+                        -t "CT,c,c" -n "Ares Agent" -i "$cert_file" 2>/dev/null; then
+                        info "Certificate trusted in Chrome/Chromium."
+                        CERT_TRUSTED=true
+                    fi
+                fi
+
+                # Also trust in Firefox profiles if present
+                local ff_profile
+                for ff_profile in "$HOME"/.mozilla/firefox/*/cert9.db; do
+                    [ -f "$ff_profile" ] || continue
+                    local ff_dir
+                    ff_dir="$(dirname "$ff_profile")"
+                    if certutil -d "sql:$ff_dir" -A \
+                        -t "CT,c,c" -n "Ares Agent" -i "$cert_file" 2>/dev/null; then
+                        info "Certificate trusted in Firefox profile: $(basename "$ff_dir")"
+                    fi
+                done
+            else
+                warn "certutil not found — cannot auto-trust certificate in Chrome/Firefox."
+                warn "Install it with: sudo apt install libnss3-tools   (Debian/Ubuntu)"
+                warn "             or: sudo dnf install nss-tools        (Fedora/RHEL)"
             fi
 
-            # also add to system store for curl/wget/other tools
-            info "Adding to system trust store may require your password."
+            # Add to system CA store for curl/wget/other tools
             if command -v update-ca-certificates >/dev/null 2>&1; then
-                if sudo cp "$cert_file" /usr/local/share/ca-certificates/ares-agent.crt 2>/dev/null \
-                    && sudo update-ca-certificates 2>/dev/null; then
+                info "Trusting certificate system-wide (may prompt for your password)."
+                if sudo cp "$cert_file" /usr/local/share/ca-certificates/ares-agent.crt \
+                    && sudo update-ca-certificates; then
                     info "Certificate trusted system-wide."
-                    CERT_TRUSTED=true
+                    if [ "$CERT_TRUSTED" = "false" ]; then
+                        CERT_TRUSTED=true
+                    fi
+                fi
+            elif command -v update-ca-trust >/dev/null 2>&1; then
+                info "Trusting certificate system-wide (may prompt for your password)."
+                if sudo cp "$cert_file" /etc/pki/ca-trust/source/anchors/ares-agent.crt \
+                    && sudo update-ca-trust; then
+                    info "Certificate trusted system-wide."
+                    if [ "$CERT_TRUSTED" = "false" ]; then
+                        CERT_TRUSTED=true
+                    fi
                 fi
             fi
 
             if [ "$CERT_TRUSTED" = "false" ]; then
-                warn "Could not auto-trust certificate. Accept the browser warning manually."
+                warn "Could not auto-trust certificate."
+                warn "Chrome on Linux requires 'certutil' (libnss3-tools) to trust certificates."
+                warn "Accept the browser warning manually, or install certutil and re-run."
             fi
             ;;
         *)
@@ -321,6 +368,13 @@ print_summary() {
     info "  $n. Log in with the initial password"; n=$((n + 1))
     info "  $n. Change your password (required)"; n=$((n + 1))
     info "  $n. Complete the setup wizard"
+    printf "\n"
+    if [ "$PLATFORM" = "windows" ]; then
+        printf "\n"
+        warn "WireGuard VPN is not available on Windows/Git Bash."
+        info "  For full VPN support, run this script inside WSL 2 instead."
+    fi
+
     printf "\n"
     info "Useful commands:"
     info "  docker logs ares-agent        View logs"
