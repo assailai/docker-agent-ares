@@ -19,8 +19,11 @@ from agent.tunnel import (
     _HOSTS_REPORTED_MAX,
     _OPEN_ERR,
     _PROBE_TIMEOUT,
+    HostApproval,
     RefusalLog,
     Refused,
+    globally_routable,
+    host_approval,
     host_approved,
     TunnelClient,
     TunnelManager,
@@ -435,8 +438,9 @@ def test_host_approved(host: str, allowed: set[str], expected: bool) -> None:
 
 
 def test_wildcard_does_not_widen_ip_literals() -> None:
-    """The wildcard opens NAMES. An address is still bounded by the registered networks, so it can
-    never be used to reach something this agent was not registered for."""
+    """The wildcard opens NAMES, and an IP literal is not one: it stays bounded by the registered
+    networks. What a wildcard-approved NAME may resolve to is a separate question, answered by the
+    address-class tests below - this one deliberately only covers the literal."""
     client = _client(allowed_hosts={"*"})
     with pytest.raises(Refused, match="outside this agent's registered networks"):
         asyncio.run(client._dial_address("203.0.113.10", 443))
@@ -446,6 +450,144 @@ def test_wildcard_lets_an_unenumerated_login_host_through() -> None:
     client = _client(allowed_hosts={"*"})
     _stub_resolver(client, {"agtacc.allstate.com": ["167.127.118.229"]})
     assert asyncio.run(client._dial_address("agtacc.allstate.com", 443)) == "167.127.118.229"
+
+
+@pytest.mark.parametrize(
+    ("host", "allowed", "expected"),
+    [
+        ("acme.okta.com", {"acme.okta.com"}, HostApproval.EXACT),
+        ("acme.okta.com", {".okta.com"}, HostApproval.SUFFIX),
+        ("acme.okta.com", {"*.okta.com"}, HostApproval.SUFFIX),
+        ("acme.okta.com", {"*"}, HostApproval.WILDCARD),
+        ("acme.okta.com", {"other.example.com"}, HostApproval.NONE),
+        ("acme.okta.com", set(), HostApproval.NONE),
+        ("", {"*"}, HostApproval.NONE),
+        # The narrowest match wins, whatever order the set iterates in. ares pushes "*" ALONGSIDE
+        # the run's real target while an interactive login is parked, so this exact combination is
+        # the common case and not a corner: grading it WILDCARD would apply the public-address rule
+        # to the hunt's own internal target and refuse it.
+        ("acme.okta.com", {"*", "acme.okta.com"}, HostApproval.EXACT),
+        ("acme.okta.com", {"*", ".okta.com"}, HostApproval.SUFFIX),
+        ("acme.okta.com", {"*", ".okta.com", "acme.okta.com"}, HostApproval.EXACT),
+    ],
+)
+def test_host_approval_reports_the_narrowest_match(
+    host: str, allowed: set[str], expected: HostApproval
+) -> None:
+    assert host_approval(host, allowed) is expected
+
+
+# --- address classes: what a pattern-approved name is allowed to resolve to --------------------
+#
+# A name approved by "*" or a domain suffix matches hosts nobody enumerated, so the name proves
+# nothing about intent and the ADDRESS has to earn the dial. Without this the agent would relay TCP
+# to cloud metadata, to services on loopback, and into private segments it was never registered
+# for, on nothing more than an approved login domain.
+
+_SPECIAL_USE = [
+    ("169.254.169.254", "cloud metadata over link-local"),
+    ("127.0.0.1", "IPv4 loopback"),
+    ("192.168.7.9", "RFC 1918 outside the registered networks"),
+    ("10.9.9.9", "RFC 1918 in a different private block"),
+    ("100.64.0.1", "RFC 6598 carrier-grade NAT"),
+    ("0.0.0.0", "the unspecified address"),
+    ("224.0.0.1", "IPv4 multicast, which ipaddress.is_global calls global"),
+    ("239.255.255.250", "IPv4 administratively scoped multicast"),
+    ("203.0.113.5", "TEST-NET-3"),
+    ("198.18.0.1", "the benchmarking range"),
+    ("::1", "IPv6 loopback"),
+    ("fe80::1", "IPv6 link-local"),
+    ("fc00::1", "IPv6 unique-local"),
+    ("ff02::1", "IPv6 multicast, which ipaddress.is_global also calls global"),
+    ("::", "the IPv6 unspecified address"),
+    ("::ffff:169.254.169.254", "metadata wearing an IPv4-mapped IPv6 spelling"),
+    ("::ffff:127.0.0.1", "loopback wearing an IPv4-mapped IPv6 spelling"),
+]
+
+
+@pytest.mark.parametrize(("address", "why"), _SPECIAL_USE)
+def test_a_wildcard_name_cannot_reach_special_use_space(address: str, why: str) -> None:
+    """Pinned as a table because this is a policy about the special-use registries, and those move
+    between Python releases: production runs 3.12 while a dev venv may be newer."""
+    client = _client(networks=["10.0.0.0/24"], allowed_hosts={"*"})
+    _stub_resolver(client, {"login-resource.example.test": [address]})
+    with pytest.raises(Refused, match="not public address space"):
+        asyncio.run(client._dial_address("login-resource.example.test", 443))
+
+
+@pytest.mark.parametrize(("address", "why"), _SPECIAL_USE)
+def test_a_suffix_name_cannot_reach_special_use_space(address: str, why: str) -> None:
+    """A suffix is as unenumerable as "*" and gets the same rule. This matters MORE than the
+    wildcard: ares ships okta.com / auth0.com / pingone.com as built-in identity-provider suffixes,
+    so a suffix entry is not confined to the interactive-login window the wildcard lives in."""
+    client = _client(networks=["10.0.0.0/24"], allowed_hosts={".okta.com"})
+    _stub_resolver(client, {"tenant.okta.com": [address]})
+    with pytest.raises(Refused, match="not public address space"):
+        asyncio.run(client._dial_address("tenant.okta.com", 443))
+
+
+def test_a_pattern_named_public_address_is_still_reachable() -> None:
+    """The whole reason "*" exists: a federated login bounces through hosts nobody can list. The
+    fix must not break that."""
+    client = _client(networks=["10.0.0.0/24"], allowed_hosts={"*"})
+    _stub_resolver(client, {"cdn.example.test": ["93.184.216.34"]})
+    assert asyncio.run(client._dial_address("cdn.example.test", 443)) == "93.184.216.34"
+
+
+@pytest.mark.parametrize("answers", [["93.184.216.34", "169.254.169.254"], ["169.254.169.254", "93.184.216.34"]])
+def test_one_bad_answer_refuses_the_whole_name(answers: list[str]) -> None:
+    """EVERY answer has to pass, not just the one that would be dialled. Whoever controls the DNS
+    reply controls its order, so checking a mixed reply and then taking the first record would be
+    the same as not checking at all - hence both orderings."""
+    client = _client(networks=["10.0.0.0/24"], allowed_hosts={"*"})
+    _stub_resolver(client, {"mixed.example.test": answers})
+    with pytest.raises(Refused, match="not public address space"):
+        asyncio.run(client._dial_address("mixed.example.test", 443))
+
+
+def test_an_exact_runtime_target_may_be_a_private_host() -> None:
+    """An exact name is a destination ares was TOLD to assess, and internal targets under
+    split-horizon DNS answer with private addresses. Grading exact with the patterns would refuse
+    the hunt's own target."""
+    client = _client(networks=["10.0.0.0/24"], allowed_hosts={"intranet.acme.local"})
+    _stub_resolver(client, {"intranet.acme.local": ["10.5.0.7"]})
+    assert asyncio.run(client._dial_address("intranet.acme.local", 443)) == "10.5.0.7"
+
+
+def test_the_login_wildcard_does_not_downgrade_the_hunts_own_target() -> None:
+    """The regression the narrowest-match rule exists for: "*" is pushed alongside the real target
+    during an interactive login, and a first-match implementation refuses that target."""
+    client = _client(networks=["10.0.0.0/24"], allowed_hosts={"*", "intranet.acme.local"})
+    _stub_resolver(client, {"intranet.acme.local": ["10.5.0.7"]})
+    assert asyncio.run(client._dial_address("intranet.acme.local", 443)) == "10.5.0.7"
+
+
+def test_an_operator_scoped_host_reaches_any_address_class() -> None:
+    """A standing decision by a person who typed one exact destination. That is the point of scope:
+    an operator can add a host this agent's own detection never reached."""
+    client = _client(networks=["10.0.0.0/24"], scoped_hosts={"pinned.example.test"})
+    _stub_resolver(client, {"pinned.example.test": ["169.254.169.254"]})
+    assert asyncio.run(client._dial_address("pinned.example.test", 443)) == "169.254.169.254"
+
+
+def test_a_name_inside_the_registered_networks_needs_no_approval_at_all() -> None:
+    client = _client(networks=["10.0.0.0/24"])
+    _stub_resolver(client, {"db.acme.local": ["10.0.0.15"]})
+    assert asyncio.run(client._dial_address("db.acme.local", 443)) == "10.0.0.15"
+
+
+def test_an_unparseable_answer_is_never_globally_routable() -> None:
+    """Fail closed: an address we cannot classify is not one we can vouch for."""
+    assert globally_routable("not-an-address") is False
+    assert globally_routable("") is False
+
+
+def test_the_checked_address_is_the_one_dialled() -> None:
+    """The existing anti-rebinding property, asserted so the restructure above cannot lose it: the
+    concrete address that passed the check is returned, never the name for a second lookup."""
+    client = _client(networks=["10.0.0.0/24"], allowed_hosts={"*"})
+    _stub_resolver(client, {"many.example.test": ["93.184.216.34", "93.184.216.35"]})
+    assert asyncio.run(client._dial_address("many.example.test", 443)) == "93.184.216.34"
 
 
 # --- static pins ----------------------------------------------------------------------------

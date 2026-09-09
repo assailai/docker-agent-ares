@@ -11,11 +11,17 @@ Two kinds of destination are authorized, and the agent is the one that decides:
   registered for;
 * a **hostname** is resolved *here*, on the agent's resolver (that is the whole point: the
   name may only exist on the customer's internal DNS, and split-horizon DNS would give ares
-  the wrong answer). It is allowed when every address it resolves to is inside the registered
-  networks, or when ares named that host in ``tunnel_allowed_hosts`` on the heartbeat, which
-  it only does for the target of a hunt that is actually running. The dial then goes to the
-  address we checked, never back through the resolver, so a second lookup cannot swap the
-  destination out from under the check.
+  the wrong answer). The dial then goes to the address we checked, never back through the
+  resolver, so a second lookup cannot swap the destination out from under the check.
+
+A name being approved is never on its own enough: **how** it was approved bounds where it is
+allowed to point (see :class:`HostApproval` and :func:`globally_routable`). A name somebody
+actually chose - an address in this agent's scope, or the named target of a running hunt - may
+resolve anywhere, including into private space, because that is a deliberate statement about one
+destination. A *pattern* (``*``, or a domain suffix) matches names nobody enumerated, so the name
+carries no such intent and the resolved ADDRESS has to earn the dial by being publicly routable.
+That is what keeps an approved login domain from becoming a route to loopback, link-local metadata,
+or a private segment this agent was never registered for.
 
 The frame format mirrors ``ares/infra/net/tunnel.py`` byte for byte; the two repos must
 change it together.
@@ -33,6 +39,7 @@ import struct
 import time
 from collections import Counter
 from collections.abc import Iterable
+from enum import Enum
 
 import websockets
 
@@ -169,14 +176,66 @@ def is_ip_literal(value: str) -> bool:
 # browser is handed to an identity provider, bounced through whatever asset CDNs the login page
 # pulls from, and handed back. Enumerating those was a guessing game the customer always lost.
 #
-# It widens NAMES ONLY. An IP literal is still bounded by the registered networks below, so this
-# can never be used to reach an address the agent was not registered for, and the name is still
-# resolved on this agent's own resolver.
+# It widens NAMES ONLY, and only to PUBLIC addresses. An IP literal is still bounded by the
+# registered networks below; a name it approves is still resolved on this agent's own resolver, and
+# the address that comes back must still be globally routable, because a pattern that matches
+# everything is not a statement that any particular destination was intended. Loopback,
+# link-local, private and other special-use space stay unreachable through it.
 ANY_HOST = "*"
 
 
+class HostApproval(Enum):
+    """How ares approved a name, because how broadly it was approved bounds where it may point.
+
+    The ordering is the point: an exact name is a destination somebody *chose*, so it is trusted the
+    way an operator-scoped address is. A suffix or ``*`` matches names nobody enumerated in advance,
+    so the name proves nothing about intent and :func:`globally_routable` has to vouch for the
+    address instead. Widening the pattern narrows the address privilege.
+    """
+
+    NONE = "none"
+    EXACT = "exact"
+    SUFFIX = "suffix"
+    WILDCARD = "wildcard"
+
+
+# Narrowest first. A host can match several entries at once - ares pushes ``*`` ALONGSIDE the run's
+# real target while an interactive login is parked - and the narrowest match is the one that
+# describes what was actually intended, so it is the one that decides.
+_APPROVAL_PRECEDENCE = (HostApproval.EXACT, HostApproval.SUFFIX, HostApproval.WILDCARD)
+
+
+def host_approval(host: str, allowed_hosts: Iterable[str]) -> HostApproval:
+    """How ares approved ``host`` for a running assessment, or :attr:`HostApproval.NONE`.
+
+    Every entry is considered, not just the first that matches, because the answer must be the
+    NARROWEST way this host was approved. ``{"*", "intranet.acme.local"}`` is a real and common
+    set - the wildcard for the login detour, the exact name for the target - and grading that host
+    as a wildcard match would refuse the very destination the hunt is for.
+    """
+    matched: set[HostApproval] = set()
+    for raw in allowed_hosts:
+        kind = _entry_matches(host, raw)
+        if kind is not HostApproval.NONE:
+            matched.add(kind)
+    for kind in _APPROVAL_PRECEDENCE:
+        if kind in matched:
+            return kind
+    return HostApproval.NONE
+
+
 def host_approved(host: str, allowed_hosts: Iterable[str]) -> bool:
-    """Whether ares approved ``host`` for a running assessment.
+    """Whether ares approved ``host`` at all, in any of the forms :func:`host_approval` grades.
+
+    Kept as the plain yes/no question for callers that do not care how the approval was reached.
+    Anything making an authorization decision wants :func:`host_approval` instead, because the
+    *kind* of match is what bounds the addresses the name may resolve to.
+    """
+    return host_approval(host, allowed_hosts) is not HostApproval.NONE
+
+
+def _entry_matches(host: str, entry: str) -> HostApproval:
+    """How one allowed-hosts entry matches ``host``.
 
     Three forms, in the order an operator would expect:
 
@@ -192,23 +251,59 @@ def host_approved(host: str, allowed_hosts: Iterable[str]) -> bool:
     """
     needle = normalize_host(host)
     if not needle:
+        return HostApproval.NONE
+    entry = normalize_host(entry)
+    if not entry:
+        return HostApproval.NONE
+    if entry == ANY_HOST:
+        return HostApproval.WILDCARD
+    if entry.startswith("*."):
+        entry = entry[1:]  # "*.example.com" -> ".example.com"
+    if entry.startswith("."):
+        domain = entry.lstrip(".")
+        if domain and (needle == domain or needle.endswith(f".{domain}")):
+            return HostApproval.SUFFIX
+        return HostApproval.NONE
+    if needle == entry:
+        return HostApproval.EXACT
+    return HostApproval.NONE
+
+
+def _classified(address: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The address to judge, or None if it will not parse.
+
+    An IPv4-mapped IPv6 answer is reduced to the IPv4 address it really is, because
+    ``::ffff:169.254.169.254`` is link-local reached by a second spelling: judged as a v6 address it
+    looks globally routable, and the guard below would wave it through.
+    """
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return None
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+        return parsed.ipv4_mapped
+    return parsed
+
+
+def globally_routable(address: str) -> bool:
+    """Whether a *pattern*-approved name is allowed to resolve here: the public internet only.
+
+    Fails closed on anything it cannot parse or classify.
+
+    ``is_global`` carries the special-use registries, which is exactly what this needs - it is False
+    for loopback, link-local (169.254/16, so cloud metadata), RFC 1918, CGNAT, the unspecified
+    address and the reserved test/benchmark ranges - and it tracks them far better than
+    ``is_private``, which :func:`agent.reachability.is_private_v4` already documents as the wrong
+    primitive for this job.
+
+    Multicast is excluded explicitly because ``is_global`` is **True** for it in both families
+    (``224.0.0.1``, ``ff02::1``). A tunnel has no business dialling a group address, and relying on
+    ``is_global`` alone here would have left that open.
+    """
+    parsed = _classified(address)
+    if parsed is None:
         return False
-    for raw in allowed_hosts:
-        entry = normalize_host(raw)
-        if not entry:
-            continue
-        if entry == ANY_HOST:
-            return True
-        if entry.startswith("*."):
-            entry = entry[1:]  # "*.example.com" -> ".example.com"
-        if entry.startswith("."):
-            domain = entry.lstrip(".")
-            if domain and (needle == domain or needle.endswith(f".{domain}")):
-                return True
-            continue
-        if needle == entry:
-            return True
-    return False
+    return parsed.is_global and not parsed.is_multicast
 
 
 class Refused(Exception):
@@ -333,10 +428,26 @@ class TunnelClient:
         dial it, which reads as a machine that exists and cannot be assessed. It widens by exact
         address only (see :meth:`_in_operator_scope`), so it can never open a network.
 
-        A hostname is resolved here and allowed when *every* address it resolves to is inside the
-        registered networks, when ares pushed the name for a running hunt, or when it is in scope
-        by hand. Returning a concrete address (not the name) is what keeps the check and the
-        connect on the same destination.
+        A hostname is resolved here, and then the authority for dialling it decides how far that
+        authority reaches. Strongest first:
+
+        * every address inside the registered networks - allowed, as it always has been;
+        * an exact host an operator put in this agent's scope - allowed wherever it resolves,
+          because that is a person naming one destination on purpose;
+        * an exact name ares pushed for a running hunt - likewise allowed wherever it resolves: the
+          assessment names its target, and that target is routinely an internal name that
+          split-horizon DNS answers with a private address;
+        * a *pattern* ares pushed - ``*`` or a domain suffix - allowed only if EVERY address it
+          resolved to is globally routable. A pattern matches names nobody enumerated, so it is not
+          evidence that any particular destination was intended, and it must not become a route to
+          loopback, cloud metadata, or a private segment this agent was never registered for.
+
+        Every address has to pass, not just the one that gets dialled: whoever controls the DNS
+        answer controls its order, so approving a mixed reply and then taking the first record is
+        the same as having no check at all.
+
+        Returning a concrete address (not the name) is what keeps the check and the connect on the
+        same destination.
         """
         if is_ip_literal(host):
             if not self._in_allowed_networks(host) and not self._in_operator_scope(host):
@@ -345,9 +456,23 @@ class TunnelClient:
                 )
             return host
         addresses = await self._resolve(host, port)
-        inside_networks = all(self._in_allowed_networks(a) for a in addresses)
-        approved_by_ares = host_approved(host, self._allowed_hosts)
-        if inside_networks or approved_by_ares or self._in_operator_scope(host):
+        if all(self._in_allowed_networks(a) for a in addresses):
+            return addresses[0]
+        if self._in_operator_scope(host):
+            return addresses[0]
+        approval = host_approval(host, self._allowed_hosts)
+        if approval is HostApproval.EXACT:
+            return addresses[0]
+        if approval is not HostApproval.NONE:
+            unroutable = [a for a in addresses if not globally_routable(a)]
+            if unroutable:
+                raise Refused(
+                    f"{host} is approved for this assessment by {approval.value} match only, and "
+                    f"resolves to {summarize_addresses(unroutable)}, which is not public address "
+                    "space; a pattern that matches names nobody listed cannot reach loopback, "
+                    "link-local, private or reserved destinations. Add the exact host to this "
+                    "agent's scope if it is genuinely a target."
+                )
             return addresses[0]
         raise Refused(
             f"{host} resolves outside this agent's registered networks "
