@@ -205,36 +205,7 @@ class HostApproval(Enum):
 _APPROVAL_PRECEDENCE = (HostApproval.EXACT, HostApproval.SUFFIX, HostApproval.WILDCARD)
 
 
-def host_approval(host: str, allowed_hosts: Iterable[str]) -> HostApproval:
-    """How ares approved ``host`` for a running assessment, or :attr:`HostApproval.NONE`.
-
-    Every entry is considered, not just the first that matches, because the answer must be the
-    NARROWEST way this host was approved. ``{"*", "intranet.acme.local"}`` is a real and common
-    set - the wildcard for the login detour, the exact name for the target - and grading that host
-    as a wildcard match would refuse the very destination the hunt is for.
-    """
-    matched: set[HostApproval] = set()
-    for raw in allowed_hosts:
-        kind = _entry_matches(host, raw)
-        if kind is not HostApproval.NONE:
-            matched.add(kind)
-    for kind in _APPROVAL_PRECEDENCE:
-        if kind in matched:
-            return kind
-    return HostApproval.NONE
-
-
-def host_approved(host: str, allowed_hosts: Iterable[str]) -> bool:
-    """Whether ares approved ``host`` at all, in any of the forms :func:`host_approval` grades.
-
-    Kept as the plain yes/no question for callers that do not care how the approval was reached.
-    Anything making an authorization decision wants :func:`host_approval` instead, because the
-    *kind* of match is what bounds the addresses the name may resolve to.
-    """
-    return host_approval(host, allowed_hosts) is not HostApproval.NONE
-
-
-def _entry_matches(host: str, entry: str) -> HostApproval:
+def _entry_matches(host: str, raw: str) -> HostApproval:
     """How one allowed-hosts entry matches ``host``.
 
     Three forms, in the order an operator would expect:
@@ -250,10 +221,8 @@ def _entry_matches(host: str, entry: str) -> HostApproval:
     ``acme.okta.com`` and ``okta.com``, but never ``notokta.com``.
     """
     needle = normalize_host(host)
-    if not needle:
-        return HostApproval.NONE
-    entry = normalize_host(entry)
-    if not entry:
+    entry = normalize_host(raw)
+    if not needle or not entry:
         return HostApproval.NONE
     if entry == ANY_HOST:
         return HostApproval.WILDCARD
@@ -264,12 +233,25 @@ def _entry_matches(host: str, entry: str) -> HostApproval:
         if domain and (needle == domain or needle.endswith(f".{domain}")):
             return HostApproval.SUFFIX
         return HostApproval.NONE
-    if needle == entry:
-        return HostApproval.EXACT
+    return HostApproval.EXACT if needle == entry else HostApproval.NONE
+
+
+def host_approval(host: str, allowed_hosts: Iterable[str]) -> HostApproval:
+    """How ares approved ``host`` for a running assessment, or :attr:`HostApproval.NONE`.
+
+    Every entry is considered, not just the first that matches, because the answer must be the
+    NARROWEST way this host was approved. ``{"*", "intranet.acme.local"}`` is a real and common
+    set - the wildcard for the login detour, the exact name for the target - and grading that host
+    as a wildcard match would refuse the very destination the hunt is for.
+    """
+    matched = {_entry_matches(host, raw) for raw in allowed_hosts}
+    for kind in _APPROVAL_PRECEDENCE:
+        if kind in matched:
+            return kind
     return HostApproval.NONE
 
 
-def _classified(address: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+def _normalized_address(address: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     """The address to judge, or None if it will not parse.
 
     An IPv4-mapped IPv6 answer is reduced to the IPv4 address it really is, because
@@ -288,19 +270,16 @@ def _classified(address: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address |
 def globally_routable(address: str) -> bool:
     """Whether a *pattern*-approved name is allowed to resolve here: the public internet only.
 
-    Fails closed on anything it cannot parse or classify.
-
-    ``is_global`` carries the special-use registries, which is exactly what this needs - it is False
-    for loopback, link-local (169.254/16, so cloud metadata), RFC 1918, CGNAT, the unspecified
-    address and the reserved test/benchmark ranges - and it tracks them far better than
-    ``is_private``, which :func:`agent.reachability.is_private_v4` already documents as the wrong
-    primitive for this job.
+    Fails closed on anything that will not parse. ``is_global`` is the right primitive because it
+    carries the special-use registries - False for loopback, link-local (169.254/16, so cloud
+    metadata), RFC 1918, CGNAT, the unspecified address and the reserved test/benchmark ranges -
+    unlike ``is_private``, which :func:`agent.reachability.is_private_v4` documents as unreliable.
 
     Multicast is excluded explicitly because ``is_global`` is **True** for it in both families
-    (``224.0.0.1``, ``ff02::1``). A tunnel has no business dialling a group address, and relying on
-    ``is_global`` alone here would have left that open.
+    (``224.0.0.1``, ``ff02::1``). A tunnel has no business dialling a group address, and
+    ``is_global`` alone would have left that open.
     """
-    parsed = _classified(address)
+    parsed = _normalized_address(address)
     if parsed is None:
         return False
     return parsed.is_global and not parsed.is_multicast
@@ -456,15 +435,15 @@ class TunnelClient:
                 )
             return host
         addresses = await self._resolve(host, port)
-        if all(self._in_allowed_networks(a) for a in addresses):
-            return addresses[0]
-        if self._in_operator_scope(host):
+        if all(self._in_allowed_networks(value) for value in addresses):
             return addresses[0]
         approval = host_approval(host, self._allowed_hosts)
-        if approval is HostApproval.EXACT:
+        # A destination somebody named on purpose: an operator's standing scope entry, or the exact
+        # target of this run. Either may legitimately be an internal host on a private address.
+        if self._in_operator_scope(host) or approval is HostApproval.EXACT:
             return addresses[0]
         if approval is not HostApproval.NONE:
-            unroutable = [a for a in addresses if not globally_routable(a)]
+            unroutable = [value for value in addresses if not globally_routable(value)]
             if unroutable:
                 raise Refused(
                     f"{host} is approved for this assessment by {approval.value} match only, and "

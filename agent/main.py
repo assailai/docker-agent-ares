@@ -38,6 +38,9 @@ from agent.tunnel import probe as tunnel_probe  # aliased: bare "probe" says too
 logger = logging.getLogger("ares.agent")
 
 
+_Network = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
 class _AuthInvalidated(Exception):
     """The control plane rejected our agent token past the retry threshold.
 
@@ -490,43 +493,50 @@ def _identity_probe() -> IdentityProbe | None:
     )
 
 
-def _local_ceiling() -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
-    """The networks ARES_NETWORKS pins this agent to, or [] when it was not set.
+def _parse_networks(values: list[str]) -> tuple[list[_Network], list[str]]:
+    """Split CIDR strings into the ones that parse and the ones that do not.
 
-    Unparseable entries are dropped rather than allowed to fail every task: ARES_NETWORKS is a
-    free-form string (:meth:`agent.config.Settings.network_overrides` does not validate it), and one
-    typo in a list of five should not stop the agent scanning the four that are fine. ``run`` names
-    the bad entries once at startup so the typo is still visible.
+    Tolerant on purpose. ARES_NETWORKS is a free-form string that
+    :meth:`agent.config.Settings.network_overrides` does not validate, and one typo in a list of
+    five should not stop the agent scanning the four that are fine. The rejects come back so
+    ``run`` can name them once at startup rather than leaving an operator to infer the typo from
+    refused tasks.
     """
-    ceiling: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
-    for value in settings.network_overrides():
+    good: list[_Network] = []
+    bad: list[str] = []
+    for value in values:
         try:
-            ceiling.append(ipaddress.ip_network(value, strict=False))
+            good.append(ipaddress.ip_network(value, strict=False))
         except ValueError:
-            continue
-    return ceiling
+            bad.append(value)
+    return good, bad
+
+
+def _contained_by(target: _Network, networks: list[_Network]) -> bool:
+    """Whether ``target`` sits wholly inside any of ``networks``.
+
+    Version-matched first because ``subnet_of`` raises TypeError across families, so an IPv6 entry
+    in an otherwise IPv4 list would crash the comparison rather than simply failing to match.
+    """
+    return any(target.version == net.version and target.subnet_of(net) for net in networks)
 
 
 def _warn_unparseable_networks() -> None:
     """Name any ARES_NETWORKS entry that is not a CIDR, once, at startup."""
-    bad = []
-    for value in settings.network_overrides():
-        try:
-            ipaddress.ip_network(value, strict=False)
-        except ValueError:
-            bad.append(value)
-    if bad:
-        logger.warning(
-            "Ignoring %d ARES_NETWORKS entr%s that %s not a CIDR: %s. The rest still apply, and "
-            "they are the ceiling this agent will hold scan tasks to.",
-            len(bad),
-            "y" if len(bad) == 1 else "ies",
-            "is" if len(bad) == 1 else "are",
-            ", ".join(repr(value) for value in bad),
-        )
+    _, bad = _parse_networks(settings.network_overrides())
+    if not bad:
+        return
+    logger.warning(
+        "Ignoring %d ARES_NETWORKS entr%s that %s not a CIDR: %s. The rest still apply, and they "
+        "are the ceiling this agent will hold scan tasks to.",
+        len(bad),
+        "y" if len(bad) == 1 else "ies",
+        "is" if len(bad) == 1 else "are",
+        ", ".join(repr(value) for value in bad),
+    )
 
 
-def _warn_if_undetected(task_id: str, target: ipaddress.IPv4Network) -> None:
+def _warn_if_undetected(task_id: str, target: _Network) -> None:
     """Say so when a task targets somewhere this agent never reported it could reach.
 
     Advisory only, and on purpose. Without ARES_NETWORKS the scope is whatever re-detection last
@@ -534,15 +544,17 @@ def _warn_if_undetected(task_id: str, target: ipaddress.IPv4Network) -> None:
     as widens - enforcing it would refuse legitimate tasks whenever a task and a re-detect crossed.
     So the scan proceeds and the operator gets the one line they need to notice drift, plus the
     knob that turns this into a hard ceiling.
+
+    Silent when ARES_NETWORKS is set, because then the ceiling is enforced and there is no drift to
+    report; the check lives here so no caller has to remember that.
     """
+    if settings.network_overrides():
+        return
     detected = _reachable["networks"]
     if not detected:
         return  # nothing detected yet: the first task can easily beat the first probe
-    try:
-        known = [ipaddress.ip_network(net, strict=False) for net in detected]
-    except ValueError:  # pragma: no cover - detection emits parseable CIDRs
-        return
-    if any(target.version == net.version and target.subnet_of(net) for net in known):
+    known, _ = _parse_networks(detected)
+    if _contained_by(target, known):
         return
     logger.warning(
         "Scan task %s targets %s, which is outside every network this agent detected (%s). "
@@ -577,10 +589,8 @@ def _authorized_target(cidr: str) -> ipaddress.IPv4Network:
         raise ValueError(f"only IPv4 ranges are supported, got {cidr}")
     if target.prefixlen == 0:
         raise ValueError(f"{target} is the whole address space, which is never a scan scope")
-    ceiling = _local_ceiling()
-    if ceiling and not any(
-        target.version == net.version and target.subnet_of(net) for net in ceiling
-    ):
+    ceiling, _ = _parse_networks(settings.network_overrides())
+    if ceiling and not _contained_by(target, ceiling):
         allowed = ", ".join(str(net) for net in ceiling)
         raise ValueError(f"{target} is not inside ARES_NETWORKS ({allowed})")
     return target
@@ -603,8 +613,9 @@ async def _run_task(token: str, task: dict) -> None:
         logger.warning("Refused scan task %s: %s", task_id, exc)
         await control_plane.task_failed(settings, token, task_id, f"scope refused: {exc}")
         return
-    if not settings.network_overrides():
-        _warn_if_undetected(task_id, target)
+    _warn_if_undetected(task_id, target)
+    # Scan, log and report the normalized form, so a task naming "10.0.1.7/24" does not describe
+    # itself as a host when what actually gets scanned is 10.0.1.0/24.
     cidr = str(target)
     await control_plane.task_started(settings, token, task_id)
 
@@ -929,16 +940,16 @@ async def run() -> int:
     pins = HostPins(aliases=settings.host_aliases)
     _host_pins = pins
     logger.info("Host pins: %s", pins.summary())
+    # And once more for the same reason: ARES_NETWORKS is the ceiling _authorized_target holds scan
+    # tasks to, so an entry it cannot parse silently shrinks that ceiling. Say so up front rather
+    # than leaving an operator to infer the typo from refused tasks.
+    _warn_unparseable_networks()
     # The subnets this agent is ATTACHED to, which is cheap and instant. Reachability discovery is
     # deliberately NOT awaited here: on the default scope it reaches across the customer's private
     # space and takes minutes, and blocking enrollment on it would leave a freshly installed agent
     # reading "Offline, never" in the dashboard for the whole of that. It runs as a background task
     # instead (_redetect_loop) and reports through the heartbeat, so the agent is online in seconds
     # and its scope widens underneath it as discovery finishes.
-    # Same reasoning again: ARES_NETWORKS is the hard ceiling _authorized_target enforces, so an
-    # entry it cannot parse silently shrinks that ceiling. Name it here rather than leaving an
-    # operator to work it out from refused tasks.
-    _warn_unparseable_networks()
     networks = settings.network_overrides() or netdetect.scan_targets(settings.scan_scope)
     if not networks:
         logger.warning(

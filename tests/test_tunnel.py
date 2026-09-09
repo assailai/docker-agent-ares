@@ -24,7 +24,6 @@ from agent.tunnel import (
     Refused,
     globally_routable,
     host_approval,
-    host_approved,
     TunnelClient,
     TunnelManager,
     _decode,
@@ -411,30 +410,39 @@ async def test_the_probe_sends_no_ssl_context_for_a_plaintext_url(
     ("host", "allowed", "expected"),
     [
         # exact, as before
-        ("staging.acme.com", {"staging.acme.com"}, True),
-        ("other.acme.com", {"staging.acme.com"}, False),
+        ("staging.acme.com", {"staging.acme.com"}, HostApproval.EXACT),
+        ("other.acme.com", {"staging.acme.com"}, HostApproval.NONE),
         # suffix forms. This is the hole exact-match left: ares ships okta.com / auth0.com /
         # pingone.com as built-in identity providers, but every real tenant is <name>.okta.com,
         # so none of those entries ever matched anything at all.
-        ("acme.okta.com", {".okta.com"}, True),
-        ("acme.okta.com", {"*.okta.com"}, True),
-        ("okta.com", {".okta.com"}, True),
-        ("deep.sub.okta.com", {"*.okta.com"}, True),
+        ("acme.okta.com", {".okta.com"}, HostApproval.SUFFIX),
+        ("acme.okta.com", {"*.okta.com"}, HostApproval.SUFFIX),
+        ("okta.com", {".okta.com"}, HostApproval.SUFFIX),
+        ("deep.sub.okta.com", {"*.okta.com"}, HostApproval.SUFFIX),
         # a suffix entry must not match a host that merely ENDS WITH the text
-        ("notokta.com", {".okta.com"}, False),
-        ("okta.com.evil.test", {".okta.com"}, False),
+        ("notokta.com", {".okta.com"}, HostApproval.NONE),
+        ("okta.com.evil.test", {".okta.com"}, HostApproval.NONE),
         # the wildcard opens any name
-        ("anything.at.all.example", {"*"}, True),
-        ("agtacc.allstate.com", {"*"}, True),
+        ("anything.at.all.example", {"*"}, HostApproval.WILDCARD),
+        ("agtacc.allstate.com", {"*"}, HostApproval.WILDCARD),
         # case and the root dot are irrelevant on both sides
-        ("ACME.Okta.Com.", {"*.OKTA.com"}, True),
+        ("ACME.Okta.Com.", {"*.OKTA.com"}, HostApproval.SUFFIX),
         # empties are never a destination
-        ("", {"*"}, False),
-        ("host.example.com", {"", "   "}, False),
+        ("", {"*"}, HostApproval.NONE),
+        ("host.example.com", {"", "   "}, HostApproval.NONE),
+        # Several entries can match at once, and the NARROWEST decides, whatever order the set
+        # iterates in. ares pushes "*" ALONGSIDE the run's real target while an interactive login
+        # is parked, so this is the common case rather than a corner: grading it WILDCARD would
+        # apply the public-address rule to the hunt's own internal target and refuse it.
+        ("acme.okta.com", {"*", "acme.okta.com"}, HostApproval.EXACT),
+        ("acme.okta.com", {"*", ".okta.com"}, HostApproval.SUFFIX),
+        ("acme.okta.com", {"*", ".okta.com", "acme.okta.com"}, HostApproval.EXACT),
     ],
 )
-def test_host_approved(host: str, allowed: set[str], expected: bool) -> None:
-    assert host_approved(host, allowed) is expected
+def test_host_approval_reports_the_narrowest_match(
+    host: str, allowed: set[str], expected: HostApproval
+) -> None:
+    assert host_approval(host, allowed) is expected
 
 
 def test_wildcard_does_not_widen_ip_literals() -> None:
@@ -452,31 +460,6 @@ def test_wildcard_lets_an_unenumerated_login_host_through() -> None:
     assert asyncio.run(client._dial_address("agtacc.allstate.com", 443)) == "167.127.118.229"
 
 
-@pytest.mark.parametrize(
-    ("host", "allowed", "expected"),
-    [
-        ("acme.okta.com", {"acme.okta.com"}, HostApproval.EXACT),
-        ("acme.okta.com", {".okta.com"}, HostApproval.SUFFIX),
-        ("acme.okta.com", {"*.okta.com"}, HostApproval.SUFFIX),
-        ("acme.okta.com", {"*"}, HostApproval.WILDCARD),
-        ("acme.okta.com", {"other.example.com"}, HostApproval.NONE),
-        ("acme.okta.com", set(), HostApproval.NONE),
-        ("", {"*"}, HostApproval.NONE),
-        # The narrowest match wins, whatever order the set iterates in. ares pushes "*" ALONGSIDE
-        # the run's real target while an interactive login is parked, so this exact combination is
-        # the common case and not a corner: grading it WILDCARD would apply the public-address rule
-        # to the hunt's own internal target and refuse it.
-        ("acme.okta.com", {"*", "acme.okta.com"}, HostApproval.EXACT),
-        ("acme.okta.com", {"*", ".okta.com"}, HostApproval.SUFFIX),
-        ("acme.okta.com", {"*", ".okta.com", "acme.okta.com"}, HostApproval.EXACT),
-    ],
-)
-def test_host_approval_reports_the_narrowest_match(
-    host: str, allowed: set[str], expected: HostApproval
-) -> None:
-    assert host_approval(host, allowed) is expected
-
-
 # --- address classes: what a pattern-approved name is allowed to resolve to --------------------
 #
 # A name approved by "*" or a domain suffix matches hosts nobody enumerated, so the name proves
@@ -485,28 +468,28 @@ def test_host_approval_reports_the_narrowest_match(
 # for, on nothing more than an approved login domain.
 
 _SPECIAL_USE = [
-    ("169.254.169.254", "cloud metadata over link-local"),
-    ("127.0.0.1", "IPv4 loopback"),
-    ("192.168.7.9", "RFC 1918 outside the registered networks"),
-    ("10.9.9.9", "RFC 1918 in a different private block"),
-    ("100.64.0.1", "RFC 6598 carrier-grade NAT"),
-    ("0.0.0.0", "the unspecified address"),
-    ("224.0.0.1", "IPv4 multicast, which ipaddress.is_global calls global"),
-    ("239.255.255.250", "IPv4 administratively scoped multicast"),
-    ("203.0.113.5", "TEST-NET-3"),
-    ("198.18.0.1", "the benchmarking range"),
-    ("::1", "IPv6 loopback"),
-    ("fe80::1", "IPv6 link-local"),
-    ("fc00::1", "IPv6 unique-local"),
-    ("ff02::1", "IPv6 multicast, which ipaddress.is_global also calls global"),
-    ("::", "the IPv6 unspecified address"),
-    ("::ffff:169.254.169.254", "metadata wearing an IPv4-mapped IPv6 spelling"),
-    ("::ffff:127.0.0.1", "loopback wearing an IPv4-mapped IPv6 spelling"),
+    pytest.param("169.254.169.254", id="cloud-metadata-over-link-local"),
+    pytest.param("127.0.0.1", id="ipv4-loopback"),
+    pytest.param("192.168.7.9", id="rfc1918-outside-registered-networks"),
+    pytest.param("10.9.9.9", id="rfc1918-in-another-private-block"),
+    pytest.param("100.64.0.1", id="rfc6598-carrier-grade-nat"),
+    pytest.param("0.0.0.0", id="unspecified"),
+    pytest.param("224.0.0.1", id="ipv4-multicast-which-is-global-calls-global"),
+    pytest.param("239.255.255.250", id="ipv4-scoped-multicast"),
+    pytest.param("203.0.113.5", id="test-net-3"),
+    pytest.param("198.18.0.1", id="benchmarking-range"),
+    pytest.param("::1", id="ipv6-loopback"),
+    pytest.param("fe80::1", id="ipv6-link-local"),
+    pytest.param("fc00::1", id="ipv6-unique-local"),
+    pytest.param("ff02::1", id="ipv6-multicast-which-is-global-also-calls-global"),
+    pytest.param("::", id="ipv6-unspecified"),
+    pytest.param("::ffff:169.254.169.254", id="metadata-as-ipv4-mapped-ipv6"),
+    pytest.param("::ffff:127.0.0.1", id="loopback-as-ipv4-mapped-ipv6"),
 ]
 
 
-@pytest.mark.parametrize(("address", "why"), _SPECIAL_USE)
-def test_a_wildcard_name_cannot_reach_special_use_space(address: str, why: str) -> None:
+@pytest.mark.parametrize("address", _SPECIAL_USE)
+def test_a_wildcard_name_cannot_reach_special_use_space(address: str) -> None:
     """Pinned as a table because this is a policy about the special-use registries, and those move
     between Python releases: production runs 3.12 while a dev venv may be newer."""
     client = _client(networks=["10.0.0.0/24"], allowed_hosts={"*"})
@@ -515,8 +498,8 @@ def test_a_wildcard_name_cannot_reach_special_use_space(address: str, why: str) 
         asyncio.run(client._dial_address("login-resource.example.test", 443))
 
 
-@pytest.mark.parametrize(("address", "why"), _SPECIAL_USE)
-def test_a_suffix_name_cannot_reach_special_use_space(address: str, why: str) -> None:
+@pytest.mark.parametrize("address", _SPECIAL_USE)
+def test_a_suffix_name_cannot_reach_special_use_space(address: str) -> None:
     """A suffix is as unenumerable as "*" and gets the same rule. This matters MORE than the
     wildcard: ares ships okta.com / auth0.com / pingone.com as built-in identity-provider suffixes,
     so a suffix entry is not confined to the interactive-login window the wildcard lives in."""
@@ -534,7 +517,13 @@ def test_a_pattern_named_public_address_is_still_reachable() -> None:
     assert asyncio.run(client._dial_address("cdn.example.test", 443)) == "93.184.216.34"
 
 
-@pytest.mark.parametrize("answers", [["93.184.216.34", "169.254.169.254"], ["169.254.169.254", "93.184.216.34"]])
+@pytest.mark.parametrize(
+    "answers",
+    [
+        ["93.184.216.34", "169.254.169.254"],
+        ["169.254.169.254", "93.184.216.34"],
+    ],
+)
 def test_one_bad_answer_refuses_the_whole_name(answers: list[str]) -> None:
     """EVERY answer has to pass, not just the one that would be dialled. Whoever controls the DNS
     reply controls its order, so checking a mixed reply and then taking the first record would be

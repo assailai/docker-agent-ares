@@ -321,6 +321,10 @@ async def test_run_task_fails_without_a_target_network(monkeypatch: pytest.Monke
 # instruction is still just an instruction.
 
 
+async def _noop(*_a, **_kw) -> None:
+    return None
+
+
 def _scope_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
     """Record what a task actually did: whether it started, scanned, or was refused."""
     seen: dict[str, list] = {"started": [], "scanned": [], "failed": []}
@@ -341,10 +345,6 @@ def _scope_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
     monkeypatch.setattr(main.control_plane, "task_progress", _noop)
     monkeypatch.setattr(main.scan, "scan_cidr", _fake_scan)
     return seen
-
-
-async def _noop(*_a, **_kw) -> None:
-    return None
 
 
 @pytest.mark.parametrize(
@@ -513,7 +513,7 @@ async def test_a_refused_task_is_reported_exactly_once(monkeypatch: pytest.Monke
 async def test_a_denied_task_stays_denied_when_the_control_plane_retries_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A retry is not a second opinion. Redelivering the same task must not eventually get it run."""
+    """A retry is not a second opinion. Redelivering the same task must not eventually run it."""
     seen = _scope_probe(monkeypatch)
     monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24")
     task = {"id": "t1", "target_network": "203.0.113.0/24"}
@@ -529,7 +529,7 @@ async def test_the_normalized_target_is_what_gets_scanned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A host bit set in the task ("10.0.1.7/24") is scanned as its network either way, since the
-    scanner normalizes internally. Passing the normalized form on makes the logs say what happened."""
+    scanner normalizes internally. Passing the normalized form on makes the logs say so too."""
     seen = _scope_probe(monkeypatch)
     monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24")
 
