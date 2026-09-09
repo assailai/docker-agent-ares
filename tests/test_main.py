@@ -314,6 +314,230 @@ async def test_run_task_fails_without_a_target_network(monkeypatch: pytest.Monke
     assert failed == ["missing target_network"]
 
 
+# --- scan scope: the agent checks the destination it was told to scan ---------------------------
+#
+# The agent is the last thing between an instruction and a customer's network, so it re-checks the
+# target itself instead of trusting that whoever queued the task got it right. An authenticated
+# instruction is still just an instruction.
+
+
+def _scope_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
+    """Record what a task actually did: whether it started, scanned, or was refused."""
+    seen: dict[str, list] = {"started": [], "scanned": [], "failed": []}
+
+    async def _task_started(_s, _t, task_id):
+        seen["started"].append(task_id)
+
+    async def _task_failed(_s, _t, _task_id, reason):
+        seen["failed"].append(reason)
+
+    async def _fake_scan(cidr, _ports, **_kwargs):
+        seen["scanned"].append(cidr)
+        return []
+
+    monkeypatch.setattr(main.control_plane, "task_started", _task_started)
+    monkeypatch.setattr(main.control_plane, "task_failed", _task_failed)
+    monkeypatch.setattr(main.control_plane, "task_completed", _noop)
+    monkeypatch.setattr(main.control_plane, "task_progress", _noop)
+    monkeypatch.setattr(main.scan, "scan_cidr", _fake_scan)
+    return seen
+
+
+async def _noop(*_a, **_kw) -> None:
+    return None
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "10.0.1.0/24",  # exactly the approved network
+        "10.0.1.64/26",  # a subnet of it
+        "10.0.1.7/32",  # a single host inside it
+    ],
+)
+async def test_a_target_inside_ares_networks_is_scanned(
+    monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24")
+
+    await main._run_task("tok", {"id": "t1", "target_network": target})
+
+    assert seen["failed"] == []
+    assert seen["started"] == ["t1"]
+    assert seen["scanned"]
+
+
+@pytest.mark.parametrize(
+    ("target", "why"),
+    [
+        ("10.0.0.0/16", "a supernet of the approved network"),
+        ("10.0.0.0/23", "a supernet that merely contains it"),
+        ("10.0.0.0/8", "the whole private block"),
+        ("192.168.1.0/24", "an unrelated private network"),
+        ("203.0.113.0/24", "a public network"),
+        ("127.0.0.0/8", "loopback"),
+        ("169.254.0.0/16", "link-local, where cloud metadata lives"),
+    ],
+)
+async def test_a_target_outside_ares_networks_is_refused(
+    monkeypatch: pytest.MonkeyPatch, target: str, why: str
+) -> None:
+    """Containment, not overlap. A supernet of an approved network is a request for everything ELSE
+    in it too, so overlapping is not close enough - ARES_NETWORKS is a decision nothing widens."""
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24")
+
+    await main._run_task("tok", {"id": "t1", "target_network": target})
+
+    assert seen["scanned"] == []
+    assert seen["started"] == []  # never reported as begun, because it never began
+    assert len(seen["failed"]) == 1
+    assert "scope refused" in seen["failed"][0]
+    assert "ARES_NETWORKS" in seen["failed"][0]
+
+
+@pytest.mark.parametrize(
+    ("target", "reason"),
+    [
+        ("not-a-cidr", "does not appear to be"),
+        ("10.0.0.0/33", "does not appear to be"),
+        ("", "missing target_network"),
+        ("::/0", "only IPv4"),
+        ("fd00::/8", "only IPv4"),
+        ("0.0.0.0/0", "whole address space"),
+    ],
+)
+async def test_a_target_that_is_never_a_scope_is_refused_in_either_mode(
+    monkeypatch: pytest.MonkeyPatch, target: str, reason: str
+) -> None:
+    """Malformed, IPv6 and the default route are refused whether or not ARES_NETWORKS is set: there
+    is no configuration under which they are a scan scope. The scanner would reject the first two
+    itself, but only after the task had been marked started."""
+    for networks in ("10.0.1.0/24", ""):
+        seen = _scope_probe(monkeypatch)
+        monkeypatch.setattr(main.settings, "networks", networks)
+
+        await main._run_task("tok", {"id": "t1", "target_network": target})
+
+        assert seen["scanned"] == []
+        assert seen["started"] == []
+        assert reason in seen["failed"][0]
+
+
+async def test_a_typo_in_ares_networks_does_not_refuse_everything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ARES_NETWORKS is a free-form string, so one bad entry in a list of three must not take the
+    other two down with it. run() names the bad entry at startup instead."""
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24, oops, 192.168.5.0/24")
+
+    await main._run_task("tok", {"id": "t1", "target_network": "192.168.5.128/25"})
+
+    assert seen["scanned"] == ["192.168.5.128/25"]
+
+
+def test_startup_names_an_unparseable_ares_networks_entry(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24, oops")
+    with caplog.at_level(logging.WARNING, logger="ares.agent"):
+        main._warn_unparseable_networks()
+
+    assert "'oops'" in caplog.records[0].getMessage()
+
+
+async def test_an_auto_detected_scope_warns_but_does_not_refuse(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Without ARES_NETWORKS the scope is whatever re-detection last worked out, which is evidence
+    of reachability rather than an authorization - and it narrows as well as widens, so enforcing it
+    would refuse legitimate tasks whenever a task and a re-detect crossed. The operator gets the one
+    line they need to notice drift, and the knob that makes it a hard ceiling."""
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", "")
+    monkeypatch.setitem(main._reachable, "networks", ["10.0.0.0/8"])
+
+    with caplog.at_level(logging.WARNING, logger="ares.agent"):
+        await main._run_task("tok", {"id": "t1", "target_network": "203.0.113.0/24"})
+
+    assert seen["scanned"] == ["203.0.113.0/24"]  # scanned, by choice
+    warning = caplog.records[0].getMessage()
+    assert "outside every network this agent detected" in warning
+    assert "ARES_NETWORKS" in warning  # and says how to make it enforceable
+
+
+async def test_an_auto_detected_scope_is_quiet_about_a_target_it_detected(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", "")
+    monkeypatch.setitem(main._reachable, "networks", ["10.0.0.0/8"])
+
+    with caplog.at_level(logging.WARNING, logger="ares.agent"):
+        await main._run_task("tok", {"id": "t1", "target_network": "10.4.0.0/24"})
+
+    assert seen["scanned"] == ["10.4.0.0/24"]
+    assert caplog.records == []
+
+
+async def test_nothing_detected_yet_is_not_treated_as_drift(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The first task can beat the first reachability probe; an empty answer is "not yet", not
+    "outside the scope"."""
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", "")
+    monkeypatch.setitem(main._reachable, "networks", [])
+
+    with caplog.at_level(logging.WARNING, logger="ares.agent"):
+        await main._run_task("tok", {"id": "t1", "target_network": "10.4.0.0/24"})
+
+    assert seen["scanned"] == ["10.4.0.0/24"]
+    assert caplog.records == []
+
+
+async def test_a_refused_task_is_reported_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One auditable failure and zero scan calls, so a denial reads unambiguously in the dashboard
+    and cannot be mistaken for a scan that found nothing."""
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24")
+
+    await main._run_task("tok", {"id": "t1", "target_network": "203.0.113.0/24"})
+
+    assert len(seen["failed"]) == 1
+    assert seen["scanned"] == []
+
+
+async def test_a_denied_task_stays_denied_when_the_control_plane_retries_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry is not a second opinion. Redelivering the same task must not eventually get it run."""
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24")
+    task = {"id": "t1", "target_network": "203.0.113.0/24"}
+
+    for _ in range(3):
+        await main._run_task("tok", task)
+
+    assert seen["scanned"] == []
+    assert len(seen["failed"]) == 3
+
+
+async def test_the_normalized_target_is_what_gets_scanned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host bit set in the task ("10.0.1.7/24") is scanned as its network either way, since the
+    scanner normalizes internally. Passing the normalized form on makes the logs say what happened."""
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24")
+
+    await main._run_task("tok", {"id": "t1", "target_network": "10.0.1.7/24"})
+
+    assert seen["scanned"] == ["10.0.1.0/24"]
+
+
 async def test_run_advertises_auto_scoped_networks(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
