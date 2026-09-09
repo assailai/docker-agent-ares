@@ -745,8 +745,13 @@ async def test_record_contact_throttles_the_marker_but_always_bumps_the_clock(
     # ~5s poll), but the in-memory watchdog clock advances on every contact.
     monkeypatch.setattr(main.settings, "data_dir", tmp_path)
     monkeypatch.setattr(main, "_MARKER_MIN_INTERVAL_SECONDS", 999)
-    main._liveness["last_marker_at"] = 0.0
-    main._record_contact()  # first write allowed (last_marker_at was 0)
+    # Far enough back that the first write is due whatever the host's uptime is. A literal 0.0
+    # reads as "never written", but the guard compares against time.monotonic(), which is seconds
+    # since boot: on a machine up for less than the interval, 0.0 makes the write look throttled
+    # and nothing is written at all. That passes on a long-lived laptop and fails on a fresh CI
+    # runner.
+    main._liveness["last_marker_at"] = time.monotonic() - 1000
+    main._record_contact()  # first write allowed: the interval has elapsed
     marker = tmp_path / "last-contact"
     marker.unlink()  # remove it; a throttled second call must NOT recreate it
     main._liveness["last_contact"] = 0.0
