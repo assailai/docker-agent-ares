@@ -430,7 +430,7 @@ async def test_the_probe_sends_no_ssl_context_for_a_plaintext_url(
         # empties are never a destination
         ("", {"*"}, HostApproval.NONE),
         ("host.example.com", {"", "   "}, HostApproval.NONE),
-        # Several entries can match at once, and the narrowest decides, whatever order the set
+        # several entries can match at once, and the narrowest decides, whatever order the set
         # iterates in. ares pushes "*" alongside the run's real target while an interactive login
         # is parked, so this is the common case rather than a corner: grading it as a wildcard
         # match would apply the public-address rule to the hunt's own target and refuse it.
@@ -462,12 +462,12 @@ def test_wildcard_lets_an_unenumerated_login_host_through() -> None:
 
 # --- address classes: what a pattern-approved name is allowed to resolve to --------------------
 #
-# A name approved by "*" or a domain suffix matches hosts nobody enumerated, so the name proves
+# a name approved by "*" or a domain suffix matches hosts nobody enumerated, so the name proves
 # nothing about intent and the address has to earn the dial. Without this the agent would relay TCP
 # to cloud metadata, to services on loopback, and into private segments it was never registered
 # for, on nothing more than an approved login domain.
 #
-# The suffix half matters at least as much as the wildcard: ares ships okta.com / auth0.com /
+# the suffix half matters at least as much as the wildcard: ares ships okta.com / auth0.com /
 # pingone.com as built-in identity-provider suffixes, so a suffix entry is not confined to the
 # interactive-login window the wildcard lives in.
 
@@ -488,12 +488,12 @@ _SPECIAL_USE = [
     pytest.param("fc00::1", id="v6-unique-local"),
     pytest.param("ff02::1", id="v6-multicast"),
     pytest.param("::", id="v6-unspecified"),
-    # The same two addresses again, spelled as IPv4-mapped IPv6.
+    # the same two addresses again, spelled as IPv4-mapped IPv6.
     pytest.param("::ffff:169.254.169.254", id="mapped-metadata"),
     pytest.param("::ffff:127.0.0.1", id="mapped-loopback"),
 ]
 
-# Both ways a name can be approved by pattern rather than by name, which get the same rule.
+# both ways a name can be approved by pattern rather than by name, which get the same rule.
 _PATTERNS = [
     pytest.param({"*"}, "login-resource.example.test", id="wildcard"),
     pytest.param({".okta.com"}, "tenant.okta.com", id="suffix"),

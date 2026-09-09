@@ -606,13 +606,13 @@ async def _run_task(token: str, task: dict) -> None:
     try:
         target = _authorized_target(str(cidr))
     except ValueError as exc:
-        # Refused before task_started, so a task the agent will not run is never reported as one it
+        # refused before task_started, so a task the agent will not run is never reported as one it
         # began, and before the scanner, so nothing dials anything.
         logger.warning("Refused scan task %s: %s", task_id, exc)
-        await control_plane.task_failed(settings, token, task_id, f"scope refused: {exc}")
+        await control_plane.task_failed(settings, token, task_id, reason=f"scope refused: {exc}")
         return
     _warn_if_undetected(task_id, target)
-    # Scan, log and report the normalized form, so a task naming "10.0.1.7/24" does not describe
+    # scan, log and report the normalized form, so a task naming "10.0.1.7/24" does not describe
     # itself as a host when what actually gets scanned is 10.0.1.0/24.
     cidr = str(target)
     await control_plane.task_started(settings, token, task_id)
@@ -938,7 +938,7 @@ async def run() -> int:
     pins = HostPins(aliases=settings.host_aliases)
     _host_pins = pins
     logger.info("Host pins: %s", pins.summary())
-    # And once more for the same reason: ARES_NETWORKS is the ceiling _authorized_target holds scan
+    # and once more for the same reason: ARES_NETWORKS is the ceiling _authorized_target holds scan
     # tasks to, so an entry it cannot parse silently shrinks that ceiling. Say so up front rather
     # than leaving an operator to infer the typo from refused tasks.
     _warn_unparseable_networks()

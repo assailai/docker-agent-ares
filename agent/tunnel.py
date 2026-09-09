@@ -200,7 +200,7 @@ class HostApproval(Enum):
     WILDCARD = "wildcard"
 
 
-# Narrowest first. A host can match several entries at once - ares pushes ``*`` alongside the run's
+# narrowest first. A host can match several entries at once - ares pushes ``*`` alongside the run's
 # real target while an interactive login is parked - and the narrowest match is the one that
 # describes what was actually intended, so it is the one that decides.
 _APPROVAL_PRECEDENCE = (HostApproval.EXACT, HostApproval.SUFFIX, HostApproval.WILDCARD)
@@ -439,26 +439,26 @@ class TunnelClient:
         if all(self._in_allowed_networks(value) for value in addresses):
             return addresses[0]
         approval = host_approval(host, self._allowed_hosts)
-        # A destination somebody named on purpose: an operator's standing scope entry, or the exact
-        # target of this run. Either may legitimately be an internal host on a private address.
+        # a destination somebody named on purpose: an operator's standing scope entry, or the exact
+        # target of this run. either may legitimately be an internal host on a private address.
         if self._in_operator_scope(host) or approval is HostApproval.EXACT:
             return addresses[0]
-        if approval is not HostApproval.NONE:
-            unroutable = [value for value in addresses if not globally_routable(value)]
-            if unroutable:
-                raise Refused(
-                    f"{host} is approved for this assessment by {approval.value} match only, and "
-                    f"resolves to {summarize_addresses(unroutable)}, which is not public address "
-                    "space; a pattern that matches names nobody listed cannot reach loopback, "
-                    "link-local, private or reserved destinations. Add the exact host to this "
-                    "agent's scope if it is genuinely a target."
-                )
-            return addresses[0]
-        raise Refused(
-            f"{host} resolves outside this agent's registered networks "
-            f"({summarize_addresses(addresses)}), is not in this agent's scope, and is not an "
-            "approved target of a running assessment"
-        )
+        if approval is HostApproval.NONE:
+            raise Refused(
+                f"{host} resolves outside this agent's registered networks "
+                f"({summarize_addresses(addresses)}), is not in this agent's scope, and is not an "
+                "approved target of a running assessment"
+            )
+        unroutable = [value for value in addresses if not globally_routable(value)]
+        if unroutable:
+            raise Refused(
+                f"{host} is approved for this assessment by {approval.value} match only, and "
+                f"resolves to {summarize_addresses(unroutable)}, which is not public address "
+                "space; a pattern that matches names nobody listed cannot reach loopback, "
+                "link-local, private or reserved destinations. Add the exact host to this "
+                "agent's scope if it is genuinely a target."
+            )
+        return addresses[0]
 
     async def _resolve(self, host: str, port: int) -> list[str]:
         """Addresses for ``host``: a static pin if one exists, else this agent's resolver.

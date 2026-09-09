@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -316,27 +317,36 @@ async def test_run_task_fails_without_a_target_network(monkeypatch: pytest.Monke
 
 # --- scan scope: the agent checks the destination it was told to scan ---------------------------
 #
-# The agent is the last thing between an instruction and a customer's network, so it re-checks the
+# the agent is the last thing between an instruction and a customer's network, so it re-checks the
 # target itself instead of trusting that whoever queued the task got it right. An authenticated
 # instruction is still just an instruction.
 
 
-async def _noop(*_a, **_kw) -> None:
+async def _noop(*_args: object, **_kwargs: object) -> None:
     return None
 
 
-def _scope_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
-    """Record what a task actually did: whether it started, scanned, or was refused."""
-    seen: dict[str, list] = {"started": [], "scanned": [], "failed": []}
+@dataclass
+class _TaskOutcome:
+    """What a scan task actually did, as the control plane and the scanner saw it."""
 
-    async def _task_started(_s, _t, task_id):
-        seen["started"].append(task_id)
+    started: list[str] = field(default_factory=list)
+    scanned: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
 
-    async def _task_failed(_s, _t, _task_id, reason):
-        seen["failed"].append(reason)
 
-    async def _fake_scan(cidr, _ports, **_kwargs):
-        seen["scanned"].append(cidr)
+def _scope_probe(monkeypatch: pytest.MonkeyPatch) -> _TaskOutcome:
+    """Record whether a task started, what it scanned, and why it was refused."""
+    seen = _TaskOutcome()
+
+    async def _task_started(_s: object, _t: object, task_id: str) -> None:
+        seen.started.append(task_id)
+
+    async def _task_failed(_s: object, _t: object, _task_id: str, reason: str) -> None:
+        seen.failed.append(reason)
+
+    async def _fake_scan(cidr: str, _ports: list[int], **_kwargs: object) -> list[dict]:
+        seen.scanned.append(cidr)
         return []
 
     monkeypatch.setattr(main.control_plane, "task_started", _task_started)
@@ -363,25 +373,25 @@ async def test_run_task_scans_a_target_inside_ares_networks(
 
     await main._run_task("tok", {"id": "t1", "target_network": target})
 
-    assert seen["failed"] == []
-    assert seen["started"] == ["t1"]
-    assert seen["scanned"]
+    assert seen.failed == []
+    assert seen.started == ["t1"]
+    assert seen.scanned
 
 
 @pytest.mark.parametrize(
-    ("target", "why"),
+    "target",
     [
-        ("10.0.0.0/16", "a supernet of the approved network"),
-        ("10.0.0.0/23", "a supernet that merely contains it"),
-        ("10.0.0.0/8", "the whole private block"),
-        ("192.168.1.0/24", "an unrelated private network"),
-        ("203.0.113.0/24", "a public network"),
-        ("127.0.0.0/8", "loopback"),
-        ("169.254.0.0/16", "link-local, where cloud metadata lives"),
+        pytest.param("10.0.0.0/16", id="supernet"),
+        pytest.param("10.0.0.0/23", id="supernet-that-merely-contains-it"),
+        pytest.param("10.0.0.0/8", id="whole-private-block"),
+        pytest.param("192.168.1.0/24", id="unrelated-private"),
+        pytest.param("203.0.113.0/24", id="public"),
+        pytest.param("127.0.0.0/8", id="loopback"),
+        pytest.param("169.254.0.0/16", id="link-local"),
     ],
 )
 async def test_run_task_refuses_a_target_outside_ares_networks(
-    monkeypatch: pytest.MonkeyPatch, target: str, why: str
+    monkeypatch: pytest.MonkeyPatch, target: str
 ) -> None:
     """Containment, not overlap: a supernet of an approved network asks for everything else in it
     too, so merely overlapping is not close enough."""
@@ -390,11 +400,11 @@ async def test_run_task_refuses_a_target_outside_ares_networks(
 
     await main._run_task("tok", {"id": "t1", "target_network": target})
 
-    assert seen["scanned"] == []
-    assert seen["started"] == []  # never reported as begun, because it never began
-    assert len(seen["failed"]) == 1
-    assert "scope refused" in seen["failed"][0]
-    assert "ARES_NETWORKS" in seen["failed"][0]
+    assert seen.scanned == []
+    assert seen.started == []  # never reported as begun, because it never began
+    assert len(seen.failed) == 1
+    assert "scope refused" in seen.failed[0]
+    assert "ARES_NETWORKS" in seen.failed[0]
 
 
 @pytest.mark.parametrize(
@@ -419,9 +429,9 @@ async def test_run_task_refuses_a_target_that_is_never_a_scope(
 
         await main._run_task("tok", {"id": "t1", "target_network": target})
 
-        assert seen["scanned"] == []
-        assert seen["started"] == []
-        assert reason in seen["failed"][0]
+        assert seen.scanned == []
+        assert seen.started == []
+        assert reason in seen.failed[0]
 
 
 async def test_run_task_survives_a_typo_in_ares_networks(
@@ -434,7 +444,7 @@ async def test_run_task_survives_a_typo_in_ares_networks(
 
     await main._run_task("tok", {"id": "t1", "target_network": "192.168.5.128/25"})
 
-    assert seen["scanned"] == ["192.168.5.128/25"]
+    assert seen.scanned == ["192.168.5.128/25"]
 
 
 def test_startup_names_an_unparseable_ares_networks_entry(
@@ -461,7 +471,7 @@ async def test_run_task_warns_but_still_scans_outside_the_detected_scope(
     with caplog.at_level(logging.WARNING, logger="ares.agent"):
         await main._run_task("tok", {"id": "t1", "target_network": "203.0.113.0/24"})
 
-    assert seen["scanned"] == ["203.0.113.0/24"]  # scanned, by choice
+    assert seen.scanned == ["203.0.113.0/24"]  # scanned, by choice
     warning = caplog.records[0].getMessage()
     assert "outside every network this agent detected" in warning
     assert "ARES_NETWORKS" in warning  # and says how to make it enforceable
@@ -477,7 +487,7 @@ async def test_run_task_is_quiet_about_a_target_it_detected(
     with caplog.at_level(logging.WARNING, logger="ares.agent"):
         await main._run_task("tok", {"id": "t1", "target_network": "10.4.0.0/24"})
 
-    assert seen["scanned"] == ["10.4.0.0/24"]
+    assert seen.scanned == ["10.4.0.0/24"]
     assert caplog.records == []
 
 
@@ -493,7 +503,7 @@ async def test_run_task_does_not_call_an_empty_detection_drift(
     with caplog.at_level(logging.WARNING, logger="ares.agent"):
         await main._run_task("tok", {"id": "t1", "target_network": "10.4.0.0/24"})
 
-    assert seen["scanned"] == ["10.4.0.0/24"]
+    assert seen.scanned == ["10.4.0.0/24"]
     assert caplog.records == []
 
 
@@ -505,8 +515,8 @@ async def test_run_task_reports_a_refusal_exactly_once(monkeypatch: pytest.Monke
 
     await main._run_task("tok", {"id": "t1", "target_network": "203.0.113.0/24"})
 
-    assert len(seen["failed"]) == 1
-    assert seen["scanned"] == []
+    assert len(seen.failed) == 1
+    assert seen.scanned == []
 
 
 async def test_run_task_keeps_refusing_a_redelivered_task(
@@ -520,8 +530,8 @@ async def test_run_task_keeps_refusing_a_redelivered_task(
     for _ in range(3):
         await main._run_task("tok", task)
 
-    assert seen["scanned"] == []
-    assert len(seen["failed"]) == 3
+    assert seen.scanned == []
+    assert len(seen.failed) == 3
 
 
 async def test_run_task_scans_the_normalized_target(
@@ -534,7 +544,7 @@ async def test_run_task_scans_the_normalized_target(
 
     await main._run_task("tok", {"id": "t1", "target_network": "10.0.1.7/24"})
 
-    assert seen["scanned"] == ["10.0.1.0/24"]
+    assert seen.scanned == ["10.0.1.0/24"]
 
 
 async def test_run_advertises_auto_scoped_networks(
