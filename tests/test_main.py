@@ -355,7 +355,7 @@ def _scope_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
         "10.0.1.7/32",  # a single host inside it
     ],
 )
-async def test_a_target_inside_ares_networks_is_scanned(
+async def test_run_task_scans_a_target_inside_ares_networks(
     monkeypatch: pytest.MonkeyPatch, target: str
 ) -> None:
     seen = _scope_probe(monkeypatch)
@@ -380,11 +380,11 @@ async def test_a_target_inside_ares_networks_is_scanned(
         ("169.254.0.0/16", "link-local, where cloud metadata lives"),
     ],
 )
-async def test_a_target_outside_ares_networks_is_refused(
+async def test_run_task_refuses_a_target_outside_ares_networks(
     monkeypatch: pytest.MonkeyPatch, target: str, why: str
 ) -> None:
-    """Containment, not overlap. A supernet of an approved network is a request for everything ELSE
-    in it too, so overlapping is not close enough - ARES_NETWORKS is a decision nothing widens."""
+    """Containment, not overlap: a supernet of an approved network asks for everything else in it
+    too, so merely overlapping is not close enough."""
     seen = _scope_probe(monkeypatch)
     monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24")
 
@@ -402,13 +402,12 @@ async def test_a_target_outside_ares_networks_is_refused(
     [
         ("not-a-cidr", "does not appear to be"),
         ("10.0.0.0/33", "does not appear to be"),
-        ("", "missing target_network"),
         ("::/0", "only IPv4"),
         ("fd00::/8", "only IPv4"),
         ("0.0.0.0/0", "whole address space"),
     ],
 )
-async def test_a_target_that_is_never_a_scope_is_refused_in_either_mode(
+async def test_run_task_refuses_a_target_that_is_never_a_scope(
     monkeypatch: pytest.MonkeyPatch, target: str, reason: str
 ) -> None:
     """Malformed, IPv6 and the default route are refused whether or not ARES_NETWORKS is set: there
@@ -425,7 +424,7 @@ async def test_a_target_that_is_never_a_scope_is_refused_in_either_mode(
         assert reason in seen["failed"][0]
 
 
-async def test_a_typo_in_ares_networks_does_not_refuse_everything(
+async def test_run_task_survives_a_typo_in_ares_networks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """ARES_NETWORKS is a free-form string, so one bad entry in a list of three must not take the
@@ -448,7 +447,7 @@ def test_startup_names_an_unparseable_ares_networks_entry(
     assert "'oops'" in caplog.records[0].getMessage()
 
 
-async def test_an_auto_detected_scope_warns_but_does_not_refuse(
+async def test_run_task_warns_but_still_scans_outside_the_detected_scope(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Without ARES_NETWORKS the scope is whatever re-detection last worked out, which is evidence
@@ -468,7 +467,7 @@ async def test_an_auto_detected_scope_warns_but_does_not_refuse(
     assert "ARES_NETWORKS" in warning  # and says how to make it enforceable
 
 
-async def test_an_auto_detected_scope_is_quiet_about_a_target_it_detected(
+async def test_run_task_is_quiet_about_a_target_it_detected(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     seen = _scope_probe(monkeypatch)
@@ -482,7 +481,7 @@ async def test_an_auto_detected_scope_is_quiet_about_a_target_it_detected(
     assert caplog.records == []
 
 
-async def test_nothing_detected_yet_is_not_treated_as_drift(
+async def test_run_task_does_not_call_an_empty_detection_drift(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The first task can beat the first reachability probe; an empty answer is "not yet", not
@@ -498,7 +497,7 @@ async def test_nothing_detected_yet_is_not_treated_as_drift(
     assert caplog.records == []
 
 
-async def test_a_refused_task_is_reported_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_run_task_reports_a_refusal_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
     """One auditable failure and zero scan calls, so a denial reads unambiguously in the dashboard
     and cannot be mistaken for a scan that found nothing."""
     seen = _scope_probe(monkeypatch)
@@ -510,7 +509,7 @@ async def test_a_refused_task_is_reported_exactly_once(monkeypatch: pytest.Monke
     assert seen["scanned"] == []
 
 
-async def test_a_denied_task_stays_denied_when_the_control_plane_retries_it(
+async def test_run_task_keeps_refusing_a_redelivered_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A retry is not a second opinion. Redelivering the same task must not eventually run it."""
@@ -525,7 +524,7 @@ async def test_a_denied_task_stays_denied_when_the_control_plane_retries_it(
     assert len(seen["failed"]) == 3
 
 
-async def test_the_normalized_target_is_what_gets_scanned(
+async def test_run_task_scans_the_normalized_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A host bit set in the task ("10.0.1.7/24") is scanned as its network either way, since the

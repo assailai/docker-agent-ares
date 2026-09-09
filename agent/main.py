@@ -576,12 +576,10 @@ def _authorized_target(cidr: str) -> ipaddress.IPv4Network:
     An explicit ARES_NETWORKS is a ceiling, not just a starting point - the README and
     :func:`_redetect_loop` both already say an explicit list is a decision that nothing widens, and
     that has to include a task. Containment, not overlap: ``10.0.0.0/16`` is refused against an
-    approved ``10.0.1.0/24``, because a supernet is a request for everything ELSE in it too.
+    approved ``10.0.1.0/24``, since a supernet asks for everything else in it too.
 
-    Auto-detected scope is deliberately NOT a ceiling here. It is evidence of what this agent can
-    reach, which is not the same as a grant, and it moves under the agent's feet as routes appear
-    and disappear - a task queued against a network detected a minute ago must not start failing
-    because re-detection has since narrowed. ``_run_task`` warns about that case instead.
+    Auto-detected scope is deliberately NOT a ceiling here; :func:`_warn_if_undetected` says why,
+    and warns instead.
     """
     target = ipaddress.ip_network(cidr, strict=False)
     if target.version != 4:

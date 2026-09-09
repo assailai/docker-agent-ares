@@ -430,10 +430,10 @@ async def test_the_probe_sends_no_ssl_context_for_a_plaintext_url(
         # empties are never a destination
         ("", {"*"}, HostApproval.NONE),
         ("host.example.com", {"", "   "}, HostApproval.NONE),
-        # Several entries can match at once, and the NARROWEST decides, whatever order the set
-        # iterates in. ares pushes "*" ALONGSIDE the run's real target while an interactive login
-        # is parked, so this is the common case rather than a corner: grading it WILDCARD would
-        # apply the public-address rule to the hunt's own internal target and refuse it.
+        # Several entries can match at once, and the narrowest decides, whatever order the set
+        # iterates in. ares pushes "*" alongside the run's real target while an interactive login
+        # is parked, so this is the common case rather than a corner: grading it as a wildcard
+        # match would apply the public-address rule to the hunt's own target and refuse it.
         ("acme.okta.com", {"*", "acme.okta.com"}, HostApproval.EXACT),
         ("acme.okta.com", {"*", ".okta.com"}, HostApproval.SUFFIX),
         ("acme.okta.com", {"*", ".okta.com", "acme.okta.com"}, HostApproval.EXACT),
@@ -463,50 +463,54 @@ def test_wildcard_lets_an_unenumerated_login_host_through() -> None:
 # --- address classes: what a pattern-approved name is allowed to resolve to --------------------
 #
 # A name approved by "*" or a domain suffix matches hosts nobody enumerated, so the name proves
-# nothing about intent and the ADDRESS has to earn the dial. Without this the agent would relay TCP
+# nothing about intent and the address has to earn the dial. Without this the agent would relay TCP
 # to cloud metadata, to services on loopback, and into private segments it was never registered
 # for, on nothing more than an approved login domain.
+#
+# The suffix half matters at least as much as the wildcard: ares ships okta.com / auth0.com /
+# pingone.com as built-in identity-provider suffixes, so a suffix entry is not confined to the
+# interactive-login window the wildcard lives in.
 
 _SPECIAL_USE = [
-    pytest.param("169.254.169.254", id="cloud-metadata-over-link-local"),
-    pytest.param("127.0.0.1", id="ipv4-loopback"),
-    pytest.param("192.168.7.9", id="rfc1918-outside-registered-networks"),
-    pytest.param("10.9.9.9", id="rfc1918-in-another-private-block"),
-    pytest.param("100.64.0.1", id="rfc6598-carrier-grade-nat"),
+    pytest.param("169.254.169.254", id="cloud-metadata"),
+    pytest.param("127.0.0.1", id="loopback"),
+    pytest.param("192.168.7.9", id="rfc1918-off-scope"),
+    pytest.param("10.9.9.9", id="rfc1918-other-block"),
+    pytest.param("100.64.0.1", id="cgnat"),
     pytest.param("0.0.0.0", id="unspecified"),
-    pytest.param("224.0.0.1", id="ipv4-multicast-which-is-global-calls-global"),
-    pytest.param("239.255.255.250", id="ipv4-scoped-multicast"),
+    # is_global is True for both of these, so is_global on its own would have let them through.
+    pytest.param("224.0.0.1", id="multicast"),
+    pytest.param("239.255.255.250", id="multicast-scoped"),
     pytest.param("203.0.113.5", id="test-net-3"),
-    pytest.param("198.18.0.1", id="benchmarking-range"),
-    pytest.param("::1", id="ipv6-loopback"),
-    pytest.param("fe80::1", id="ipv6-link-local"),
-    pytest.param("fc00::1", id="ipv6-unique-local"),
-    pytest.param("ff02::1", id="ipv6-multicast-which-is-global-also-calls-global"),
-    pytest.param("::", id="ipv6-unspecified"),
-    pytest.param("::ffff:169.254.169.254", id="metadata-as-ipv4-mapped-ipv6"),
-    pytest.param("::ffff:127.0.0.1", id="loopback-as-ipv4-mapped-ipv6"),
+    pytest.param("198.18.0.1", id="benchmarking"),
+    pytest.param("::1", id="v6-loopback"),
+    pytest.param("fe80::1", id="v6-link-local"),
+    pytest.param("fc00::1", id="v6-unique-local"),
+    pytest.param("ff02::1", id="v6-multicast"),
+    pytest.param("::", id="v6-unspecified"),
+    # The same two addresses again, spelled as IPv4-mapped IPv6.
+    pytest.param("::ffff:169.254.169.254", id="mapped-metadata"),
+    pytest.param("::ffff:127.0.0.1", id="mapped-loopback"),
+]
+
+# Both ways a name can be approved by pattern rather than by name, which get the same rule.
+_PATTERNS = [
+    pytest.param({"*"}, "login-resource.example.test", id="wildcard"),
+    pytest.param({".okta.com"}, "tenant.okta.com", id="suffix"),
 ]
 
 
+@pytest.mark.parametrize(("allowed", "host"), _PATTERNS)
 @pytest.mark.parametrize("address", _SPECIAL_USE)
-def test_a_wildcard_name_cannot_reach_special_use_space(address: str) -> None:
-    """Pinned as a table because this is a policy about the special-use registries, and those move
+def test_a_pattern_approved_name_cannot_reach_special_use_space(
+    address: str, allowed: set[str], host: str
+) -> None:
+    """Kept as a table because this is a policy about the special-use registries, and those shift
     between Python releases: production runs 3.12 while a dev venv may be newer."""
-    client = _client(networks=["10.0.0.0/24"], allowed_hosts={"*"})
-    _stub_resolver(client, {"login-resource.example.test": [address]})
+    client = _client(networks=["10.0.0.0/24"], allowed_hosts=allowed)
+    _stub_resolver(client, {host: [address]})
     with pytest.raises(Refused, match="not public address space"):
-        asyncio.run(client._dial_address("login-resource.example.test", 443))
-
-
-@pytest.mark.parametrize("address", _SPECIAL_USE)
-def test_a_suffix_name_cannot_reach_special_use_space(address: str) -> None:
-    """A suffix is as unenumerable as "*" and gets the same rule. This matters MORE than the
-    wildcard: ares ships okta.com / auth0.com / pingone.com as built-in identity-provider suffixes,
-    so a suffix entry is not confined to the interactive-login window the wildcard lives in."""
-    client = _client(networks=["10.0.0.0/24"], allowed_hosts={".okta.com"})
-    _stub_resolver(client, {"tenant.okta.com": [address]})
-    with pytest.raises(Refused, match="not public address space"):
-        asyncio.run(client._dial_address("tenant.okta.com", 443))
+        asyncio.run(client._dial_address(host, 443))
 
 
 def test_a_pattern_named_public_address_is_still_reachable() -> None:
@@ -525,9 +529,9 @@ def test_a_pattern_named_public_address_is_still_reachable() -> None:
     ],
 )
 def test_one_bad_answer_refuses_the_whole_name(answers: list[str]) -> None:
-    """EVERY answer has to pass, not just the one that would be dialled. Whoever controls the DNS
+    """Every answer has to pass, not only the one that would be dialled. Whoever controls the DNS
     reply controls its order, so checking a mixed reply and then taking the first record would be
-    the same as not checking at all - hence both orderings."""
+    the same as not checking - hence both orderings here."""
     client = _client(networks=["10.0.0.0/24"], allowed_hosts={"*"})
     _stub_resolver(client, {"mixed.example.test": answers})
     with pytest.raises(Refused, match="not public address space"):
@@ -535,8 +539,8 @@ def test_one_bad_answer_refuses_the_whole_name(answers: list[str]) -> None:
 
 
 def test_an_exact_runtime_target_may_be_a_private_host() -> None:
-    """An exact name is a destination ares was TOLD to assess, and internal targets under
-    split-horizon DNS answer with private addresses. Grading exact with the patterns would refuse
+    """An exact name is a destination ares was told to assess, and an internal target under
+    split-horizon DNS answers with a private address. Grading exact with the patterns would refuse
     the hunt's own target."""
     client = _client(networks=["10.0.0.0/24"], allowed_hosts={"intranet.acme.local"})
     _stub_resolver(client, {"intranet.acme.local": ["10.5.0.7"]})

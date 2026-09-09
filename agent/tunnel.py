@@ -14,14 +14,15 @@ Two kinds of destination are authorized, and the agent is the one that decides:
   the wrong answer). The dial then goes to the address we checked, never back through the
   resolver, so a second lookup cannot swap the destination out from under the check.
 
-A name being approved is never on its own enough: **how** it was approved bounds where it is
-allowed to point (see :class:`HostApproval` and :func:`globally_routable`). A name somebody
-actually chose - an address in this agent's scope, or the named target of a running hunt - may
-resolve anywhere, including into private space, because that is a deliberate statement about one
-destination. A *pattern* (``*``, or a domain suffix) matches names nobody enumerated, so the name
-carries no such intent and the resolved ADDRESS has to earn the dial by being publicly routable.
-That is what keeps an approved login domain from becoming a route to loopback, link-local metadata,
-or a private segment this agent was never registered for.
+Approval alone is not enough: how a name was approved bounds where it may
+point (see :class:`HostApproval` and :func:`globally_routable`). A name somebody
+actually chose - an address in this agent's scope, or the named target of a running
+hunt - may resolve anywhere, private space included, since that is a deliberate
+statement about one destination. A pattern (``*``, or a domain suffix) matches names
+nobody enumerated, so it carries no such intent and the address it resolves to has to
+earn the dial by being publicly routable. Otherwise an approved login domain becomes
+a route to loopback, link-local metadata, or a private segment this agent never
+registered for.
 
 The frame format mirrors ``ares/infra/net/tunnel.py`` byte for byte; the two repos must
 change it together.
@@ -176,21 +177,21 @@ def is_ip_literal(value: str) -> bool:
 # browser is handed to an identity provider, bounced through whatever asset CDNs the login page
 # pulls from, and handed back. Enumerating those was a guessing game the customer always lost.
 #
-# It widens NAMES ONLY, and only to PUBLIC addresses. An IP literal is still bounded by the
-# registered networks below; a name it approves is still resolved on this agent's own resolver, and
-# the address that comes back must still be globally routable, because a pattern that matches
-# everything is not a statement that any particular destination was intended. Loopback,
-# link-local, private and other special-use space stay unreachable through it.
+# It widens NAMES ONLY, and only as far as public address space. An IP literal is still bounded by
+# the registered networks below; a name it approves is still resolved on this agent's own resolver,
+# and the address that comes back must still be globally routable, because a pattern matching
+# everything says nothing about which destination was intended. Loopback, link-local, private and
+# other special-use space stay unreachable through it.
 ANY_HOST = "*"
 
 
 class HostApproval(Enum):
     """How ares approved a name, because how broadly it was approved bounds where it may point.
 
-    The ordering is the point: an exact name is a destination somebody *chose*, so it is trusted the
-    way an operator-scoped address is. A suffix or ``*`` matches names nobody enumerated in advance,
-    so the name proves nothing about intent and :func:`globally_routable` has to vouch for the
-    address instead. Widening the pattern narrows the address privilege.
+    An exact name is a destination somebody chose, so it is trusted the way an operator-scoped
+    address is. A suffix or ``*`` matches names nobody enumerated in advance, proving nothing about
+    intent, so :func:`globally_routable` has to vouch for the address instead. The wider the
+    pattern, the narrower the address privilege.
     """
 
     NONE = "none"
@@ -199,7 +200,7 @@ class HostApproval(Enum):
     WILDCARD = "wildcard"
 
 
-# Narrowest first. A host can match several entries at once - ares pushes ``*`` ALONGSIDE the run's
+# Narrowest first. A host can match several entries at once - ares pushes ``*`` alongside the run's
 # real target while an interactive login is parked - and the narrowest match is the one that
 # describes what was actually intended, so it is the one that decides.
 _APPROVAL_PRECEDENCE = (HostApproval.EXACT, HostApproval.SUFFIX, HostApproval.WILDCARD)
@@ -239,8 +240,8 @@ def _entry_matches(host: str, raw: str) -> HostApproval:
 def host_approval(host: str, allowed_hosts: Iterable[str]) -> HostApproval:
     """How ares approved ``host`` for a running assessment, or :attr:`HostApproval.NONE`.
 
-    Every entry is considered, not just the first that matches, because the answer must be the
-    NARROWEST way this host was approved. ``{"*", "intranet.acme.local"}`` is a real and common
+    Every entry is considered, not just the first that matches, because the answer has to be the
+    narrowest way this host was approved. ``{"*", "intranet.acme.local"}`` is a real and common
     set - the wildcard for the login detour, the exact name for the target - and grading that host
     as a wildcard match would refuse the very destination the hunt is for.
     """
@@ -416,14 +417,14 @@ class TunnelClient:
         * an exact name ares pushed for a running hunt - likewise allowed wherever it resolves: the
           assessment names its target, and that target is routinely an internal name that
           split-horizon DNS answers with a private address;
-        * a *pattern* ares pushed - ``*`` or a domain suffix - allowed only if EVERY address it
-          resolved to is globally routable. A pattern matches names nobody enumerated, so it is not
-          evidence that any particular destination was intended, and it must not become a route to
-          loopback, cloud metadata, or a private segment this agent was never registered for.
+        * a pattern ares pushed - ``*`` or a domain suffix - allowed only if every address it
+          resolved to is globally routable. A pattern matches names nobody enumerated, so it is no
+          evidence that a particular destination was intended, and it must not become a route to
+          loopback, cloud metadata, or a private segment this agent never registered for.
 
-        Every address has to pass, not just the one that gets dialled: whoever controls the DNS
-        answer controls its order, so approving a mixed reply and then taking the first record is
-        the same as having no check at all.
+        Every address has to pass, not only the one that gets dialled: whoever controls the DNS
+        answer controls its order, so approving a mixed reply and then taking the first record
+        would be the same as not checking.
 
         Returning a concrete address (not the name) is what keeps the check and the connect on the
         same destination.
