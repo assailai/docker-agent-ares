@@ -523,8 +523,17 @@ def _contained_by(target: _Network, networks: list[_Network]) -> bool:
 
 def _warn_unparseable_networks() -> None:
     """Name any ARES_NETWORKS entry that is not a CIDR, once, at startup."""
-    _, bad = _parse_networks(settings.network_overrides())
+    good, bad = _parse_networks(settings.network_overrides())
     if not bad:
+        return
+    named = ", ".join(repr(value) for value in bad)
+    if not good:
+        logger.error(
+            "ARES_NETWORKS is set to %s, none of which is a CIDR, so this agent has no scope to "
+            "hold scan tasks to and will refuse all of them. Fix the value; leaving it broken is "
+            "not the same as leaving it unset.",
+            named,
+        )
         return
     logger.warning(
         "Ignoring %d ARES_NETWORKS entr%s that %s not a CIDR: %s. The rest still apply, and they "
@@ -532,7 +541,7 @@ def _warn_unparseable_networks() -> None:
         len(bad),
         "y" if len(bad) == 1 else "ies",
         "is" if len(bad) == 1 else "are",
-        ", ".join(repr(value) for value in bad),
+        named,
     )
 
 
@@ -580,6 +589,10 @@ def _authorized_target(cidr: str) -> ipaddress.IPv4Network:
 
     Auto-detected scope is deliberately NOT a ceiling here; :func:`_warn_if_undetected` says why,
     and warns instead.
+
+    An ARES_NETWORKS that parses to nothing at all is a refusal, not an absent ceiling. Dropping
+    individual bad entries is a kindness; dropping the last one would quietly turn an enforced
+    deployment into an unenforced one, which is the failure this whole check exists to prevent.
     """
     target = ipaddress.ip_network(cidr, strict=False)
     if target.version != 4:
@@ -587,7 +600,14 @@ def _authorized_target(cidr: str) -> ipaddress.IPv4Network:
         raise ValueError(f"only IPv4 ranges are supported, got {cidr}")
     if target.prefixlen == 0:
         raise ValueError(f"{target} is the whole address space, which is never a scan scope")
-    ceiling, _ = _parse_networks(settings.network_overrides())
+    configured = settings.network_overrides()
+    ceiling, unusable = _parse_networks(configured)
+    if configured and not ceiling:
+        raise ValueError(
+            f"ARES_NETWORKS is set but none of it parses as a CIDR "
+            f"({', '.join(repr(value) for value in unusable)}), so this agent has no scope to "
+            "hold this task to; fix the value rather than leaving the ceiling off"
+        )
     if ceiling and not _contained_by(target, ceiling):
         allowed = ", ".join(str(net) for net in ceiling)
         raise ValueError(f"{target} is not inside ARES_NETWORKS ({allowed})")

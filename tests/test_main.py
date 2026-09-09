@@ -447,6 +447,45 @@ async def test_run_task_survives_a_typo_in_ares_networks(
     assert seen.scanned == ["192.168.5.128/25"]
 
 
+@pytest.mark.parametrize(
+    "networks",
+    [
+        pytest.param("oops", id="one-junk-entry"),
+        pytest.param("10.0.0/24", id="cidr-missing-an-octet"),
+        pytest.param("oops, also-oops", id="all-entries-junk"),
+    ],
+)
+async def test_run_task_refuses_everything_when_ares_networks_parses_to_nothing(
+    monkeypatch: pytest.MonkeyPatch, networks: str
+) -> None:
+    """The dangerous half of tolerating typos. Dropping bad entries one at a time is a kindness,
+    but dropping the last one would leave `if ceiling` false and hand the agent right back the
+    unenforced behaviour this check exists to remove - an operator who asked for a ceiling and
+    fat-fingered it would get no ceiling and no refusal. So an ARES_NETWORKS that yields nothing
+    fails closed instead of falling back to auto-detect."""
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", networks)
+
+    await main._run_task("tok", {"id": "t1", "target_network": "203.0.113.0/24"})
+
+    assert seen.scanned == []
+    assert seen.started == []
+    assert "none of it parses as a CIDR" in seen.failed[0]
+
+
+def test_startup_calls_a_wholly_broken_ares_networks_an_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A partly-bad value is a warning; a wholly-bad one stops the agent scanning at all, so it
+    gets reported at ERROR rather than buried at the same level as a single dropped entry."""
+    monkeypatch.setattr(main.settings, "networks", "oops, also-oops")
+    with caplog.at_level(logging.WARNING, logger="ares.agent"):
+        main._warn_unparseable_networks()
+
+    assert caplog.records[0].levelno == logging.ERROR
+    assert "refuse all of them" in caplog.records[0].getMessage()
+
+
 def test_startup_names_an_unparseable_ares_networks_entry(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
