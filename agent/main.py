@@ -10,6 +10,7 @@ narrate each step so an operator can self-diagnose.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -35,6 +36,9 @@ from agent.tunnel import (
 from agent.tunnel import probe as tunnel_probe  # aliased: bare "probe" says too little here
 
 logger = logging.getLogger("ares.agent")
+
+
+_Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 
 class _AuthInvalidated(Exception):
@@ -489,6 +493,127 @@ def _identity_probe() -> IdentityProbe | None:
     )
 
 
+def _parse_networks(values: list[str]) -> tuple[list[_Network], list[str]]:
+    """Split CIDR strings into the ones that parse and the ones that do not.
+
+    Tolerant on purpose. ARES_NETWORKS is a free-form string that
+    :meth:`agent.config.Settings.network_overrides` does not validate, and one typo in a list of
+    five should not stop the agent scanning the four that are fine. The rejects come back so
+    ``run`` can name them once at startup rather than leaving an operator to infer the typo from
+    refused tasks.
+    """
+    good: list[_Network] = []
+    bad: list[str] = []
+    for value in values:
+        try:
+            good.append(ipaddress.ip_network(value, strict=False))
+        except ValueError:
+            bad.append(value)
+    return good, bad
+
+
+def _contained_by(target: _Network, networks: list[_Network]) -> bool:
+    """Whether ``target`` sits wholly inside any of ``networks``.
+
+    Version-matched first because ``subnet_of`` raises TypeError across families, so an IPv6 entry
+    in an otherwise IPv4 list would crash the comparison rather than simply failing to match.
+    """
+    return any(target.version == net.version and target.subnet_of(net) for net in networks)
+
+
+def _warn_unparseable_networks() -> None:
+    """Name any ARES_NETWORKS entry that is not a CIDR, once, at startup."""
+    good, bad = _parse_networks(settings.network_overrides())
+    if not bad:
+        return
+    named = ", ".join(repr(value) for value in bad)
+    if not good:
+        logger.error(
+            "ARES_NETWORKS is set to %s, none of which is a CIDR, so this agent has no scope to "
+            "hold scan tasks to and will refuse all of them. Fix the value; leaving it broken is "
+            "not the same as leaving it unset.",
+            named,
+        )
+        return
+    logger.warning(
+        "Ignoring %d ARES_NETWORKS entr%s that %s not a CIDR: %s. The rest still apply, and they "
+        "are the ceiling this agent will hold scan tasks to.",
+        len(bad),
+        "y" if len(bad) == 1 else "ies",
+        "is" if len(bad) == 1 else "are",
+        named,
+    )
+
+
+def _warn_if_undetected(task_id: str, target: _Network) -> None:
+    """Say so when a task targets somewhere this agent never reported it could reach.
+
+    Advisory only, and on purpose. Without ARES_NETWORKS the scope is whatever re-detection last
+    worked out, which is reachability evidence rather than an authorization, and it narrows as well
+    as widens - enforcing it would refuse legitimate tasks whenever a task and a re-detect crossed.
+    So the scan proceeds and the operator gets the one line they need to notice drift, plus the
+    knob that turns this into a hard ceiling.
+
+    Silent when ARES_NETWORKS is set, because then the ceiling is enforced and there is no drift to
+    report; the check lives here so no caller has to remember that.
+    """
+    if settings.network_overrides():
+        return
+    detected = _reachable["networks"]
+    if not detected:
+        return  # nothing detected yet: the first task can easily beat the first probe
+    known, _ = _parse_networks(detected)
+    if _contained_by(target, known):
+        return
+    logger.warning(
+        "Scan task %s targets %s, which is outside every network this agent detected (%s). "
+        "Scanning it anyway, because auto-detected scope is evidence of reachability rather than "
+        "an authorization; set ARES_NETWORKS to make the scope a hard ceiling this agent enforces.",
+        task_id,
+        target,
+        ", ".join(detected),
+    )
+
+
+def _authorized_target(cidr: str) -> ipaddress.IPv4Network:
+    """The network a scan task may actually scan, or raise ValueError saying why it may not.
+
+    The agent is the last thing standing between an instruction and a customer's network, so it
+    checks the destination itself rather than trusting that whoever queued the task got it right.
+    An authenticated instruction is still an instruction.
+
+    An explicit ARES_NETWORKS is a ceiling, not just a starting point - the README and
+    :func:`_redetect_loop` both already say an explicit list is a decision that nothing widens, and
+    that has to include a task. Containment, not overlap: ``10.0.0.0/16`` is refused against an
+    approved ``10.0.1.0/24``, since a supernet asks for everything else in it too.
+
+    Auto-detected scope is deliberately NOT a ceiling here; :func:`_warn_if_undetected` says why,
+    and warns instead.
+
+    An ARES_NETWORKS that parses to nothing at all is a refusal, not an absent ceiling. Dropping
+    individual bad entries is a kindness; dropping the last one would quietly turn an enforced
+    deployment into an unenforced one, which is the failure this whole check exists to prevent.
+    """
+    target = ipaddress.ip_network(cidr, strict=False)
+    if target.version != 4:
+        # scan._plan_chunks rejects these too, but only after the task has been marked started.
+        raise ValueError(f"only IPv4 ranges are supported, got {cidr}")
+    if target.prefixlen == 0:
+        raise ValueError(f"{target} is the whole address space, which is never a scan scope")
+    configured = settings.network_overrides()
+    ceiling, unusable = _parse_networks(configured)
+    if configured and not ceiling:
+        raise ValueError(
+            f"ARES_NETWORKS is set but none of it parses as a CIDR "
+            f"({', '.join(repr(value) for value in unusable)}), so this agent has no scope to "
+            "hold this task to; fix the value rather than leaving the ceiling off"
+        )
+    if ceiling and not _contained_by(target, ceiling):
+        allowed = ", ".join(str(net) for net in ceiling)
+        raise ValueError(f"{target} is not inside ARES_NETWORKS ({allowed})")
+    return target
+
+
 async def _run_task(token: str, task: dict) -> None:
     task_id = task["id"]
     cidr = task.get("target_network")
@@ -498,6 +623,18 @@ async def _run_task(token: str, task: dict) -> None:
     if not cidr:
         await control_plane.task_failed(settings, token, task_id, "missing target_network")
         return
+    try:
+        target = _authorized_target(str(cidr))
+    except ValueError as exc:
+        # refused before task_started, so a task the agent will not run is never reported as one it
+        # began, and before the scanner, so nothing dials anything.
+        logger.warning("Refused scan task %s: %s", task_id, exc)
+        await control_plane.task_failed(settings, token, task_id, reason=f"scope refused: {exc}")
+        return
+    _warn_if_undetected(task_id, target)
+    # scan, log and report the normalized form, so a task naming "10.0.1.7/24" does not describe
+    # itself as a host when what actually gets scanned is 10.0.1.0/24.
+    cidr = str(target)
     await control_plane.task_started(settings, token, task_id)
 
     last_pct = 0
@@ -821,6 +958,10 @@ async def run() -> int:
     pins = HostPins(aliases=settings.host_aliases)
     _host_pins = pins
     logger.info("Host pins: %s", pins.summary())
+    # and once more for the same reason: ARES_NETWORKS is the ceiling _authorized_target holds scan
+    # tasks to, so an entry it cannot parse silently shrinks that ceiling. Say so up front rather
+    # than leaving an operator to infer the typo from refused tasks.
+    _warn_unparseable_networks()
     # The subnets this agent is ATTACHED to, which is cheap and instant. Reachability discovery is
     # deliberately NOT awaited here: on the default scope it reaches across the customer's private
     # space and takes minutes, and blocking enrollment on it would leave a freshly installed agent

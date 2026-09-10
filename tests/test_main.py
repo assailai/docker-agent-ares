@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -314,6 +315,277 @@ async def test_run_task_fails_without_a_target_network(monkeypatch: pytest.Monke
     assert failed == ["missing target_network"]
 
 
+# --- scan scope: the agent checks the destination it was told to scan ---------------------------
+#
+# the agent is the last thing between an instruction and a customer's network, so it re-checks the
+# target itself instead of trusting that whoever queued the task got it right. An authenticated
+# instruction is still just an instruction.
+
+
+async def _noop(*_args: object, **_kwargs: object) -> None:
+    return None
+
+
+@dataclass
+class _TaskOutcome:
+    """What a scan task actually did, as the control plane and the scanner saw it."""
+
+    started: list[str] = field(default_factory=list)
+    scanned: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
+
+
+def _scope_probe(monkeypatch: pytest.MonkeyPatch) -> _TaskOutcome:
+    """Record whether a task started, what it scanned, and why it was refused."""
+    seen = _TaskOutcome()
+
+    async def _task_started(_s: object, _t: object, task_id: str) -> None:
+        seen.started.append(task_id)
+
+    async def _task_failed(_s: object, _t: object, _task_id: str, reason: str) -> None:
+        seen.failed.append(reason)
+
+    async def _fake_scan(cidr: str, _ports: list[int], **_kwargs: object) -> list[dict]:
+        seen.scanned.append(cidr)
+        return []
+
+    monkeypatch.setattr(main.control_plane, "task_started", _task_started)
+    monkeypatch.setattr(main.control_plane, "task_failed", _task_failed)
+    monkeypatch.setattr(main.control_plane, "task_completed", _noop)
+    monkeypatch.setattr(main.control_plane, "task_progress", _noop)
+    monkeypatch.setattr(main.scan, "scan_cidr", _fake_scan)
+    return seen
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "10.0.1.0/24",  # exactly the approved network
+        "10.0.1.64/26",  # a subnet of it
+        "10.0.1.7/32",  # a single host inside it
+    ],
+)
+async def test_run_task_scans_a_target_inside_ares_networks(
+    monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24")
+
+    await main._run_task("tok", {"id": "t1", "target_network": target})
+
+    assert seen.failed == []
+    assert seen.started == ["t1"]
+    assert seen.scanned
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        pytest.param("10.0.0.0/16", id="supernet"),
+        pytest.param("10.0.0.0/23", id="supernet-that-merely-contains-it"),
+        pytest.param("10.0.0.0/8", id="whole-private-block"),
+        pytest.param("192.168.1.0/24", id="unrelated-private"),
+        pytest.param("203.0.113.0/24", id="public"),
+        pytest.param("127.0.0.0/8", id="loopback"),
+        pytest.param("169.254.0.0/16", id="link-local"),
+    ],
+)
+async def test_run_task_refuses_a_target_outside_ares_networks(
+    monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    """Containment, not overlap: a supernet of an approved network asks for everything else in it
+    too, so merely overlapping is not close enough."""
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24")
+
+    await main._run_task("tok", {"id": "t1", "target_network": target})
+
+    assert seen.scanned == []
+    assert seen.started == []  # never reported as begun, because it never began
+    assert len(seen.failed) == 1
+    assert "scope refused" in seen.failed[0]
+    assert "ARES_NETWORKS" in seen.failed[0]
+
+
+@pytest.mark.parametrize(
+    ("target", "reason"),
+    [
+        ("not-a-cidr", "does not appear to be"),
+        ("10.0.0.0/33", "does not appear to be"),
+        ("::/0", "only IPv4"),
+        ("fd00::/8", "only IPv4"),
+        ("0.0.0.0/0", "whole address space"),
+    ],
+)
+async def test_run_task_refuses_a_target_that_is_never_a_scope(
+    monkeypatch: pytest.MonkeyPatch, target: str, reason: str
+) -> None:
+    """Malformed, IPv6 and the default route are refused whether or not ARES_NETWORKS is set: there
+    is no configuration under which they are a scan scope. The scanner would reject the first two
+    itself, but only after the task had been marked started."""
+    for networks in ("10.0.1.0/24", ""):
+        seen = _scope_probe(monkeypatch)
+        monkeypatch.setattr(main.settings, "networks", networks)
+
+        await main._run_task("tok", {"id": "t1", "target_network": target})
+
+        assert seen.scanned == []
+        assert seen.started == []
+        assert reason in seen.failed[0]
+
+
+async def test_run_task_survives_a_typo_in_ares_networks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ARES_NETWORKS is a free-form string, so one bad entry in a list of three must not take the
+    other two down with it. run() names the bad entry at startup instead."""
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24, oops, 192.168.5.0/24")
+
+    await main._run_task("tok", {"id": "t1", "target_network": "192.168.5.128/25"})
+
+    assert seen.scanned == ["192.168.5.128/25"]
+
+
+@pytest.mark.parametrize(
+    "networks",
+    [
+        pytest.param("oops", id="one-junk-entry"),
+        pytest.param("10.0.0/24", id="cidr-missing-an-octet"),
+        pytest.param("oops, also-oops", id="all-entries-junk"),
+    ],
+)
+async def test_run_task_refuses_everything_when_ares_networks_parses_to_nothing(
+    monkeypatch: pytest.MonkeyPatch, networks: str
+) -> None:
+    """The dangerous half of tolerating typos. Dropping bad entries one at a time is a kindness,
+    but dropping the last one would leave `if ceiling` false and hand the agent right back the
+    unenforced behaviour this check exists to remove - an operator who asked for a ceiling and
+    fat-fingered it would get no ceiling and no refusal. So an ARES_NETWORKS that yields nothing
+    fails closed instead of falling back to auto-detect."""
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", networks)
+
+    await main._run_task("tok", {"id": "t1", "target_network": "203.0.113.0/24"})
+
+    assert seen.scanned == []
+    assert seen.started == []
+    assert "none of it parses as a CIDR" in seen.failed[0]
+
+
+def test_startup_calls_a_wholly_broken_ares_networks_an_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A partly-bad value is a warning; a wholly-bad one stops the agent scanning at all, so it
+    gets reported at ERROR rather than buried at the same level as a single dropped entry."""
+    monkeypatch.setattr(main.settings, "networks", "oops, also-oops")
+    with caplog.at_level(logging.WARNING, logger="ares.agent"):
+        main._warn_unparseable_networks()
+
+    assert caplog.records[0].levelno == logging.ERROR
+    assert "refuse all of them" in caplog.records[0].getMessage()
+
+
+def test_startup_names_an_unparseable_ares_networks_entry(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24, oops")
+    with caplog.at_level(logging.WARNING, logger="ares.agent"):
+        main._warn_unparseable_networks()
+
+    assert "'oops'" in caplog.records[0].getMessage()
+
+
+async def test_run_task_warns_but_still_scans_outside_the_detected_scope(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Without ARES_NETWORKS the scope is whatever re-detection last worked out, which is evidence
+    of reachability rather than an authorization - and it narrows as well as widens, so enforcing it
+    would refuse legitimate tasks whenever a task and a re-detect crossed. The operator gets the one
+    line they need to notice drift, and the knob that makes it a hard ceiling."""
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", "")
+    monkeypatch.setitem(main._reachable, "networks", ["10.0.0.0/8"])
+
+    with caplog.at_level(logging.WARNING, logger="ares.agent"):
+        await main._run_task("tok", {"id": "t1", "target_network": "203.0.113.0/24"})
+
+    assert seen.scanned == ["203.0.113.0/24"]  # scanned, by choice
+    warning = caplog.records[0].getMessage()
+    assert "outside every network this agent detected" in warning
+    assert "ARES_NETWORKS" in warning  # and says how to make it enforceable
+
+
+async def test_run_task_is_quiet_about_a_target_it_detected(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", "")
+    monkeypatch.setitem(main._reachable, "networks", ["10.0.0.0/8"])
+
+    with caplog.at_level(logging.WARNING, logger="ares.agent"):
+        await main._run_task("tok", {"id": "t1", "target_network": "10.4.0.0/24"})
+
+    assert seen.scanned == ["10.4.0.0/24"]
+    assert caplog.records == []
+
+
+async def test_run_task_does_not_call_an_empty_detection_drift(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The first task can beat the first reachability probe; an empty answer is "not yet", not
+    "outside the scope"."""
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", "")
+    monkeypatch.setitem(main._reachable, "networks", [])
+
+    with caplog.at_level(logging.WARNING, logger="ares.agent"):
+        await main._run_task("tok", {"id": "t1", "target_network": "10.4.0.0/24"})
+
+    assert seen.scanned == ["10.4.0.0/24"]
+    assert caplog.records == []
+
+
+async def test_run_task_reports_a_refusal_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One auditable failure and zero scan calls, so a denial reads unambiguously in the dashboard
+    and cannot be mistaken for a scan that found nothing."""
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24")
+
+    await main._run_task("tok", {"id": "t1", "target_network": "203.0.113.0/24"})
+
+    assert len(seen.failed) == 1
+    assert seen.scanned == []
+
+
+async def test_run_task_keeps_refusing_a_redelivered_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry is not a second opinion. Redelivering the same task must not eventually run it."""
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24")
+    task = {"id": "t1", "target_network": "203.0.113.0/24"}
+
+    for _ in range(3):
+        await main._run_task("tok", task)
+
+    assert seen.scanned == []
+    assert len(seen.failed) == 3
+
+
+async def test_run_task_scans_the_normalized_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host bit set in the task ("10.0.1.7/24") is scanned as its network either way, since the
+    scanner normalizes internally. Passing the normalized form on makes the logs say so too."""
+    seen = _scope_probe(monkeypatch)
+    monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24")
+
+    await main._run_task("tok", {"id": "t1", "target_network": "10.0.1.7/24"})
+
+    assert seen.scanned == ["10.0.1.0/24"]
+
+
 async def test_run_advertises_auto_scoped_networks(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -473,8 +745,13 @@ async def test_record_contact_throttles_the_marker_but_always_bumps_the_clock(
     # ~5s poll), but the in-memory watchdog clock advances on every contact.
     monkeypatch.setattr(main.settings, "data_dir", tmp_path)
     monkeypatch.setattr(main, "_MARKER_MIN_INTERVAL_SECONDS", 999)
-    main._liveness["last_marker_at"] = 0.0
-    main._record_contact()  # first write allowed (last_marker_at was 0)
+    # Far enough back that the first write is due whatever the host's uptime is. A literal 0.0
+    # reads as "never written", but the guard compares against time.monotonic(), which is seconds
+    # since boot: on a machine up for less than the interval, 0.0 makes the write look throttled
+    # and nothing is written at all. That passes on a long-lived laptop and fails on a fresh CI
+    # runner.
+    main._liveness["last_marker_at"] = time.monotonic() - 1000
+    main._record_contact()  # first write allowed: the interval has elapsed
     marker = tmp_path / "last-contact"
     marker.unlink()  # remove it; a throttled second call must NOT recreate it
     main._liveness["last_contact"] = 0.0

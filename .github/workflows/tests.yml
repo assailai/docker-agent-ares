@@ -1,0 +1,48 @@
+# Run the test suite on every push and pull request.
+#
+# The other workflows here build, sign and release images; none of them ran pytest, so a test could
+# break on main and nothing would say so. That matters most for the tests that exist to hold a
+# security boundary in place (scan-target scope in agent/main.py, tunnel destination authorization
+# in agent/tunnel.py) - a regression test nothing runs is a comment.
+#
+# Pinned to the runtime's Python, not the newest: the image is python:3.12-alpine, and the tunnel's
+# address policy is built on the stdlib's special-use registries, which shift between releases. A
+# suite that only ever ran on a newer Python could pass while production classified an address
+# differently.
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A new push supersedes an in-flight run for the same ref; main is never cancelled.
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'   # matches Dockerfile's python:3.12-alpine
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest -q

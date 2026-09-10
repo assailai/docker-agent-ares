@@ -5,4 +5,4 @@ at registration and in every heartbeat. Bump this on a release; the companion
 updater then rolls deployments to the version the server marks current.
 """
 
-__version__ = "3.9.0"
+__version__ = "3.9.1"

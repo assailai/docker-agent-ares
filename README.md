@@ -41,6 +41,13 @@ host privileges to grant.
      Ares (Ares names that host on the heartbeat, and only while the run is live). The agent then
      connects to the address it checked, so a second lookup cannot redirect the connection.
 
+   A federated login visits hosts nobody can list in advance, so while an interactive sign-in is
+   waiting Ares may approve a whole *domain* (or briefly any name at all). Those broader approvals
+   are limited to **public** addresses: a name approved by pattern rather than by name cannot
+   resolve to loopback, link-local (so not cloud metadata), private, carrier-grade NAT, multicast
+   or reserved space. A destination you approved by exact name or address is unaffected, so an
+   internal host you added by hand still works.
+
 ## Getting started
 
 **Get your install command from the Ares platform, not by hand.** In Ares, open
@@ -134,7 +141,7 @@ The agent is configured entirely through environment variables (all prefixed `AR
 |----------|---------|-------------|
 | `ARES_TOKEN` | *(required)* | One-time registration token from the dashboard. The agent exits with a clear message if it is missing. |
 | `ARES_URL` | `https://ares.assailai.com` | Base URL of the Ares control plane. Override when self-hosting. |
-| `ARES_NETWORKS` | *(auto-detected)* | Comma-separated CIDRs to scan, e.g. `10.0.0.0/24,192.168.1.0/24`. Overrides auto-detection and switches network discovery off entirely: an explicit list is a decision, so nothing widens it. You can also edit the networks in the dashboard after enrollment. |
+| `ARES_NETWORKS` | *(auto-detected)* | Comma-separated CIDRs to scan, e.g. `10.0.0.0/24,192.168.1.0/24`. Overrides auto-detection and switches network discovery off entirely: an explicit list is a decision, so nothing widens it — including a scan task, which the agent refuses if its target is not inside this list. You can also edit the networks in the dashboard after enrollment. |
 | `ARES_SCAN_SCOPE` | `reachable` | How broadly to scan when `ARES_NETWORKS` is unset. See [Network discovery](#network-discovery). `reachable` (default), `supernet16`, `attached`, `rfc1918`, `host-all`. |
 | `ARES_REACH_PROBE` | `true` | Whether `reachable` runs its active probe of private space, as opposed to reading the machine's routing and neighbour tables only. |
 | `ARES_REACH_BUDGET_SECONDS` | `600` | Wall clock the probe may spend. When it runs out the agent advertises what it found and logs the truncation. |
@@ -357,7 +364,12 @@ you deploy.
 - **Scoped reach-in** - the data-plane tunnel only proxies to the networks you approved for the
   agent, or to the hostname of a target you explicitly approved and launched in Ares, enforced on
   the agent side. It exists only while a hunt is running. Names are resolved here, never in the
-  cloud, and every refusal is logged with its reason.
+  cloud, and every refusal is logged with its reason. A broader, pattern-based approval (a login
+  domain, or the wildcard used while an interactive sign-in is parked) reaches public addresses
+  only, so it can never become a route into private, loopback or link-local space.
+- **Scan scope is enforced twice** - a scan task names the network to scan, and the agent checks
+  that network against its own scope before it starts. With `ARES_NETWORKS` set explicitly, that
+  list is a ceiling the agent will not scan outside of, even if it is asked to.
 - **Minimal image** - multi-stage Alpine build with runtime dependencies only; no secrets baked
   into the image.
 - **Token at rest** - the agent's auth token lives in the `/data` volume (mode 0700), supplied at
