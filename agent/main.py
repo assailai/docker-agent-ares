@@ -27,6 +27,7 @@ from agent.config import settings
 from agent.health.system_metrics import read_cpu_percent, read_memory_percent
 from agent.hostpins import HostPins
 from agent.identify import IdentityProbe
+from agent.kubeinfo import KubeApi, KubeConfigError, safe_collect
 from agent.state import AgentState, fingerprint, load_state, save_state
 from agent.tunnel import (
     TunnelManager,
@@ -471,15 +472,54 @@ async def _heartbeat_loop(state: AgentState, tunnel: TunnelManager) -> None:
         await asyncio.sleep(_cadence["heartbeat"])
 
 
-def _identity_probe() -> IdentityProbe | None:
+def _kube_api() -> KubeApi | None:
+    """How to reach the cluster this agent was pointed at, or ``None``.
+
+    An explicit url wins over the in-cluster ServiceAccount, so an agent running inside one
+    cluster can be aimed at another.
+    """
+    try:
+        if settings.kube_api_url:
+            return KubeApi.from_settings(
+                api_url=settings.kube_api_url,
+                token_file=settings.kube_token_file,
+                ca_file=settings.kube_ca_file,
+                timeout=settings.kube_timeout,
+            )
+        return KubeApi.in_cluster(timeout=settings.kube_timeout)
+    except KubeConfigError as exc:
+        logger.warning("cluster naming is on but no cluster is configured: %s", exc)
+        return None
+
+
+async def _kubernetes_inventory() -> dict:
+    """What the cluster calls each address, read once for the scan about to run.
+
+    Read per scan rather than cached for the agent's lifetime: pods are rescheduled constantly, so
+    an inventory held between scans would name addresses after whatever used to be on them, which
+    is worse than not naming them.
+    """
+    if not settings.identify_kubernetes:
+        return {}
+    api = _kube_api()
+    if api is None:
+        return {}
+    return await safe_collect(api, cluster=settings.kube_cluster_name or None)
+
+
+async def _identity_probe() -> IdentityProbe | None:
     """The configured phase-3 naming probe, or ``None`` when the operator turned it off.
 
     Returning ``None`` rather than an all-sources-disabled probe matters: ``scan_cidr`` skips the
     whole phase on ``None``, so a disabled probe costs nothing at all instead of one no-op pass
     per live host.
+
+    Async because the cluster read happens here, before the sweep's naming pass, so every host
+    the scan goes on to find is looked up in a dict that is already built.
     """
     if not settings.identify:
         return None
+    inventory = await _kubernetes_inventory()
     return IdentityProbe(
         reverse_dns=settings.identify_reverse_dns,
         tls=settings.identify_tls,
@@ -490,6 +530,7 @@ def _identity_probe() -> IdentityProbe | None:
         http_timeout=settings.identify_http_timeout,
         netbios_timeout=settings.identify_netbios_timeout,
         hosts_file_lookup=_host_pins.reverse if _host_pins is not None else None,
+        kubernetes_lookup=inventory.get if inventory else None,
     )
 
 
@@ -688,7 +729,7 @@ async def _run_task(token: str, task: dict) -> None:
             on_progress=_on_progress,
             on_hosts=_on_hosts,
             on_identity=_on_identity,
-            identity=_identity_probe(),
+            identity=await _identity_probe(),
         )
         evidence = sorted(identity_seen.values(), key=lambda d: d["ip"])
         await control_plane.task_completed(

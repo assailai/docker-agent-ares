@@ -1,0 +1,35 @@
+# Patch that turns cluster naming on for an agent already installed from
+# deploy/k8s/ares-agent.yaml. Apply the RBAC file first:
+#
+#   kubectl apply -f deploy/k8s/ares-agent-cluster-read.yaml
+#   kubectl patch deploy ares-agent --patch-file deploy/k8s/ares-agent-cluster-read.patch.yaml
+#
+# It mounts the reader ServiceAccount's token into the agent container only, and
+# points the agent at the in-cluster API with it. Set ARES_KUBE_CLUSTER_NAME to
+# whatever you call this cluster; it is shown beside the names it produces, which is
+# what tells two clusters apart when one agent watches both.
+spec:
+  template:
+    spec:
+      containers:
+        - name: ares-agent
+          env:
+            - name: ARES_IDENTIFY_KUBERNETES
+              value: "true"
+            - name: ARES_KUBE_CLUSTER_NAME
+              value: "prod"
+            # the in-cluster API, reached with the reader token rather than the pod's own
+            - name: ARES_KUBE_API_URL
+              value: "https://kubernetes.default.svc"
+            - name: ARES_KUBE_TOKEN_FILE
+              value: "/var/run/secrets/ares-reader/token"
+            - name: ARES_KUBE_CA_FILE
+              value: "/var/run/secrets/ares-reader/ca.crt"
+          volumeMounts:
+            - name: ares-reader
+              mountPath: /var/run/secrets/ares-reader
+              readOnly: true
+      volumes:
+        - name: ares-reader
+          secret:
+            secretName: ares-agent-reader
