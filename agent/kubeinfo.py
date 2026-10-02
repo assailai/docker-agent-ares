@@ -191,17 +191,29 @@ async def _list_all(client: httpx.AsyncClient, path: str) -> list[dict]:
 
 
 async def _list_within(client: httpx.AsyncClient, path: str, budget: float) -> list[dict]:
-    """:func:`_list_all`, abandoned when ``budget`` runs out rather than read without end.
+    """:func:`_list_all`, abandoned when ``budget`` runs out or the kind will not answer.
 
-    Returns an empty list on a timeout rather than a partial one. A half-read EndpointSlice list
-    is worse than none: the addresses it did not reach are not merely unnamed, they would fold
-    separately from the ones it did, so one Service would render as two cards that disagree.
+    Returns an empty list rather than a partial one. A half-read EndpointSlice list is worse than
+    none: the addresses it did not reach are not merely unnamed, they would fold separately from
+    the ones it did, so one Service would render as two cards that disagree.
+
+    EVERY failure is contained here, not just a timeout and not just the 403 ``_list_all`` already
+    handles. Letting one escape meant a single 404 or a transient 503 on the last and largest kind
+    threw away the kinds that had already succeeded, because the caller's guard returns ``{}`` for
+    the whole read. A cluster older than ``networking.k8s.io/v1`` answers 404 for Ingresses, and
+    pods is both read last and the most likely to meet a 503 under load, so that was the common
+    case rather than the exotic one.
     """
     try:
         async with asyncio.timeout(budget):
             return await _list_all(client, path)
     except TimeoutError:
         logger.warning("reading %s passed its %.0fs share; skipping that kind", path, budget)
+        return []
+    except (httpx.HTTPError, ValueError) as exc:
+        # ValueError covers a body that is not JSON, which an error page from a proxy in front of
+        # the API server will be
+        logger.warning("reading %s failed (%s); skipping that kind", path, exc)
         return []
 
 
@@ -362,16 +374,35 @@ async def collect(api: KubeApi, *, cluster: str | None = None) -> dict[str, Kube
     # about: this runs before the scan starts and ahead of the first progress post, so a slow API
     # would otherwise hold the scan's own clock with no ceiling.
     #
-    # Each kind is read under its own share of the budget rather than one deadline over all three,
-    # so a slow or enormous `pods` cannot starve the two kinds that do the naming. Whatever a kind
-    # returned before its share ran out is kept: a partial inventory still names hosts, and the
-    # order below puts the two that matter first.
-    share = max(api.timeout, _BUDGET_SECONDS / 4)
+    # Each kind is read under its own slice of the budget rather than one deadline over all of
+    # them, so a slow or enormous `pods` cannot starve the kinds that do the naming. A kind that
+    # overruns or fails contributes NOTHING rather than a partial list, and the order below puts
+    # the two that produce names first so they get the budget while it is whole.
+    #
+    # A RUNNING deadline, not a fixed share each. `max(api.timeout, budget / kinds)` was wrong in
+    # the direction that matters: `api.timeout` is operator-settable, so raising it to cope with a
+    # slow API server RAISED the ceiling it was supposed to sit under, four times over. The
+    # remaining time is divided by the kinds left, so the total is bounded by _BUDGET_SECONDS
+    # whatever the per-request timeout is, and an early kind that finishes fast hands its unused
+    # time to the ones after it.
+    kinds = (
+        ("/api/v1/services", "services"),
+        ("/apis/discovery.k8s.io/v1/endpointslices", "slices"),
+        ("/apis/networking.k8s.io/v1/ingresses", "ingresses"),
+        ("/api/v1/pods", "pods"),
+    )
+    collected: dict[str, list[dict]] = {}
+    deadline = _BUDGET_SECONDS
     async with api.client() as client:
-        services = await _list_within(client, "/api/v1/services", share)
-        slices = await _list_within(client, "/apis/discovery.k8s.io/v1/endpointslices", share)
-        ingresses = await _list_within(client, "/apis/networking.k8s.io/v1/ingresses", share)
-        pods = await _list_within(client, "/api/v1/pods", share)
+        for index, (path, name) in enumerate(kinds):
+            share = max(deadline / (len(kinds) - index), 0.0)
+            started = asyncio.get_running_loop().time()
+            collected[name] = await _list_within(client, path, share)
+            deadline = max(deadline - (asyncio.get_running_loop().time() - started), 0.0)
+    services = collected["services"]
+    slices = collected["slices"]
+    ingresses = collected["ingresses"]
+    pods = collected["pods"]
 
     by_service = _endpoint_addresses(slices)
     by_service.update(_service_addresses(services))
@@ -407,7 +438,11 @@ async def collect(api: KubeApi, *, cluster: str | None = None) -> dict[str, Kube
 async def safe_collect(
     api: KubeApi, *, cluster: str | None = None
 ) -> dict[str, KubernetesEvidence]:
-    """:func:`collect`, with every failure reported as an empty inventory.
+    """:func:`collect`, with a total failure reported as an empty inventory.
+
+    This is the outer guard, and it should now be unreachable for anything a single kind can do:
+    :func:`_list_within` contains a refusal, a timeout and an HTTP error per kind, so one bad kind
+    costs its own names and no others. What is left here is the client failing to be built at all.
 
     Naming is an enrichment. A cluster that will not answer must cost the scan its names, never
     the scan itself.

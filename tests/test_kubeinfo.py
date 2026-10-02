@@ -466,3 +466,48 @@ async def test_a_refused_ingress_list_costs_only_the_exposure_signal() -> None:
     assert found["10.42.0.5"].service == "checkout"
     assert found["10.42.0.5"].service_type == "LoadBalancer"
     assert found["10.42.0.5"].ingress_host is None
+
+
+async def test_one_kind_failing_does_not_discard_the_kinds_that_worked() -> None:
+    # A cluster older than networking.k8s.io/v1 answers 404 for Ingresses, and `pods` is read last
+    # and is the most likely to meet a transient 503 under load. Letting either escape threw away
+    # the services and endpointslices that had already succeeded, which is the whole inventory.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == INGRESSES:
+            return httpx.Response(404, json={"message": "the server could not find it"})
+        if request.url.path == PODS:
+            return httpx.Response(503, text="<html>upstream unavailable</html>")
+        items = (
+            [_svc("checkout", "payments", "10.43.0.9")]
+            if request.url.path == SERVICES
+            else [_slice("checkout", "payments", ["10.42.0.5"])]
+        )
+        return httpx.Response(200, json={"items": items, "metadata": {}})
+
+    api = KubeApi(base_url="https://kube.test", token="t", transport=httpx.MockTransport(handler))
+    found = await kubeinfo.collect(api)
+    assert found["10.42.0.5"].service == "checkout"
+    assert found["10.43.0.9"].service == "checkout"
+    assert found["10.42.0.5"].ingress_host is None
+
+
+async def test_a_long_per_request_timeout_cannot_raise_the_overall_budget(monkeypatch) -> None:
+    # `max(api.timeout, budget / kinds)` was wrong in the direction that matters: api.timeout is
+    # operator-settable, so raising it to cope with a slow API server RAISED the ceiling it was
+    # meant to sit under, four times over.
+    async def hang(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(30)
+        return httpx.Response(200, json={"items": []})
+
+    api = KubeApi(
+        base_url="https://kube.test",
+        token="t",
+        timeout=600.0,  # an operator coping with a slow API server
+        transport=httpx.MockTransport(hang),
+    )
+    monkeypatch.setattr(kubeinfo, "_BUDGET_SECONDS", 0.4)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    assert await kubeinfo.collect(api) == {}
+    elapsed = loop.time() - started
+    assert elapsed < 2.0, f"budget was 0.4s but the read took {elapsed:.1f}s"

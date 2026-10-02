@@ -12,8 +12,9 @@
 #
 # What is read, and nothing else. Each line is a call the agent actually makes; nothing is
 # granted "just in case", because a grant nobody uses is one an operator cannot audit:
-#   services        the real name and namespace behind a ClusterIP
+#   services        the real name and namespace behind a ClusterIP, and how it is published
 #   endpointslices  which Service fronts which pod address (the mapping that does the work)
+#   ingresses       the hostname a Service answers on, which is the strongest exposure signal
 #   pods            the owning workload, the only name a pod no Service fronts has
 #
 # `pods` is the one to argue about. It is by far the largest read and the only one with a memory
@@ -66,6 +67,9 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

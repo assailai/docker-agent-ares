@@ -148,9 +148,15 @@ kubectl apply -f deploy/k8s/ares-agent-cluster-read.yaml
 kubectl patch deploy ares-agent --patch-file deploy/k8s/ares-agent-cluster-read.patch.yaml
 ```
 
-This grants **read-only** access (`get`, `list`, `watch`) to services, endpointslices, pods and
-across the cluster, through a ServiceAccount of its own that is separate from the updater's. No
-write verb, no secrets, no configmaps. To revoke it, delete those objects and unset
+This grants **read-only** access (`get`, `list`, `watch`) to services, endpointslices, ingresses and
+pods across the cluster, through a ServiceAccount of its own that is separate from the updater's.
+No write verb, no secrets, no configmaps.
+
+Be aware of what `list pods` includes, because Kubernetes has no field-level authorisation: a Pod
+object carries its full spec, and that means container environment variables, which in many
+clusters hold inlined credentials. The agent reads only metadata and the pod address, but the grant
+is the grant. Drop the `pods` rule if that is not acceptable; everything a Service fronts is still
+named, and what you lose is the pods no Service fronts. To revoke it, delete those objects and unset
 `ARES_IDENTIFY_KUBERNETES`; the agent goes back to naming hosts from DNS alone.
 
 ## Configuration
