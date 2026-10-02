@@ -67,6 +67,7 @@ def _api(routes: dict[str, list[dict]], *, refuse: set[str] | None = None) -> Ku
 SERVICES = "/api/v1/services"
 SLICES = "/apis/discovery.k8s.io/v1/endpointslices"
 PODS = "/api/v1/pods"
+INGRESSES = "/apis/networking.k8s.io/v1/ingresses"
 
 
 async def test_a_pod_address_is_named_after_the_service_that_fronts_it() -> None:
@@ -368,3 +369,100 @@ async def test_a_refused_kind_is_still_only_that_kind_after_the_budget_change() 
     found = await kubeinfo.collect(api)
     assert found["10.42.0.5"].service == "checkout"
     assert found["10.43.0.9"].service == "checkout"
+
+
+# --- which surfaces are worth assessing ------------------------------------------------------------
+#
+# A name says what a thing is; these two say whether it is worth attacking. A ClusterIP Service is
+# reachable only from inside the cluster, where a LoadBalancer behind an Ingress is something the
+# world can open. That is the difference between a target and the kubelet on 10250.
+
+
+def _svc_typed(name: str, namespace: str, cluster_ip: str | None, kind: str) -> dict:
+    svc = _svc(name, namespace, cluster_ip)
+    svc["spec"]["type"] = kind
+    return svc
+
+
+def _ingress(namespace: str, host: str, backend: str) -> dict:
+    return {
+        "metadata": {"name": f"{backend}-ing", "namespace": namespace},
+        "spec": {
+            "rules": [
+                {"host": host, "http": {"paths": [{"backend": {"service": {"name": backend}}}]}}
+            ]
+        },
+    }
+
+
+async def test_a_services_type_reaches_every_pod_behind_it() -> None:
+    # the pod is what an operator is looking at, and the pod is what needs telling it is published
+    api = _api(
+        {
+            SERVICES: [_svc_typed("checkout", "payments", "10.43.0.9", "LoadBalancer")],
+            SLICES: [_slice("checkout", "payments", ["10.42.0.5", "10.42.0.6"])],
+            PODS: [],
+            INGRESSES: [],
+        }
+    )
+    found = await kubeinfo.collect(api)
+    assert found["10.42.0.5"].service_type == "LoadBalancer"
+    assert found["10.42.0.6"].service_type == "LoadBalancer"
+    assert found["10.43.0.9"].service_type == "LoadBalancer"
+
+
+async def test_an_ingress_host_reaches_the_service_it_routes_to() -> None:
+    api = _api(
+        {
+            SERVICES: [_svc_typed("checkout", "payments", "10.43.0.9", "ClusterIP")],
+            SLICES: [_slice("checkout", "payments", ["10.42.0.5"])],
+            PODS: [],
+            INGRESSES: [_ingress("payments", "shop.acme.com", "checkout")],
+        }
+    )
+    found = await kubeinfo.collect(api)
+    assert found["10.42.0.5"].ingress_host == "shop.acme.com"
+    # a ClusterIP Service published by an Ingress IS internet-facing, which is the whole point:
+    # the type alone would have said the opposite
+    assert found["10.42.0.5"].service_type == "ClusterIP"
+
+
+async def test_an_ingress_for_another_service_does_not_leak_onto_this_one() -> None:
+    api = _api(
+        {
+            SERVICES: [_svc_typed("internal", "payments", "10.43.0.9", "ClusterIP")],
+            SLICES: [_slice("internal", "payments", ["10.42.0.5"])],
+            PODS: [],
+            INGRESSES: [_ingress("payments", "shop.acme.com", "checkout")],
+        }
+    )
+    assert (await kubeinfo.collect(api))["10.42.0.5"].ingress_host is None
+
+
+async def test_the_same_service_name_in_another_namespace_is_a_different_service() -> None:
+    api = _api(
+        {
+            SERVICES: [_svc_typed("web", "staging", "10.43.0.9", "ClusterIP")],
+            SLICES: [_slice("web", "staging", ["10.42.0.5"])],
+            PODS: [],
+            INGRESSES: [_ingress("prod", "shop.acme.com", "web")],
+        }
+    )
+    assert (await kubeinfo.collect(api))["10.42.0.5"].ingress_host is None
+
+
+async def test_a_refused_ingress_list_costs_only_the_exposure_signal() -> None:
+    # the common case: a role granted before Ingresses were read. Names must still work.
+    api = _api(
+        {
+            SERVICES: [_svc_typed("checkout", "payments", "10.43.0.9", "LoadBalancer")],
+            SLICES: [_slice("checkout", "payments", ["10.42.0.5"])],
+            PODS: [],
+            INGRESSES: [_ingress("payments", "shop.acme.com", "checkout")],
+        },
+        refuse={INGRESSES},
+    )
+    found = await kubeinfo.collect(api)
+    assert found["10.42.0.5"].service == "checkout"
+    assert found["10.42.0.5"].service_type == "LoadBalancer"
+    assert found["10.42.0.5"].ingress_host is None

@@ -58,13 +58,29 @@ class KubernetesEvidence:
     namespace: str | None = None
     service: str | None = None
     workload: str | None = None
+    # How the Service is published: ClusterIP, NodePort, LoadBalancer or ExternalName. This is the
+    # difference between a port that only the cluster can reach and one the world can, which is
+    # what decides whether a surface is worth assessing at all.
+    service_type: str | None = None
+    # The hostname an Ingress routes to this Service, when one does. The strongest exposure signal
+    # there is: something outside the cluster was deliberately pointed at this workload.
+    ingress_host: str | None = None
 
     def is_empty(self) -> bool:
-        return not any((self.cluster, self.namespace, self.service, self.workload))
+        return not any(
+            (
+                self.cluster,
+                self.namespace,
+                self.service,
+                self.workload,
+                self.service_type,
+                self.ingress_host,
+            )
+        )
 
     def as_payload(self) -> dict:
         payload: dict = {}
-        for key in ("cluster", "namespace", "service", "workload"):
+        for key in ("cluster", "namespace", "service", "workload", "service_type", "ingress_host"):
             value = getattr(self, key)
             if value:
                 payload[key] = value
@@ -199,6 +215,50 @@ def _meta(obj: dict) -> tuple[str | None, str | None]:
     )
 
 
+def _service_types(services: list[dict]) -> dict[tuple[str, str], str]:
+    """How each ``(namespace, service)`` is published.
+
+    Kept apart from the address map because it is keyed by the Service rather than by an address:
+    a pod behind a LoadBalancer Service has no address of the Service's own, and that pod is
+    exactly the one an operator wants told is reachable from outside.
+    """
+    out: dict[tuple[str, str], str] = {}
+    for svc in services:
+        name, namespace = _meta(svc)
+        kind = (svc.get("spec") or {}).get("type")
+        if name and namespace and isinstance(kind, str) and kind:
+            out[(namespace, name)] = kind
+    return out
+
+
+def _ingress_hosts(ingresses: list[dict]) -> dict[tuple[str, str], str]:
+    """The hostname each ``(namespace, service)`` is published under, when an Ingress publishes it.
+
+    An Ingress names a host and routes its paths to backend Services, so this walks the rules to
+    find which Service each host reaches. The first host wins for a Service fronted by several,
+    which keeps the answer stable between scans rather than following whichever rule sorted first.
+    """
+    out: dict[tuple[str, str], str] = {}
+    for item in ingresses:
+        _, namespace = _meta(item)
+        if not namespace:
+            continue
+        spec = item.get("spec") or {}
+        default = ((spec.get("defaultBackend") or {}).get("service") or {}).get("name")
+        for rule in spec.get("rules") or []:
+            if not isinstance(rule, dict):
+                continue
+            host = rule.get("host")
+            paths = ((rule.get("http") or {}).get("paths")) or []
+            for path in paths:
+                if not isinstance(path, dict):
+                    continue
+                backend = ((path.get("backend") or {}).get("service") or {}).get("name") or default
+                if isinstance(host, str) and host and isinstance(backend, str) and backend:
+                    out.setdefault((namespace, backend), host)
+    return out
+
+
 def _service_addresses(services: list[dict]) -> dict[str, tuple[str, str]]:
     """Each Service's own addresses, mapped to ``(service, namespace)``.
 
@@ -306,15 +366,18 @@ async def collect(api: KubeApi, *, cluster: str | None = None) -> dict[str, Kube
     # so a slow or enormous `pods` cannot starve the two kinds that do the naming. Whatever a kind
     # returned before its share ran out is kept: a partial inventory still names hosts, and the
     # order below puts the two that matter first.
-    share = max(api.timeout, _BUDGET_SECONDS / 3)
+    share = max(api.timeout, _BUDGET_SECONDS / 4)
     async with api.client() as client:
         services = await _list_within(client, "/api/v1/services", share)
         slices = await _list_within(client, "/apis/discovery.k8s.io/v1/endpointslices", share)
+        ingresses = await _list_within(client, "/apis/networking.k8s.io/v1/ingresses", share)
         pods = await _list_within(client, "/api/v1/pods", share)
 
     by_service = _endpoint_addresses(slices)
     by_service.update(_service_addresses(services))
     by_workload = _pod_addresses(pods)
+    types = _service_types(services)
+    hosts = _ingress_hosts(ingresses)
 
     label = (cluster or "").strip()[:_MAX_CLUSTER_LABEL] or None
     if cluster and label != cluster.strip():
@@ -324,11 +387,16 @@ async def collect(api: KubeApi, *, cluster: str | None = None) -> dict[str, Kube
     for address in set(by_service) | set(by_workload):
         service, service_ns = by_service.get(address, (None, None))
         workload, workload_ns = by_workload.get(address, (None, None))
+        # exposure is a property of the SERVICE, so it reaches every address behind it: the pod an
+        # operator is looking at is the one that needs telling it is reachable from outside.
+        key = (service_ns, service) if service and service_ns else None
         evidence = KubernetesEvidence(
             cluster=label,
             namespace=service_ns or workload_ns,
             service=service,
             workload=workload,
+            service_type=types.get(key) if key else None,
+            ingress_host=hosts.get(key) if key else None,
         )
         if not evidence.is_empty():
             out[address] = evidence
