@@ -1,0 +1,86 @@
+# =============================================================================
+# Optional: let the agent read Service and workload names from this cluster.
+# =============================================================================
+# Apply this ONLY if you want your inventory to read "checkout (payments)" instead
+# of one row per pod address. It grants read-only access to a few kinds across the
+# whole cluster, which is a power the agent does not otherwise hold, so it is a
+# separate file you opt into rather than part of the standard install.
+#
+#   kubectl apply -f deploy/k8s/ares-agent.yaml
+#   kubectl apply -f deploy/k8s/ares-agent-cluster-read.yaml
+#   kubectl patch deploy ares-agent --patch-file deploy/k8s/ares-agent-cluster-read.patch.yaml
+#
+# What is read, and nothing else. Each line is a call the agent actually makes; nothing is
+# granted "just in case", because a grant nobody uses is one an operator cannot audit:
+#   services        the real name and namespace behind a ClusterIP, and how it is published
+#   endpointslices  which Service fronts which pod address (the mapping that does the work)
+#   ingresses       the hostname a Service answers on, which is the strongest exposure signal
+#   pods            the owning workload, the only name a pod no Service fronts has
+#
+# `pods` is the one to argue about. It is by far the largest read and the only one with a memory
+# cost worth naming, and it buys exactly the pods that no Service fronts. Drop it from the rules
+# below if that is not worth it to you: the agent treats a refused kind as unavailable and carries
+# on, so everything a Service fronts is still named.
+#
+# All read-only: get, list, watch. No write verb, no secrets, no configmaps, nothing
+# that reads your workloads' data. To revoke, delete these objects and unset
+# ARES_IDENTIFY_KUBERNETES; the agent goes back to naming hosts from DNS alone.
+#
+# WHY A SECRET TOKEN AND NOT A PROJECTED ONE. The agent pod deliberately runs with
+# automountServiceAccountToken: false, and projects a token into the UPDATER container
+# alone, so the target-facing container holds nothing that can change the cluster.
+# A projected serviceAccountToken volume issues a token for the POD's ServiceAccount,
+# which is the updater's, so using one here would hand the agent exactly the power
+# that design withholds. A Secret bound to its own read-only ServiceAccount keeps the
+# two apart, which is the whole point.
+# =============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ares-agent-reader
+  # If you installed the agent outside `default`, set this on all THREE objects and on the
+  # binding's subject below. The binding is the one that fails silently when they disagree: the
+  # agent's reads are refused, a refused kind reads as unavailable by design, and the inventory
+  # comes back with no cluster names and no error anywhere.
+  namespace: default
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ares-agent-reader
+  namespace: default   # keep in step with the ServiceAccount above
+  annotations:
+    kubernetes.io/service-account.name: ares-agent-reader
+# Since 1.24 a ServiceAccount gets no Secret automatically; this asks for one. The
+# token it holds does not expire, which is the trade for not being the pod's own.
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ares-agent-reader
+rules:
+  # cluster-wide because a scan crosses namespaces: the point is to name an address
+  # whatever namespace it turns out to live in.
+  - apiGroups: [""]
+    resources: ["services", "pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ares-agent-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ares-agent-reader
+subjects:
+  - kind: ServiceAccount
+    name: ares-agent-reader
+    namespace: default   # keep in step with the ServiceAccount above

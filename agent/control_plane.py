@@ -31,6 +31,19 @@ CAPABILITIES = [
     "tunnel_dns",  # resolve a hostname destination locally and dial it through the tunnel
     "host_identity",  # collect naming evidence (PTR, TLS cert, HTTP, NetBIOS) per live host
 ]
+# read Services, EndpointSlices and workloads from a cluster API. Reported only when the operator
+# turned it on, unlike the list above, which is what the build can do. The distinction is the
+# point: this one needs credentials the agent does not otherwise hold, so an operator looking at
+# the fleet needs to see which agents were actually pointed at a cluster.
+KUBERNETES_CAPABILITY = "kubernetes_inventory"
+
+
+def capabilities(settings: Settings) -> list[str]:
+    """What to report for this install."""
+    out = list(CAPABILITIES)
+    if settings.identify_kubernetes:
+        out.append(KUBERNETES_CAPABILITY)
+    return out
 
 
 def system_info() -> dict:
@@ -68,7 +81,7 @@ async def register(settings: Settings, *, networks: list[str], name: str) -> dic
         "name": name or None,
         "hostname": socket.gethostname(),
         "agent_version": settings.agent_version,
-        "capabilities": list(CAPABILITIES),
+        "capabilities": capabilities(settings),
         "system_info": system_info(),
     }
     async with _client(settings) as client:
@@ -92,7 +105,7 @@ async def heartbeat(
 ) -> dict:
     body: dict[str, object] = {
         "agent_version": settings.agent_version,
-        "capabilities": list(CAPABILITIES),
+        "capabilities": capabilities(settings),
     }
     # What reachability discovery currently believes this agent can reach. Sent on the beat and
     # not only at register, because registration happens once: a self-updating agent keeps its
