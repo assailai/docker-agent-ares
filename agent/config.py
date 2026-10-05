@@ -133,9 +133,9 @@ class Settings(BaseSettings):
     # Seconds one request to the cluster API may take.
     kube_timeout: float = 15.0
     # Wall clock for the whole cluster read, all four kinds and every page. It runs beside the
-    # sweep, so this is the most naming can wait for it. Capped because ares requeues a task 1800s
-    # after dispatch whatever it is doing, and a default scan plus its naming share already uses
-    # about 1125s of that.
+    # sweep, and naming waits for what is left of it no longer than naming's own allowance. Capped
+    # because a task sent without a time budget has no allowance, and ares requeues a task 1800s
+    # after dispatch whatever it is doing.
     kube_budget_seconds: float = Field(default=120.0, gt=0, le=600)
 
     # Per-source timeouts. Kept short: on a live LAN these all answer in milliseconds, and the

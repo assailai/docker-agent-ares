@@ -120,6 +120,11 @@ _IDENTITY_BATCH = IDENTITY_CONCURRENCY
 _SWEEP_PROGRESS_CEILING = 90
 
 
+def naming_allowance(budget_seconds: float | None) -> float | None:
+    """How long the naming pass may spend within a scan's budget, or ``None`` when unbounded."""
+    return budget_seconds * IDENTITY_BUDGET_SHARE if budget_seconds is not None else None
+
+
 def _service_for(port: int) -> str:
     return _COMMON_SERVICES.get(port, "unknown")
 
@@ -428,11 +433,7 @@ async def scan_cidr(
             if identity is not None
             else None
         ),
-        identity_allowance=(
-            budget_seconds * IDENTITY_BUDGET_SHARE
-            if identity is not None and budget_seconds is not None
-            else None
-        ),
+        identity_allowance=naming_allowance(budget_seconds) if identity is not None else None,
     )
 
     discovered: list[dict] = []

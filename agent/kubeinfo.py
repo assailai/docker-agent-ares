@@ -34,7 +34,7 @@ _PAGE_LIMIT = 500
 # paging stops here rather than growing the agent's memory without bound.
 _MAX_OBJECTS = 20_000
 # default wall clock for the whole cluster read, shared between the four kinds
-# (ARES_KUBE_BUDGET_SECONDS). The read runs beside the sweep, so this bounds how long naming waits.
+# (ARES_KUBE_BUDGET_SECONDS)
 _BUDGET_SECONDS = 120.0
 # the label kubernetes puts on an EndpointSlice naming the Service it belongs to
 _SERVICE_LABEL = "kubernetes.io/service-name"
@@ -173,6 +173,16 @@ class _Refused(_PartialRead):
     """
 
 
+def _dict(value: object) -> dict:
+    """``value`` when it is an object, otherwise an empty one."""
+    return value if isinstance(value, dict) else {}
+
+
+def _list(value: object) -> list:
+    """``value`` when it is an array, otherwise an empty one."""
+    return value if isinstance(value, list) else []
+
+
 def _pick(value: object, keys: tuple[str, ...]) -> dict:
     """The named keys of ``value``, or nothing when it is not an object."""
     if not isinstance(value, dict):
@@ -257,11 +267,17 @@ async def _list_all(client: httpx.AsyncClient, kind: _Kind) -> list[dict]:
         if not isinstance(page, list):
             raise _PartialRead("a page with no item list")
         items.extend(kind.slim(obj) for obj in page if isinstance(obj, dict))
-        meta = body.get("metadata")
-        token = meta.get("continue") if isinstance(meta, dict) else None
-        if not isinstance(token, str) or not token:
+        if len(items) > _MAX_OBJECTS:
+            raise _PartialRead(f"more than {_MAX_OBJECTS} objects")
+        meta = body.get("metadata") or {}
+        if not isinstance(meta, dict):
+            raise _PartialRead("a page with malformed metadata")
+        token = meta.get("continue")
+        if token is None or token == "":
             return items
-        if len(items) >= _MAX_OBJECTS:
+        if not isinstance(token, str):
+            raise _PartialRead("a page with a malformed continue token")
+        if len(items) == _MAX_OBJECTS:
             raise _PartialRead(f"more than {_MAX_OBJECTS} objects")
 
 
@@ -288,9 +304,10 @@ async def _list_within(client: httpx.AsyncClient, kind: _Kind, budget: float) ->
         logger.warning("reading %s stopped short (%s); skipping that kind", kind.path, exc)
     except TimeoutError:
         logger.warning("reading %s passed its %.1fs share; skipping that kind", kind.path, budget)
-    except (httpx.HTTPError, ValueError) as exc:
+    except (httpx.HTTPError, ValueError, RecursionError) as exc:
         # ValueError covers a body that is not JSON, which an error page from a proxy in front of
-        # the API server will be
+        # the API server will be. RecursionError is a deeply nested body, and is a RuntimeError,
+        # so nothing else here would catch it.
         logger.warning("reading %s failed (%s); skipping that kind", kind.path, exc)
     return []
 
@@ -325,7 +342,7 @@ async def _read_kinds(
 
 
 def _meta(obj: dict) -> tuple[str | None, str | None]:
-    meta = obj.get("metadata") or {}
+    meta = _dict(obj.get("metadata"))
     name = meta.get("name")
     namespace = meta.get("namespace")
     return (
@@ -344,7 +361,7 @@ def _service_types(services: list[dict]) -> dict[tuple[str, str], str]:
     out: dict[tuple[str, str], str] = {}
     for svc in services:
         name, namespace = _meta(svc)
-        kind = (svc.get("spec") or {}).get("type")
+        kind = _dict(svc.get("spec")).get("type")
         if name and namespace and isinstance(kind, str) and kind:
             out[(namespace, name)] = kind
     return out
@@ -362,17 +379,17 @@ def _ingress_hosts(ingresses: list[dict]) -> dict[tuple[str, str], str]:
         _, namespace = _meta(item)
         if not namespace:
             continue
-        spec = item.get("spec") or {}
-        default = ((spec.get("defaultBackend") or {}).get("service") or {}).get("name")
-        for rule in spec.get("rules") or []:
+        spec = _dict(item.get("spec"))
+        default = _dict(_dict(spec.get("defaultBackend")).get("service")).get("name")
+        for rule in _list(spec.get("rules")):
             if not isinstance(rule, dict):
                 continue
             host = rule.get("host")
-            paths = ((rule.get("http") or {}).get("paths")) or []
+            paths = _list(_dict(rule.get("http")).get("paths"))
             for path in paths:
                 if not isinstance(path, dict):
                     continue
-                backend = ((path.get("backend") or {}).get("service") or {}).get("name") or default
+                backend = _dict(_dict(path.get("backend")).get("service")).get("name") or default
                 if isinstance(host, str) and host and isinstance(backend, str) and backend:
                     out.setdefault((namespace, backend), host)
     return out
@@ -390,8 +407,8 @@ def _service_addresses(services: list[dict]) -> dict[str, tuple[str, str]]:
         name, namespace = _meta(svc)
         if not name or not namespace:
             continue
-        spec = svc.get("spec") or {}
-        addresses = [spec.get("clusterIP"), *(spec.get("clusterIPs") or [])]
+        spec = _dict(svc.get("spec"))
+        addresses = [spec.get("clusterIP"), *_list(spec.get("clusterIPs"))]
         for address in addresses:
             # "None" is what a headless Service carries, and it is a string, not a null
             if isinstance(address, str) and address and address != "None":
@@ -408,13 +425,13 @@ def _endpoint_addresses(slices: list[dict]) -> dict[str, tuple[str, str]]:
     out: dict[str, tuple[str, str]] = {}
     for item in slices:
         _, namespace = _meta(item)
-        service = ((item.get("metadata") or {}).get("labels") or {}).get(_SERVICE_LABEL)
+        service = _dict(_dict(item.get("metadata")).get("labels")).get(_SERVICE_LABEL)
         if not namespace or not isinstance(service, str) or not service:
             continue
-        for endpoint in item.get("endpoints") or []:
+        for endpoint in _list(item.get("endpoints")):
             if not isinstance(endpoint, dict):
                 continue
-            for address in endpoint.get("addresses") or []:
+            for address in _list(endpoint.get("addresses")):
                 # first writer wins, so a pod fronted by two Services keeps one answer rather than
                 # flipping between them from scan to scan
                 if isinstance(address, str) and address and address not in out:
@@ -429,17 +446,17 @@ def _workload_name(pod: dict) -> str | None:
     so the Deployment name comes back without a second API call. Every other controller names
     itself after the workload already.
     """
-    owners = (pod.get("metadata") or {}).get("ownerReferences") or []
+    owners = _list(_dict(pod.get("metadata")).get("ownerReferences"))
     for owner in owners:
         if not isinstance(owner, dict):
             continue
         kind, name = owner.get("kind"), owner.get("name")
-        if not isinstance(name, str) or not name:
+        if not isinstance(kind, str) or not isinstance(name, str) or not name:
             continue
         if kind in _DIRECT_OWNER_KINDS:
             return name
         if kind == "ReplicaSet":
-            suffix = ((pod.get("metadata") or {}).get("labels") or {}).get(_TEMPLATE_HASH_LABEL)
+            suffix = _dict(_dict(pod.get("metadata")).get("labels")).get(_TEMPLATE_HASH_LABEL)
             if isinstance(suffix, str) and suffix and name.endswith(f"-{suffix}"):
                 return name[: -len(suffix) - 1]
             return name
@@ -458,10 +475,10 @@ def _pod_addresses(pods: list[dict]) -> dict[str, tuple[str, str]]:
         workload = _workload_name(pod)
         if not namespace or not workload:
             continue
-        status = pod.get("status") or {}
+        status = _dict(pod.get("status"))
         addresses = [status.get("podIP")]
         addresses.extend(
-            entry.get("ip") for entry in (status.get("podIPs") or []) if isinstance(entry, dict)
+            entry.get("ip") for entry in _list(status.get("podIPs")) if isinstance(entry, dict)
         )
         for address in addresses:
             if isinstance(address, str) and address and address not in out:

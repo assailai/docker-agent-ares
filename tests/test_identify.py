@@ -545,3 +545,13 @@ async def test_a_failed_cluster_read_costs_only_that_source(
     evidence = await probe.run("10.42.0.5", {80: "http"})
     assert evidence.kubernetes is None
     assert evidence.ptr_name == "web-01.corp.local"
+
+
+async def test_naming_stops_waiting_for_a_slow_cluster_read_at_its_allowance() -> None:
+    inventory: asyncio.Future = asyncio.get_running_loop().create_future()
+    probe = IdentityProbe(**_QUIET, kubernetes_inventory=inventory, kubernetes_wait=0.05)
+    evidence = await asyncio.wait_for(probe.run("10.42.0.5", {80: "http"}), timeout=2.0)
+    assert evidence.kubernetes is None
+    # giving up on it must not cancel the read itself
+    assert not inventory.done()
+    inventory.cancel()

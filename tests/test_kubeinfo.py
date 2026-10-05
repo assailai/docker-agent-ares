@@ -357,8 +357,7 @@ async def test_an_overlong_cluster_label_is_trimmed_not_sent() -> None:
 
 
 async def test_a_kind_that_never_answers_costs_its_share_and_not_the_scan() -> None:
-    # this runs BEFORE the sweep and ahead of the first progress post, so an API that hangs would
-    # otherwise hold the scan's own clock with no ceiling.
+    # an API that hangs must cost each kind its share of the budget, not an unbounded wait
     async def hang(request: httpx.Request) -> httpx.Response:
         await asyncio.sleep(30)
         return httpx.Response(200, json={"items": []})
@@ -631,3 +630,77 @@ async def test_the_whole_read_is_bounded_by_the_budget_when_every_kind_hangs() -
     assert all(items == [] for items in read.values())
     assert set(read) == {k.path for k in _ABCD}
     assert loop.time() - started < 1.0
+
+
+# --- malformed answers cost at most their own kind -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [{"continue": 123}, {"continue": True}, {"continue": ["1"]}, {"continue": {"t": "1"}}, "x"],
+)
+async def test_a_malformed_continue_token_is_not_read_as_the_last_page(metadata) -> None:
+    # page 1 of 2 would otherwise pass as the whole list
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == SLICES:
+            page = [_slice("checkout", "payments", ["10.42.0.5"])]
+            return httpx.Response(200, json={"items": page, "metadata": metadata})
+        return httpx.Response(200, json={"items": []})
+
+    api = KubeApi(base_url="https://kube.test", token="t", transport=httpx.MockTransport(handler))
+    assert await kubeinfo.collect(api) == {}
+
+
+async def test_a_last_page_that_crosses_the_cap_is_still_past_it(monkeypatch) -> None:
+    monkeypatch.setattr(kubeinfo, "_MAX_OBJECTS", 3)
+    services = [_svc(f"svc{n}", "default", f"10.43.0.{n}") for n in range(1, 5)]
+    # two pages of two, so the fourth object arrives on the page with no continue token
+    assert await kubeinfo.collect(_api({SERVICES: services})) == {}
+
+
+async def test_a_server_ignoring_the_page_limit_is_still_held_to_the_cap(monkeypatch) -> None:
+    monkeypatch.setattr(kubeinfo, "_MAX_OBJECTS", 3)
+    services = [_svc(f"svc{n}", "default", f"10.43.0.{n}") for n in range(1, 5)]
+    api = _paged(SERVICES, [services])
+    assert await kubeinfo.collect(api) == {}
+
+
+async def test_a_deeply_nested_body_costs_only_that_kind() -> None:
+    # parsing it raises RecursionError, a RuntimeError, which nothing else in the read catches
+    nested = "[" * 100_000 + "]" * 100_000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == PODS:
+            return httpx.Response(200, content=nested, headers={"content-type": "application/json"})
+        if request.url.path == SERVICES:
+            return httpx.Response(200, json={"items": [_svc("checkout", "payments", "10.43.0.9")]})
+        return httpx.Response(200, json={"items": []})
+
+    api = KubeApi(base_url="https://kube.test", token="t", transport=httpx.MockTransport(handler))
+    assert (await kubeinfo.collect(api))["10.43.0.9"].service == "checkout"
+
+
+async def test_malformed_fields_inside_objects_cost_only_those_objects() -> None:
+    # the index builders run outside the per-kind guard, so a wrong type there used to raise and
+    # empty the whole inventory
+    bad_svc = _svc("broken", "payments", "10.43.0.8")
+    bad_svc["spec"]["clusterIPs"] = 5
+    bad_slice = _slice("broken", "payments", [])
+    bad_slice["endpoints"] = [{"addresses": 5}]
+    bad_slice["metadata"]["labels"] = "x"
+    bad_ingress = {"metadata": {"namespace": "payments"}, "spec": {"rules": 5, "defaultBackend": 5}}
+    bad_pod = _pod("broken", "payments", "10.42.0.8", None)
+    bad_pod["metadata"]["ownerReferences"] = 5
+    unhashable_owner = _pod("odd", "payments", "10.42.0.7", {"kind": ["ReplicaSet"], "name": "x"})
+    unhashable_owner["status"]["podIPs"] = 5
+    api = _api(
+        {
+            SERVICES: [bad_svc, _svc("checkout", "payments", "10.43.0.9")],
+            SLICES: [bad_slice, _slice("checkout", "payments", ["10.42.0.5"])],
+            INGRESSES: [bad_ingress],
+            PODS: [bad_pod, unhashable_owner],
+        }
+    )
+    found = await kubeinfo.collect(api)
+    assert found["10.42.0.5"].service == "checkout"
+    assert found["10.43.0.9"].service == "checkout"

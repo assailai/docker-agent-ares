@@ -514,8 +514,9 @@ async def _kubernetes_inventory() -> dict[str, KubernetesEvidence]:
 def _start_kubernetes_inventory() -> asyncio.Task[dict[str, KubernetesEvidence]] | None:
     """Begin the cluster read for one scan, or ``None`` when nothing would use it.
 
-    Runs beside the sweep rather than before it. Naming starts only once the sweep is done, so the
-    read has usually finished by then, and a slow cluster API never delays a progress post.
+    Runs beside the sweep rather than before it, so a slow cluster API never holds up the sweep.
+    Naming starts only once the sweep is done, by which time the read has usually finished; if it
+    has not, naming waits no longer than its own allowance.
     """
     if not settings.identify or not settings.identify_kubernetes:
         return None
@@ -524,6 +525,8 @@ def _start_kubernetes_inventory() -> asyncio.Task[dict[str, KubernetesEvidence]]
 
 def _identity_probe(
     kubernetes_inventory: asyncio.Future[dict[str, KubernetesEvidence]] | None = None,
+    *,
+    budget_seconds: float | None = None,
 ) -> IdentityProbe | None:
     """The configured phase-3 naming probe, or ``None`` when the operator turned it off.
 
@@ -544,6 +547,7 @@ def _identity_probe(
         netbios_timeout=settings.identify_netbios_timeout,
         hosts_file_lookup=_host_pins.reverse if _host_pins is not None else None,
         kubernetes_inventory=kubernetes_inventory,
+        kubernetes_wait=scan.naming_allowance(budget_seconds),
     )
 
 
@@ -743,7 +747,7 @@ async def _run_task(token: str, task: dict) -> None:
             on_progress=_on_progress,
             on_hosts=_on_hosts,
             on_identity=_on_identity,
-            identity=_identity_probe(inventory),
+            identity=_identity_probe(inventory, budget_seconds=budget),
         )
         evidence = sorted(identity_seen.values(), key=lambda d: d["ip"])
         await control_plane.task_completed(

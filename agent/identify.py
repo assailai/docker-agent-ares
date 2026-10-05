@@ -484,10 +484,12 @@ class IdentityProbe:
     netbios_timeout: float = 1.0
     # resolves an address to a pinned name (agent.hostpins.HostPins.reverse)
     hosts_file_lookup: Callable[[str], str | None] | None = None
-    # what a cluster calls each address (agent.kubeinfo), read while the sweep runs. The first
-    # hosts named wait for whatever is left of the read, inside the naming allowance, so a slow
-    # cluster API costs names rather than scan time.
+    # what a cluster calls each address (agent.kubeinfo), read while the sweep runs
     kubernetes_inventory: asyncio.Future[dict[str, KubernetesEvidence]] | None = None
+    # the longest a host waits for that read if it is still running: the naming allowance, so a
+    # slow cluster API costs names rather than pushing the scan past its budget. None waits for
+    # the read's own budget.
+    kubernetes_wait: float | None = None
 
     async def run(self, ip: str, services: dict[int, str]) -> HostEvidence:
         """Collect every enabled source for one host, concurrently.
@@ -507,9 +509,14 @@ class IdentityProbe:
 
         if self.kubernetes_inventory is not None:
             try:
-                # shielded, so one cancelled probe cannot cancel the read every host shares
-                found = (await asyncio.shield(self.kubernetes_inventory)).get(ip)
+                # shielded, so one probe giving up cannot cancel the read every host shares
+                inventory = await asyncio.wait_for(
+                    asyncio.shield(self.kubernetes_inventory), timeout=self.kubernetes_wait
+                )
+                found = inventory.get(ip)
                 evidence.kubernetes = found if found is not None and not found.is_empty() else None
+            except TimeoutError:
+                logger.debug("cluster read outlasted the naming allowance; %s named without it", ip)
             except Exception:  # noqa: BLE001 - same rule as the pin table above
                 logger.debug("cluster lookup failed for %s", ip, exc_info=True)
 

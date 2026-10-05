@@ -1228,3 +1228,71 @@ def test_an_unreadable_cluster_token_costs_the_names_not_the_scan(
     monkeypatch.setattr(main.settings, "kube_api_url", "https://kube.test")
     monkeypatch.setattr(main.settings, "kube_token_file", str(tmp_path))
     assert main._kube_api() is None
+
+
+def test_naming_waits_for_the_cluster_no_longer_than_its_allowance() -> None:
+    inventory = Mock()
+    probe = main._identity_probe(inventory, budget_seconds=400)
+    assert probe is not None
+    assert probe.kubernetes_wait == main.scan.naming_allowance(400) == 100.0
+    assert main._identity_probe(inventory).kubernetes_wait is None
+
+
+async def test_the_cluster_budget_setting_reaches_the_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[float] = []
+
+    async def _safe_collect(api, *, cluster, budget):
+        seen.append(budget)
+        return {}
+
+    monkeypatch.setattr(main, "_kube_api", lambda: object())
+    monkeypatch.setattr(main, "safe_collect", _safe_collect)
+    monkeypatch.setattr(main.settings, "kube_budget_seconds", 7.5)
+    await main._kubernetes_inventory()
+    assert seen == [7.5]
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "601"])
+def test_the_cluster_budget_is_bounded(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    from pydantic import ValidationError
+
+    from agent.config import Settings
+
+    monkeypatch.setenv("ARES_KUBE_BUDGET_SECONDS", value)
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+async def test_a_stalled_cluster_read_cannot_push_a_scan_past_its_budget(
+    monkeypatch: pytest.MonkeyPatch, _cluster_naming: list[str]
+) -> None:
+    # the real _run_task and the real scan_cidr: a 0.4s scan budget gives naming 0.1s, and a
+    # cluster API that never answers must cost the names, not hold the task open
+    completed: list[list[dict]] = []
+
+    async def _connect(ip: str, port: int, timeout: float) -> str:
+        return "open" if (ip, port) == ("10.0.0.5", 80) else "down"
+
+    async def _inventory():
+        await asyncio.Event().wait()
+
+    async def _task_completed(_s, _t, _task_id, hosts, **_kw):
+        completed.append(hosts)
+
+    monkeypatch.setattr(main.scan, "_connect", _connect)
+    monkeypatch.setattr(main, "_kubernetes_inventory", _inventory)
+    monkeypatch.setattr(main.control_plane, "task_completed", _task_completed)
+    for source in ("reverse_dns", "tls", "http", "netbios"):
+        monkeypatch.setattr(main.settings, f"identify_{source}", False)
+
+    task = {
+        "id": "t1",
+        "target_network": "10.0.0.0/24",
+        "tool_config": {"ports": [80], "timeout_seconds": 0.4},
+    }
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await asyncio.wait_for(main._run_task("tok", task), timeout=5.0)
+    assert loop.time() - started < 2.0
+    assert _cluster_naming == []
+    assert [hit["ip"] for hit in completed[0]] == ["10.0.0.5"]
