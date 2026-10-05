@@ -22,9 +22,12 @@
 # below if that is not worth it to you: the agent treats a refused kind as unavailable and carries
 # on, so everything a Service fronts is still named.
 #
-# All read-only: get, list, watch. No write verb, no secrets, no configmaps, nothing
-# that reads your workloads' data. To revoke, delete these objects and unset
-# ARES_IDENTIFY_KUBERNETES; the agent goes back to naming hosts from DNS alone.
+# All read-only: get, list, watch. No write verb, no secrets, no configmaps. But
+# `list pods` returns full Pod specs, container environment variables included, and
+# those often hold inlined credentials. Kubernetes has no field-level authorisation, so
+# the grant covers them even though the agent keeps only names and addresses. To
+# revoke, delete these objects and unset ARES_IDENTIFY_KUBERNETES; the agent goes back
+# to naming hosts from DNS alone.
 #
 # WHY A SECRET TOKEN AND NOT A PROJECTED ONE. The agent pod deliberately runs with
 # automountServiceAccountToken: false, and projects a token into the UPDATER container
@@ -52,7 +55,8 @@ metadata:
   annotations:
     kubernetes.io/service-account.name: ares-agent-reader
 # Since 1.24 a ServiceAccount gets no Secret automatically; this asks for one. The
-# token it holds does not expire, which is the trade for not being the pod's own.
+# token it holds does not expire, which is the trade for not being the pod's own. To
+# rotate it, delete this Secret, re-apply this file, and restart the agent pod.
 type: kubernetes.io/service-account-token
 ---
 apiVersion: rbac.authorization.k8s.io/v1

@@ -154,10 +154,18 @@ No write verb, no secrets, no configmaps.
 
 Be aware of what `list pods` includes, because Kubernetes has no field-level authorisation: a Pod
 object carries its full spec, and that means container environment variables, which in many
-clusters hold inlined credentials. The agent reads only metadata and the pod address, but the grant
+clusters hold inlined credentials. The agent keeps only names, owners and addresses, but the grant
 is the grant. Drop the `pods` rule if that is not acceptable; everything a Service fronts is still
 named, and what you lose is the pods no Service fronts. To revoke it, delete those objects and unset
 `ARES_IDENTIFY_KUBERNETES`; the agent goes back to naming hosts from DNS alone.
+
+The reader token does not expire. To rotate it, delete the `ares-agent-reader` Secret, re-apply
+`deploy/k8s/ares-agent-cluster-read.yaml`, and restart the agent pod.
+
+The cluster is read once per scan, alongside the sweep, so it never delays the scan's progress. It
+is bounded by `ARES_KUBE_BUDGET_SECONDS` (two minutes by default) across every kind and page. A kind
+that is not read in full, because it ran out of time, was refused, or has more than 20,000 objects,
+is skipped rather than used in part: half a Service's endpoints would show one Service as two.
 
 ## Configuration
 
@@ -262,7 +270,8 @@ redirect and never sends a credential, so it cannot trip an account lockout.
 | `ARES_KUBE_API_URL` | _(empty)_ | API server for the cluster to read. Set this even in-cluster: the standard install keeps the ServiceAccount token out of the scanning container on purpose, so there is nothing to fall back on. The patch file sets it to `https://kubernetes.default.svc`. |
 | `ARES_KUBE_TOKEN_FILE` | _(empty)_ | Bearer token file for `ARES_KUBE_API_URL`. Required when that is set. |
 | `ARES_KUBE_CA_FILE` | _(empty)_ | CA bundle verifying `ARES_KUBE_API_URL`. Set this unless the endpoint has a publicly issued certificate. |
-| `ARES_KUBE_TIMEOUT` | `15.0` | Seconds one cluster read may take. |
+| `ARES_KUBE_TIMEOUT` | `15.0` | Seconds one request to the cluster API may take. |
+| `ARES_KUBE_BUDGET_SECONDS` | `120` | Total seconds the cluster read may take, every kind and page included (at most `600`). It runs alongside the sweep, so this is the most it can delay naming; it never delays the scan's progress. |
 
 Identification runs once per *live* host (never per open port), under its own concurrency limit,
 and inside a fixed share of the scan's overall time budget. If that share runs out, the remaining

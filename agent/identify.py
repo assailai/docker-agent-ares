@@ -484,9 +484,10 @@ class IdentityProbe:
     netbios_timeout: float = 1.0
     # resolves an address to a pinned name (agent.hostpins.HostPins.reverse)
     hosts_file_lookup: Callable[[str], str | None] | None = None
-    # resolves an address to what a cluster calls it (agent.kubeinfo). A plain dict lookup, not a
-    # probe: the cluster was read once before this phase started, so it costs no network here.
-    kubernetes_lookup: Callable[[str], KubernetesEvidence | None] | None = None
+    # what a cluster calls each address (agent.kubeinfo), read while the sweep runs. The first
+    # hosts named wait for whatever is left of the read, inside the naming allowance, so a slow
+    # cluster API costs names rather than scan time.
+    kubernetes_inventory: asyncio.Future[dict[str, KubernetesEvidence]] | None = None
 
     async def run(self, ip: str, services: dict[int, str]) -> HostEvidence:
         """Collect every enabled source for one host, concurrently.
@@ -504,9 +505,10 @@ class IdentityProbe:
             except Exception:  # noqa: BLE001 - a bad pin table must not cost the whole probe
                 logger.debug("hosts-file lookup failed for %s", ip, exc_info=True)
 
-        if self.kubernetes_lookup is not None:
+        if self.kubernetes_inventory is not None:
             try:
-                found = self.kubernetes_lookup(ip)
+                # shielded, so one cancelled probe cannot cancel the read every host shares
+                found = (await asyncio.shield(self.kubernetes_inventory)).get(ip)
                 evidence.kubernetes = found if found is not None and not found.is_empty() else None
             except Exception:  # noqa: BLE001 - same rule as the pin table above
                 logger.debug("cluster lookup failed for %s", ip, exc_info=True)

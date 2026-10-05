@@ -27,7 +27,7 @@ from agent.config import settings
 from agent.health.system_metrics import read_cpu_percent, read_memory_percent
 from agent.hostpins import HostPins
 from agent.identify import IdentityProbe
-from agent.kubeinfo import KubeApi, KubeConfigError, safe_collect
+from agent.kubeinfo import KubeApi, KubeConfigError, KubernetesEvidence, safe_collect
 from agent.state import AgentState, fingerprint, load_state, save_state
 from agent.tunnel import (
     TunnelManager,
@@ -490,36 +490,49 @@ def _kube_api() -> KubeApi | None:
     except KubeConfigError as exc:
         logger.warning("cluster naming is on but no cluster is configured: %s", exc)
         return None
+    except (OSError, ValueError) as exc:
+        # a token file that exists but cannot be read: costs the cluster names, not the scan
+        logger.warning("cluster naming is on but its credentials cannot be read: %s", exc)
+        return None
 
 
-async def _kubernetes_inventory() -> dict:
+async def _kubernetes_inventory() -> dict[str, KubernetesEvidence]:
     """What the cluster calls each address, read once for the scan about to run.
 
     Read per scan rather than cached for the agent's lifetime: pods are rescheduled constantly, so
     an inventory held between scans would name addresses after whatever used to be on them, which
     is worse than not naming them.
     """
-    if not settings.identify_kubernetes:
-        return {}
     api = _kube_api()
     if api is None:
         return {}
-    return await safe_collect(api, cluster=settings.kube_cluster_name or None)
+    return await safe_collect(
+        api, cluster=settings.kube_cluster_name or None, budget=settings.kube_budget_seconds
+    )
 
 
-async def _identity_probe() -> IdentityProbe | None:
+def _start_kubernetes_inventory() -> asyncio.Task[dict[str, KubernetesEvidence]] | None:
+    """Begin the cluster read for one scan, or ``None`` when nothing would use it.
+
+    Runs beside the sweep rather than before it. Naming starts only once the sweep is done, so the
+    read has usually finished by then, and a slow cluster API never delays a progress post.
+    """
+    if not settings.identify or not settings.identify_kubernetes:
+        return None
+    return asyncio.create_task(_kubernetes_inventory())
+
+
+def _identity_probe(
+    kubernetes_inventory: asyncio.Future[dict[str, KubernetesEvidence]] | None = None,
+) -> IdentityProbe | None:
     """The configured phase-3 naming probe, or ``None`` when the operator turned it off.
 
     Returning ``None`` rather than an all-sources-disabled probe matters: ``scan_cidr`` skips the
     whole phase on ``None``, so a disabled probe costs nothing at all instead of one no-op pass
     per live host.
-
-    Async because the cluster read happens here, before the sweep's naming pass, so every host
-    the scan goes on to find is looked up in a dict that is already built.
     """
     if not settings.identify:
         return None
-    inventory = await _kubernetes_inventory()
     return IdentityProbe(
         reverse_dns=settings.identify_reverse_dns,
         tls=settings.identify_tls,
@@ -530,7 +543,7 @@ async def _identity_probe() -> IdentityProbe | None:
         http_timeout=settings.identify_http_timeout,
         netbios_timeout=settings.identify_netbios_timeout,
         hosts_file_lookup=_host_pins.reverse if _host_pins is not None else None,
-        kubernetes_lookup=inventory.get if inventory else None,
+        kubernetes_inventory=kubernetes_inventory,
     )
 
 
@@ -715,6 +728,7 @@ async def _run_task(token: str, task: dict) -> None:
             identity_seen[item["ip"]] = item
         await _report(last_pct, None, chunk)
 
+    inventory = _start_kubernetes_inventory()
     try:
         logger.info("Scanning %s across %d port(s)", cidr, len(ports))
         hosts = await scan.scan_cidr(
@@ -729,7 +743,7 @@ async def _run_task(token: str, task: dict) -> None:
             on_progress=_on_progress,
             on_hosts=_on_hosts,
             on_identity=_on_identity,
-            identity=await _identity_probe(),
+            identity=_identity_probe(inventory),
         )
         evidence = sorted(identity_seen.values(), key=lambda d: d["ip"])
         await control_plane.task_completed(
@@ -743,6 +757,10 @@ async def _run_task(token: str, task: dict) -> None:
     except Exception as exc:  # noqa: BLE001 - report any scan failure instead of dropping the task
         logger.error("Scan task %s failed: %s", task_id, exc)
         await control_plane.task_failed(settings, token, task_id, f"{type(exc).__name__}: {exc}")
+    finally:
+        # nothing awaits the read when the scan finds nothing live; it must not outlive the task
+        if inventory is not None:
+            inventory.cancel()
 
 
 async def _redetect_loop(tunnel: TunnelManager | None = None) -> None:

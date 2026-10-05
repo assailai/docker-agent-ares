@@ -19,6 +19,7 @@ import pytest
 from pydantic import SecretStr
 
 from agent import main
+from agent.kubeinfo import KubernetesEvidence
 from agent.state import AgentState, fingerprint, load_state, save_state
 
 
@@ -1121,3 +1122,109 @@ async def test_an_older_control_plane_sends_no_name_and_the_line_says_so(
     online = next(r.getMessage() for r in caplog.records if "Agent online" in r.getMessage())
     assert 'Agent online as agent agent-1 (local name "Heffe 3").' == online
     assert not any("differs from ARES_AGENT_NAME" in r.getMessage() for r in caplog.records)
+
+
+# --- the cluster read runs beside the sweep, not before it --------------------------------------
+
+
+@pytest.fixture
+def _cluster_naming(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Cluster naming on and the control plane stubbed. Returns the failure reasons reported."""
+    failed: list[str] = []
+
+    async def _noop(*_a, **_k):
+        return None
+
+    async def _task_failed(_s, _t, _task_id, reason, **_k):
+        failed.append(reason)
+
+    monkeypatch.setattr(main.settings, "identify", True)
+    monkeypatch.setattr(main.settings, "identify_kubernetes", True)
+    for name in ("task_started", "task_progress", "task_completed"):
+        monkeypatch.setattr(main.control_plane, name, _noop)
+    monkeypatch.setattr(main.control_plane, "task_failed", _task_failed)
+    return failed
+
+
+async def test_the_cluster_read_does_not_hold_up_the_sweep(
+    monkeypatch: pytest.MonkeyPatch, _cluster_naming: list[str]
+) -> None:
+    pending_when_sweep_began: list[bool] = []
+    named: list[str | None] = []
+
+    async def _inventory():
+        await asyncio.sleep(0.2)  # a slow cluster API
+        return {"10.0.0.5": KubernetesEvidence(service="web")}
+
+    async def _fake_scan(cidr, ports, **kwargs):
+        read = kwargs["identity"].kubernetes_inventory
+        pending_when_sweep_began.append(not read.done())
+        await kwargs["on_progress"](50)
+        found = await read  # naming still gets the finished inventory
+        named.append(found["10.0.0.5"].service)
+        return []
+
+    monkeypatch.setattr(main, "_kubernetes_inventory", _inventory)
+    monkeypatch.setattr(main.scan, "scan_cidr", _fake_scan)
+
+    await main._run_task("tok", {"id": "t1", "target_network": "10.0.0.0/24"})
+
+    assert _cluster_naming == []
+    assert pending_when_sweep_began == [True]
+    assert named == ["web"]
+
+
+async def test_a_cluster_read_nothing_used_does_not_outlive_its_task(
+    monkeypatch: pytest.MonkeyPatch, _cluster_naming: list[str]
+) -> None:
+    reads: list[asyncio.Future] = []
+
+    async def _inventory():
+        await asyncio.Event().wait()  # a cluster API that never answers
+
+    async def _fake_scan(cidr, ports, **kwargs):
+        reads.append(kwargs["identity"].kubernetes_inventory)
+        return []  # nothing live, so naming never awaits the read
+
+    monkeypatch.setattr(main, "_kubernetes_inventory", _inventory)
+    monkeypatch.setattr(main.scan, "scan_cidr", _fake_scan)
+
+    await main._run_task("tok", {"id": "t1", "target_network": "10.0.0.0/24"})
+
+    (read,) = reads
+    await asyncio.wait([read], timeout=1.0)
+    assert read.cancelled()
+
+
+async def test_no_cluster_read_starts_when_cluster_naming_is_off(
+    monkeypatch: pytest.MonkeyPatch, _cluster_naming: list[str]
+) -> None:
+    started: list[bool] = []
+    reads: list[object] = []
+
+    async def _inventory():
+        started.append(True)
+        return {}
+
+    async def _fake_scan(cidr, ports, **kwargs):
+        reads.append(kwargs["identity"].kubernetes_inventory)
+        return []
+
+    monkeypatch.setattr(main.settings, "identify_kubernetes", False)
+    monkeypatch.setattr(main, "_kubernetes_inventory", _inventory)
+    monkeypatch.setattr(main.scan, "scan_cidr", _fake_scan)
+
+    await main._run_task("tok", {"id": "t1", "target_network": "10.0.0.0/24"})
+
+    assert reads == [None]
+    assert started == []
+
+
+def test_an_unreadable_cluster_token_costs_the_names_not_the_scan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # exists, so it passes the existence check, but reading it raises IsADirectoryError. That used
+    # to escape into _run_task and fail the whole scan.
+    monkeypatch.setattr(main.settings, "kube_api_url", "https://kube.test")
+    monkeypatch.setattr(main.settings, "kube_token_file", str(tmp_path))
+    assert main._kube_api() is None

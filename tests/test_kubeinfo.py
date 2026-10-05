@@ -2,7 +2,7 @@
 
 Driven against a stub API rather than a mocked client, because the things that break here are
 wire-shaped: a paged list that stops early, a headless Service whose clusterIP is the string
-"None", a role that grants two kinds out of three.
+"None", a role that grants three kinds out of four.
 """
 
 from __future__ import annotations
@@ -279,12 +279,31 @@ async def test_a_large_cluster_is_read_whole_across_pages() -> None:
     assert found[f"10.43.{1999 // 254}.{1999 % 254}"].service == "svc1999"
 
 
-async def test_a_cluster_past_the_cap_is_truncated_rather_than_read_without_bound() -> None:
-    # the guard that stops one scan growing the agent's memory with somebody else's cluster
-    big = kubeinfo._MAX_OBJECTS + 1000
-    api = _big_api(services=big, pods_per=0)
-    found = await kubeinfo.collect(api)
-    assert len(found) == kubeinfo._MAX_OBJECTS
+async def test_a_kind_past_the_cap_contributes_nothing_and_stops_paging() -> None:
+    # the guard that stops one scan growing the agent's memory with somebody else's cluster. Part
+    # of a slice list would split one Service into two cards, so the kind contributes nothing.
+    requests: list[str] = []
+    big = _big_api(services=kubeinfo._MAX_OBJECTS + 1000, pods_per=0)
+    inner = big.transport
+
+    async def counting(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        return await inner.handle_async_request(request)
+
+    big.transport = httpx.MockTransport(counting)
+    assert await kubeinfo.collect(big) == {}
+    # paging stopped at the cap rather than reading the rest and throwing it away
+    pages = -(-kubeinfo._MAX_OBJECTS // kubeinfo._PAGE_LIMIT)
+    assert requests.count(SERVICES) == pages
+    assert requests.count(SLICES) == pages
+
+
+async def test_a_kind_exactly_at_the_cap_is_read_whole(monkeypatch) -> None:
+    # the cap is "more than", so a list that ends on it is complete and kept
+    monkeypatch.setattr(kubeinfo, "_MAX_OBJECTS", 4)
+    services = [_svc(f"svc{n}", "default", f"10.43.0.{n}") for n in range(1, 5)]
+    found = await kubeinfo.collect(_api({SERVICES: services, SLICES: [], PODS: []}))
+    assert len(found) == 4
 
 
 async def test_a_custom_cluster_domain_is_read_the_same_way() -> None:
@@ -337,7 +356,7 @@ async def test_an_overlong_cluster_label_is_trimmed_not_sent() -> None:
     assert len(found["10.43.0.9"].cluster or "") == kubeinfo._MAX_CLUSTER_LABEL
 
 
-async def test_a_kind_that_never_answers_costs_its_share_and_not_the_scan(monkeypatch) -> None:
+async def test_a_kind_that_never_answers_costs_its_share_and_not_the_scan() -> None:
     # this runs BEFORE the sweep and ahead of the first progress post, so an API that hangs would
     # otherwise hold the scan's own clock with no ceiling.
     async def hang(request: httpx.Request) -> httpx.Response:
@@ -350,25 +369,7 @@ async def test_a_kind_that_never_answers_costs_its_share_and_not_the_scan(monkey
         timeout=0.05,
         transport=httpx.MockTransport(hang),
     )
-    # monkeypatch, not assignment: a module global left shortened here would silently shorten the
-    # budget for every test that runs after this one
-    monkeypatch.setattr(kubeinfo, "_BUDGET_SECONDS", 0.3)
-    found = await kubeinfo.collect(api)
-    assert found == {}
-
-
-async def test_a_refused_kind_is_still_only_that_kind_after_the_budget_change() -> None:
-    api = _api(
-        {
-            SERVICES: [_svc("checkout", "payments", "10.43.0.9")],
-            SLICES: [_slice("checkout", "payments", ["10.42.0.5"])],
-            PODS: [],
-        },
-        refuse={PODS},
-    )
-    found = await kubeinfo.collect(api)
-    assert found["10.42.0.5"].service == "checkout"
-    assert found["10.43.0.9"].service == "checkout"
+    assert await kubeinfo.collect(api, budget=0.3) == {}
 
 
 # --- which surfaces are worth assessing ------------------------------------------------------------
@@ -491,7 +492,7 @@ async def test_one_kind_failing_does_not_discard_the_kinds_that_worked() -> None
     assert found["10.42.0.5"].ingress_host is None
 
 
-async def test_a_long_per_request_timeout_cannot_raise_the_overall_budget(monkeypatch) -> None:
+async def test_a_long_per_request_timeout_cannot_raise_the_overall_budget() -> None:
     # `max(api.timeout, budget / kinds)` was wrong in the direction that matters: api.timeout is
     # operator-settable, so raising it to cope with a slow API server RAISED the ceiling it was
     # meant to sit under, four times over.
@@ -505,9 +506,128 @@ async def test_a_long_per_request_timeout_cannot_raise_the_overall_budget(monkey
         timeout=600.0,  # an operator coping with a slow API server
         transport=httpx.MockTransport(hang),
     )
-    monkeypatch.setattr(kubeinfo, "_BUDGET_SECONDS", 0.4)
     loop = asyncio.get_running_loop()
     started = loop.time()
-    assert await kubeinfo.collect(api) == {}
+    assert await kubeinfo.collect(api, budget=0.4) == {}
     elapsed = loop.time() - started
     assert elapsed < 2.0, f"budget was 0.4s but the read took {elapsed:.1f}s"
+
+
+# --- a kind is read whole or not at all ------------------------------------------------------------
+
+
+def _paged(path: str, pages: list[httpx.Response | list[dict]], others: dict | None = None):
+    """A KubeApi whose ``path`` answers ``pages`` in turn, and every other kind from ``others``."""
+    others = others or {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path != path:
+            return httpx.Response(200, json={"items": others.get(request.url.path, [])})
+        index = int(request.url.params.get("continue", 0) or 0)
+        answer = pages[index]
+        if isinstance(answer, httpx.Response):
+            return answer
+        more = {"continue": str(index + 1)} if index + 1 < len(pages) else {}
+        return httpx.Response(200, json={"items": answer, "metadata": more})
+
+    return KubeApi(base_url="https://kube.test", token="t", transport=httpx.MockTransport(handler))
+
+
+async def test_a_refusal_partway_through_paging_discards_the_pages_already_read() -> None:
+    # page 1 named 10.42.0.5; returning it alone would leave its sibling on page 2 to fold apart
+    api = _paged(
+        SLICES,
+        [[_slice("checkout", "payments", ["10.42.0.5"])], httpx.Response(403, json={})],
+        others={SERVICES: [_svc("checkout", "payments", "10.43.0.9")]},
+    )
+    found = await kubeinfo.collect(api)
+    assert "10.42.0.5" not in found
+    assert found["10.43.0.9"].service == "checkout"
+
+
+async def test_a_malformed_page_partway_through_discards_the_pages_already_read() -> None:
+    api = _paged(
+        SLICES,
+        [
+            [_slice("checkout", "payments", ["10.42.0.5"])],
+            httpx.Response(200, json={"items": "not a list"}),
+        ],
+    )
+    assert await kubeinfo.collect(api) == {}
+
+
+async def test_a_body_that_is_not_an_object_costs_only_that_kind() -> None:
+    # valid JSON in the wrong shape, as a proxy in front of the API server can send. Must not
+    # escape the per-kind guard and empty the whole inventory.
+    api = _paged(
+        SLICES,
+        [httpx.Response(200, json=["not", "an", "object"])],
+        others={SERVICES: [_svc("checkout", "payments", "10.43.0.9")]},
+    )
+    found = await kubeinfo.collect(api)
+    assert found["10.43.0.9"].service == "checkout"
+
+
+async def test_a_pod_is_cut_down_to_what_naming_reads() -> None:
+    # a Pod carries its whole spec, env vars included; only what the indexes read is kept
+    pod = _pod(
+        "batch-7c9f8-xk2",
+        "jobs",
+        "10.42.0.9",
+        {"kind": "ReplicaSet", "name": "batch-7c9f8"},
+        {"pod-template-hash": "7c9f8"},
+    )
+    pod["metadata"]["managedFields"] = [{"manager": "kubelet"}]
+    pod["metadata"]["annotations"] = {"kubectl.kubernetes.io/last-applied-configuration": "{}"}
+    pod["spec"] = {"containers": [{"env": [{"name": "DB_PASSWORD", "value": "hunter2"}]}]}
+    api = _api({PODS: [pod]})
+    async with api.client() as client:
+        (kept,) = await kubeinfo._list_all(client, kubeinfo._KINDS[-1])
+    assert "spec" not in kept
+    assert set(kept["metadata"]) == {"namespace", "labels", "ownerReferences"}
+    assert "hunter2" not in repr(kept)
+    # and what is left still names the pod
+    assert (await kubeinfo.collect(_api({PODS: [pod]})))["10.42.0.9"].workload == "batch"
+
+
+# --- the budget, read directly rather than through four stubbed endpoints --------------------------
+
+
+def _timed(delays: dict[str, float]) -> httpx.AsyncClient:
+    """A client where each path answers one object after ``delays[path]`` seconds."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(delays.get(request.url.path, 0.0))
+        return httpx.Response(200, json={"items": [{"path": request.url.path}]})
+
+    return httpx.AsyncClient(base_url="https://kube.test", transport=httpx.MockTransport(handler))
+
+
+_ABCD = tuple(kubeinfo._Kind(f"/{name}", lambda obj: obj) for name in "abcd")
+
+
+async def test_a_kind_that_finishes_early_hands_its_time_to_the_kinds_after_it() -> None:
+    # a fixed quarter each would give /d 0.2s and skip it
+    async with _timed({"/d": 0.4}) as client:
+        read = await kubeinfo._read_kinds(client, _ABCD, budget=0.8)
+    assert read["/d"] == [{"path": "/d"}]
+
+
+async def test_a_hanging_kind_costs_only_its_own_share() -> None:
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    async with _timed({"/a": 30.0}) as client:
+        read = await kubeinfo._read_kinds(client, _ABCD, budget=0.4)
+    assert read["/a"] == []
+    assert [read[k.path] for k in _ABCD[1:]] == [[{"path": k.path}] for k in _ABCD[1:]]
+    assert loop.time() - started < 1.0
+
+
+async def test_the_whole_read_is_bounded_by_the_budget_when_every_kind_hangs() -> None:
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    async with _timed({k.path: 30.0 for k in _ABCD}) as client:
+        read = await kubeinfo._read_kinds(client, _ABCD, budget=0.4)
+    assert all(items == [] for items in read.values())
+    assert set(read) == {k.path for k in _ABCD}
+    assert loop.time() - started < 1.0

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,12 +30,11 @@ _SA_DIR = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 # objects per API page. Large enough that an ordinary cluster is one or two calls, small enough
 # that one response stays a sane size.
 _PAGE_LIMIT = 500
-# ceiling on objects read per kind. A cluster larger than this is read partially and says so,
-# rather than growing the agent's memory without bound.
+# ceiling on objects read per kind. A kind with more is skipped rather than read in part, and
+# paging stops here rather than growing the agent's memory without bound.
 _MAX_OBJECTS = 20_000
-# wall clock for the whole cluster read, shared between the three kinds. The agent is a scanner,
-# and this runs before the scan it belongs to: a cluster that will not answer must cost a bounded
-# amount of time, not the scan.
+# default wall clock for the whole cluster read, shared between the four kinds
+# (ARES_KUBE_BUDGET_SECONDS). The read runs beside the sweep, so this bounds how long naming waits.
 _BUDGET_SECONDS = 120.0
 # the label kubernetes puts on an EndpointSlice naming the Service it belongs to
 _SERVICE_LABEL = "kubernetes.io/service-name"
@@ -157,64 +157,171 @@ class KubeApi:
         return httpx.AsyncClient(**kwargs)
 
 
-async def _list_all(client: httpx.AsyncClient, path: str) -> list[dict]:
-    """Every object at ``path``, followed across pages and capped.
+class _PartialRead(Exception):
+    """A kind could not be read whole.
 
-    A 403 is the ordinary answer when the agent was granted a narrower role than it asked for, so
-    it reads as "this kind is unavailable" rather than an error: the kinds that did answer are
-    still worth reporting.
+    Raised instead of returning what was read: see :func:`_list_within` for why part of a list is
+    worse than none of it.
+    """
+
+
+class _Refused(_PartialRead):
+    """The API refused the kind.
+
+    The ordinary answer when the role grants less than the agent asks for (an operator who dropped
+    the ``pods`` rule, say), so it is logged below a warning.
+    """
+
+
+def _pick(value: object, keys: tuple[str, ...]) -> dict:
+    """The named keys of ``value``, or nothing when it is not an object."""
+    if not isinstance(value, dict):
+        return {}
+    return {key: value[key] for key in keys if key in value}
+
+
+def _slim_service(obj: dict) -> dict:
+    return {
+        "metadata": _pick(obj.get("metadata"), ("name", "namespace")),
+        "spec": _pick(obj.get("spec"), ("type", "clusterIP", "clusterIPs")),
+    }
+
+
+def _slim_slice(obj: dict) -> dict:
+    endpoints = obj.get("endpoints")
+    if not isinstance(endpoints, list):
+        endpoints = []
+    return {
+        "metadata": _pick(obj.get("metadata"), ("namespace", "labels")),
+        "endpoints": [_pick(endpoint, ("addresses",)) for endpoint in endpoints],
+    }
+
+
+def _slim_ingress(obj: dict) -> dict:
+    return {
+        "metadata": _pick(obj.get("metadata"), ("namespace",)),
+        "spec": _pick(obj.get("spec"), ("defaultBackend", "rules")),
+    }
+
+
+def _slim_pod(obj: dict) -> dict:
+    return {
+        "metadata": _pick(obj.get("metadata"), ("namespace", "labels", "ownerReferences")),
+        "status": _pick(obj.get("status"), ("podIP", "podIPs")),
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class _Kind:
+    """One list call, and the fields worth keeping from each object it returns.
+
+    Objects are cut down as each page arrives: 20,000 Pods held whole come to about 700 MiB, more
+    than the agent container's 512Mi limit.
+    """
+
+    path: str
+    slim: Callable[[dict], dict]
+
+
+_SERVICES = "/api/v1/services"
+_SLICES = "/apis/discovery.k8s.io/v1/endpointslices"
+_INGRESSES = "/apis/networking.k8s.io/v1/ingresses"
+_PODS = "/api/v1/pods"
+# read in this order: the two that produce names first, so they get the budget while it is whole
+_KINDS = (
+    _Kind(_SERVICES, _slim_service),
+    _Kind(_SLICES, _slim_slice),
+    _Kind(_INGRESSES, _slim_ingress),
+    _Kind(_PODS, _slim_pod),
+)
+
+
+async def _list_all(client: httpx.AsyncClient, kind: _Kind) -> list[dict]:
+    """Every object of ``kind`` across all pages, or :class:`_PartialRead`.
+
+    Never returns part of a list, so :func:`_list_within` alone decides what an incomplete read is
+    worth.
     """
     items: list[dict] = []
     token = ""
     while True:
-        params = {"limit": _PAGE_LIMIT}
+        params: dict[str, str | int] = {"limit": _PAGE_LIMIT}
         if token:
             params["continue"] = token
-        resp = await client.get(path, params=params)
+        resp = await client.get(kind.path, params=params)
         if resp.status_code in (401, 403):
-            logger.info("cluster API refused %s (%d); skipping that kind", path, resp.status_code)
-            return items
+            raise _Refused(str(resp.status_code))
         resp.raise_for_status()
         body = resp.json()
-        page = body.get("items")
+        page = body.get("items") if isinstance(body, dict) else None
         if not isinstance(page, list):
+            raise _PartialRead("a page with no item list")
+        items.extend(kind.slim(obj) for obj in page if isinstance(obj, dict))
+        meta = body.get("metadata")
+        token = meta.get("continue") if isinstance(meta, dict) else None
+        if not isinstance(token, str) or not token:
             return items
-        items.extend(obj for obj in page if isinstance(obj, dict))
         if len(items) >= _MAX_OBJECTS:
-            logger.warning(
-                "cluster has more than %d %s; reading the first page set", _MAX_OBJECTS, path
-            )
-            return items[:_MAX_OBJECTS]
-        token = (body.get("metadata") or {}).get("continue") or ""
-        if not token:
-            return items
+            raise _PartialRead(f"more than {_MAX_OBJECTS} objects")
 
 
-async def _list_within(client: httpx.AsyncClient, path: str, budget: float) -> list[dict]:
+async def _list_within(client: httpx.AsyncClient, kind: _Kind, budget: float) -> list[dict]:
     """:func:`_list_all`, abandoned when ``budget`` runs out or the kind will not answer.
 
     Returns an empty list rather than a partial one. A half-read EndpointSlice list is worse than
     none: the addresses it did not reach are not merely unnamed, they would fold separately from
     the ones it did, so one Service would render as two cards that disagree.
 
-    EVERY failure is contained here, not just a timeout and not just the 403 ``_list_all`` already
-    handles. Letting one escape meant a single 404 or a transient 503 on the last and largest kind
-    threw away the kinds that had already succeeded, because the caller's guard returns ``{}`` for
-    the whole read. A cluster older than ``networking.k8s.io/v1`` answers 404 for Ingresses, and
-    pods is both read last and the most likely to meet a 503 under load, so that was the common
-    case rather than the exotic one.
+    EVERY failure is contained here, not just a timeout and not just a refusal. Letting one escape
+    meant a single 404 or a transient 503 on the last and largest kind threw away the kinds that
+    had already succeeded, because the caller's guard returns ``{}`` for the whole read. A cluster
+    older than ``networking.k8s.io/v1`` answers 404 for Ingresses, and pods is both read last and
+    the most likely to meet a 503 under load, so that was the common case rather than the exotic
+    one.
     """
     try:
         async with asyncio.timeout(budget):
-            return await _list_all(client, path)
+            return await _list_all(client, kind)
+    except _Refused as exc:
+        logger.info("cluster API refused %s (%s); skipping that kind", kind.path, exc)
+    except _PartialRead as exc:
+        logger.warning("reading %s stopped short (%s); skipping that kind", kind.path, exc)
     except TimeoutError:
-        logger.warning("reading %s passed its %.0fs share; skipping that kind", path, budget)
-        return []
+        logger.warning("reading %s passed its %.1fs share; skipping that kind", kind.path, budget)
     except (httpx.HTTPError, ValueError) as exc:
         # ValueError covers a body that is not JSON, which an error page from a proxy in front of
         # the API server will be
-        logger.warning("reading %s failed (%s); skipping that kind", path, exc)
-        return []
+        logger.warning("reading %s failed (%s); skipping that kind", kind.path, exc)
+    return []
+
+
+async def _read_kinds(
+    client: httpx.AsyncClient, kinds: Sequence[_Kind], *, budget: float
+) -> dict[str, list[dict]]:
+    """Each kind's objects keyed by path, the whole read finished inside ``budget`` seconds.
+
+    ONE deadline over the whole read, not just per request. Paging a large cluster is up to 40
+    sequential calls per kind, so a per-request timeout bounds nothing an operator can reason
+    about.
+
+    Each kind is read under its own slice of what is left, so a slow or enormous ``pods`` cannot
+    starve the kinds after it, and a kind that overruns contributes nothing (see
+    :func:`_list_within`).
+
+    A RUNNING deadline, not a fixed share each. ``max(api.timeout, budget / kinds)`` was wrong in
+    the direction that matters: ``api.timeout`` is operator-settable, so raising it to cope with a
+    slow API server RAISED the ceiling it was supposed to sit under, four times over. The remaining
+    time is divided by the kinds left, so the total is bounded by ``budget`` whatever the
+    per-request timeout is, and an early kind that finishes fast hands its unused time to the ones
+    after it.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget
+    out: dict[str, list[dict]] = {}
+    for index, kind in enumerate(kinds):
+        share = max(deadline - loop.time(), 0.0) / (len(kinds) - index)
+        out[kind.path] = await _list_within(client, kind, share)
+    return out
 
 
 def _meta(obj: dict) -> tuple[str | None, str | None]:
@@ -362,47 +469,21 @@ def _pod_addresses(pods: list[dict]) -> dict[str, tuple[str, str]]:
     return out
 
 
-async def collect(api: KubeApi, *, cluster: str | None = None) -> dict[str, KubernetesEvidence]:
+async def collect(
+    api: KubeApi, *, cluster: str | None = None, budget: float = _BUDGET_SECONDS
+) -> dict[str, KubernetesEvidence]:
     """Every address this cluster can name, keyed by address.
 
     Each kind is read independently, so a role granted only part of what was asked for still
     produces what it did grant. Raises nothing the caller has to handle beyond the API being
     unreachable: see :func:`safe_collect`.
     """
-    # ONE deadline over the whole read, not just per request. Paging a large cluster is up to 40
-    # sequential calls per kind, so a per-request timeout bounds nothing an operator can reason
-    # about: this runs before the scan starts and ahead of the first progress post, so a slow API
-    # would otherwise hold the scan's own clock with no ceiling.
-    #
-    # Each kind is read under its own slice of the budget rather than one deadline over all of
-    # them, so a slow or enormous `pods` cannot starve the kinds that do the naming. A kind that
-    # overruns or fails contributes NOTHING rather than a partial list, and the order below puts
-    # the two that produce names first so they get the budget while it is whole.
-    #
-    # A RUNNING deadline, not a fixed share each. `max(api.timeout, budget / kinds)` was wrong in
-    # the direction that matters: `api.timeout` is operator-settable, so raising it to cope with a
-    # slow API server RAISED the ceiling it was supposed to sit under, four times over. The
-    # remaining time is divided by the kinds left, so the total is bounded by _BUDGET_SECONDS
-    # whatever the per-request timeout is, and an early kind that finishes fast hands its unused
-    # time to the ones after it.
-    kinds = (
-        ("/api/v1/services", "services"),
-        ("/apis/discovery.k8s.io/v1/endpointslices", "slices"),
-        ("/apis/networking.k8s.io/v1/ingresses", "ingresses"),
-        ("/api/v1/pods", "pods"),
-    )
-    collected: dict[str, list[dict]] = {}
-    deadline = _BUDGET_SECONDS
     async with api.client() as client:
-        for index, (path, name) in enumerate(kinds):
-            share = max(deadline / (len(kinds) - index), 0.0)
-            started = asyncio.get_running_loop().time()
-            collected[name] = await _list_within(client, path, share)
-            deadline = max(deadline - (asyncio.get_running_loop().time() - started), 0.0)
-    services = collected["services"]
-    slices = collected["slices"]
-    ingresses = collected["ingresses"]
-    pods = collected["pods"]
+        read = await _read_kinds(client, _KINDS, budget=budget)
+    services = read[_SERVICES]
+    slices = read[_SLICES]
+    ingresses = read[_INGRESSES]
+    pods = read[_PODS]
 
     by_service = _endpoint_addresses(slices)
     by_service.update(_service_addresses(services))
@@ -436,19 +517,20 @@ async def collect(api: KubeApi, *, cluster: str | None = None) -> dict[str, Kube
 
 
 async def safe_collect(
-    api: KubeApi, *, cluster: str | None = None
+    api: KubeApi, *, cluster: str | None = None, budget: float = _BUDGET_SECONDS
 ) -> dict[str, KubernetesEvidence]:
     """:func:`collect`, with a total failure reported as an empty inventory.
 
     This is the outer guard, and it should now be unreachable for anything a single kind can do:
-    :func:`_list_within` contains a refusal, a timeout and an HTTP error per kind, so one bad kind
-    costs its own names and no others. What is left here is the client failing to be built at all.
+    :func:`_list_within` contains a refusal, a partial read, a timeout and an HTTP error per kind,
+    so one bad kind costs its own names and no others. What is left here is the client failing to
+    be built at all.
 
     Naming is an enrichment. A cluster that will not answer must cost the scan its names, never
     the scan itself.
     """
     try:
-        return await collect(api, cluster=cluster)
+        return await collect(api, cluster=cluster, budget=budget)
     except Exception:  # noqa: BLE001 - an unreachable cluster is not a reason to fail a scan
         logger.warning("cluster inventory unavailable; scan continues without it", exc_info=True)
         return {}

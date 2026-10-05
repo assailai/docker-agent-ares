@@ -18,6 +18,7 @@ import trustme
 
 from agent import identify
 from agent.identify import HostEvidence, IdentityProbe, ServiceEvidence
+from agent.kubeinfo import KubernetesEvidence
 
 
 # --- TLS certificate collection -----------------------------------------------------------------
@@ -490,3 +491,57 @@ def test_empty_evidence_is_recognised() -> None:
     assert HostEvidence(ip="10.0.0.1").is_empty()
     assert ServiceEvidence(port=80).is_empty()
     assert not HostEvidence(ip="10.0.0.1", netbios_name="X").is_empty()
+
+
+# --- the cluster inventory, read beside the sweep -----------------------------------------------
+
+
+_QUIET = {"reverse_dns": False, "tls": False, "http": False, "netbios": False}
+
+
+async def test_a_cluster_inventory_names_the_host() -> None:
+    inventory: asyncio.Future = asyncio.get_running_loop().create_future()
+    inventory.set_result({"10.42.0.5": KubernetesEvidence(service="checkout", namespace="pay")})
+    probe = IdentityProbe(**_QUIET, kubernetes_inventory=inventory)
+    named = await probe.run("10.42.0.5", {80: "http"})
+    unnamed = await probe.run("10.42.0.6", {80: "http"})
+    assert named.kubernetes is not None and named.kubernetes.service == "checkout"
+    assert unnamed.kubernetes is None
+
+
+async def test_naming_waits_for_a_cluster_read_still_in_flight() -> None:
+    inventory: asyncio.Future = asyncio.get_running_loop().create_future()
+    probe = IdentityProbe(**_QUIET, kubernetes_inventory=inventory)
+    pending = asyncio.ensure_future(probe.run("10.42.0.5", {80: "http"}))
+    await asyncio.sleep(0)
+    assert not pending.done()
+    inventory.set_result({"10.42.0.5": KubernetesEvidence(service="checkout")})
+    assert (await pending).kubernetes is not None
+
+
+async def test_one_cancelled_probe_does_not_cancel_the_read_the_others_wait_on() -> None:
+    inventory: asyncio.Future = asyncio.get_running_loop().create_future()
+    probe = IdentityProbe(**_QUIET, kubernetes_inventory=inventory)
+    first = asyncio.ensure_future(probe.run("10.42.0.5", {80: "http"}))
+    second = asyncio.ensure_future(probe.run("10.42.0.5", {80: "http"}))
+    await asyncio.sleep(0)
+    first.cancel()
+    await asyncio.sleep(0)
+    assert not inventory.cancelled()
+    inventory.set_result({"10.42.0.5": KubernetesEvidence(service="checkout")})
+    assert (await second).kubernetes is not None
+
+
+async def test_a_failed_cluster_read_costs_only_that_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _ptr(ip, *, timeout):
+        return "web-01.corp.local"
+
+    monkeypatch.setattr(identify, "reverse_dns", _ptr)
+    inventory: asyncio.Future = asyncio.get_running_loop().create_future()
+    inventory.set_exception(RuntimeError("cluster unreachable"))
+    probe = IdentityProbe(**{**_QUIET, "reverse_dns": True}, kubernetes_inventory=inventory)
+    evidence = await probe.run("10.42.0.5", {80: "http"})
+    assert evidence.kubernetes is None
+    assert evidence.ptr_name == "web-01.corp.local"
