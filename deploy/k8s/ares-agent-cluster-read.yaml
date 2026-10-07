@@ -1,10 +1,12 @@
 # =============================================================================
 # Optional: let the agent read Service and workload names from this cluster.
 # =============================================================================
-# Apply this ONLY if you want your inventory to read "checkout (payments)" instead
-# of one row per pod address. It grants read-only access to a few kinds across the
-# whole cluster, which is a power the agent does not otherwise hold, so it is a
-# separate file you opt into rather than part of the standard install.
+# Ares already names a pod after the Service in its DNS record without this. Apply it
+# ONLY if you also want what DNS cannot give: a name for a pod no Service fronts, and
+# whether a workload is reachable from outside (its Service type and Ingress host).
+# It grants read access to a few kinds across the whole cluster, which is a power the
+# agent does not otherwise hold, so it is a separate file you opt into rather than
+# part of the standard install.
 #
 #   kubectl apply -f deploy/k8s/ares-agent.yaml
 #   kubectl apply -f deploy/k8s/ares-agent-cluster-read.yaml
@@ -20,9 +22,10 @@
 # `pods` is the one to argue about. It is by far the largest read and the only one with a memory
 # cost worth naming, and it buys exactly the pods that no Service fronts. Drop it from the rules
 # below if that is not worth it to you: the agent treats a refused kind as unavailable and carries
-# on, so everything a Service fronts is still named.
+# on, so everything a Service fronts is still named and its exposure still read.
 #
-# All read-only: get, list, watch. No write verb, no secrets, no configmaps. But
+# `list` only, the one verb the agent uses: it never gets a single object by name and
+# never watches. No write verb, no secrets, no configmaps. But
 # `list pods` returns full Pod specs, container environment variables included, and
 # those often hold inlined credentials. Kubernetes has no field-level authorisation, so
 # the grant covers them even though the agent keeps only names and addresses. To
@@ -68,13 +71,13 @@ rules:
   # whatever namespace it turns out to live in.
   - apiGroups: [""]
     resources: ["services", "pods"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["list"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["list"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

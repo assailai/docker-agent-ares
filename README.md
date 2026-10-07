@@ -133,31 +133,37 @@ kubectl rollout status deploy/ares-agent
 To opt out of auto-update, delete the `ares-updater` container plus its ServiceAccount, Role, and
 RoleBinding, and update the image through your own pipeline instead.
 
-### Naming hosts after their Service (optional)
+### Reading the cluster's API (optional)
 
-By default a pod is named from its DNS record, which carries the pod's own address. Pods are
-recreated constantly and each one gets a new address, so the inventory lists a service running on
-fifty pods as fifty entries, and a different fifty after the next restart.
+Ares already names a pod after the Service and namespace in its DNS record, such as
+`checkout (payments)`, with nothing to install or grant. Letting the agent read the cluster's API
+adds two things DNS cannot give:
 
-Letting the agent read the cluster's API fixes that: entries read as the Service and namespace
-(`checkout (payments)`), one row per Service, and the names stay the same between scans. It also
-names pods that no Service fronts, which have no DNS record at all.
+- **A name for a pod no Service fronts.** Kubernetes publishes no DNS record for one, so without
+  the API it is known only by its address. With it, the pod is named after the workload that owns
+  it.
+- **Whether a workload is reachable from outside the cluster**: the Service's type and any Ingress
+  hostname that routes to it. Neither is in DNS.
+
+Nothing in Ares needs this, and nothing else changes if you leave it off. It is here for an operator
+who wants those two things and is comfortable with the grant below.
 
 ```bash
 kubectl apply -f deploy/k8s/ares-agent-cluster-read.yaml
 kubectl patch deploy ares-agent --patch-file deploy/k8s/ares-agent-cluster-read.patch.yaml
 ```
 
-This grants **read-only** access (`get`, `list`, `watch`) to services, endpointslices, ingresses and
-pods across the cluster, through a ServiceAccount of its own that is separate from the updater's.
-No write verb, no secrets, no configmaps.
+This grants `list`, and only `list`, on services, endpointslices, ingresses and pods across the
+cluster, through a ServiceAccount of its own that is separate from the updater's. `list` is the one
+verb the agent uses. No write verb, no secrets, no configmaps.
 
 Be aware of what `list pods` includes, because Kubernetes has no field-level authorisation: a Pod
 object carries its full spec, and that means container environment variables, which in many
 clusters hold inlined credentials. The agent keeps only names, owners and addresses, but the grant
 is the grant. Drop the `pods` rule if that is not acceptable; everything a Service fronts is still
-named, and what you lose is the pods no Service fronts. To revoke it, delete those objects and unset
-`ARES_IDENTIFY_KUBERNETES`; the agent goes back to naming hosts from DNS alone.
+named and its exposure still read, and what you lose is the pods no Service fronts. To revoke it,
+delete those objects and unset `ARES_IDENTIFY_KUBERNETES`; the agent goes back to naming hosts from
+DNS alone.
 
 The reader token does not expire. To rotate it, delete the `ares-agent-reader` Secret, re-apply
 `deploy/k8s/ares-agent-cluster-read.yaml`, and restart the agent pod.

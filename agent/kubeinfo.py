@@ -1,8 +1,8 @@
 """What a Kubernetes cluster calls the addresses a scan finds.
 
-A scan sees pod and Service addresses. The cluster is the only thing that knows which Service
-fronts which pod, and that mapping is what turns thousands of churning pod rows into a handful of
-workloads an operator recognises.
+A scan sees pod and Service addresses. ares already names a pod a Service fronts from its DNS
+record; the cluster API adds what DNS cannot give: the workload behind a pod no Service fronts,
+and whether a Service is published outside the cluster.
 
 Read once per scan, not once per host. The API answers for the whole cluster in a few paged calls,
 so the identity phase looks each address up in a dict and pays no network cost per host. That
