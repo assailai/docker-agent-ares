@@ -285,8 +285,8 @@ async def _list_within(client: httpx.AsyncClient, kind: _Kind, budget: float) ->
     """:func:`_list_all`, abandoned when ``budget`` runs out or the kind will not answer.
 
     Returns an empty list rather than a partial one. A half-read EndpointSlice list is worse than
-    none: the addresses it did not reach are not merely unnamed, they would fold separately from
-    the ones it did, so one Service would render as two cards that disagree.
+    none: it names an arbitrary subset of a Service's pods and leaves the rest looking like pods
+    no Service fronts, which reads as a fact about the cluster rather than a read that stopped.
 
     EVERY failure is contained here, not just a timeout and not just a refusal. Letting one escape
     meant a single 404 or a transient 503 on the last and largest kind threw away the kinds that

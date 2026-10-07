@@ -167,7 +167,8 @@ sweep. The read is bounded by `ARES_KUBE_BUDGET_SECONDS` (two minutes by default
 and page, and naming waits for whatever is left of it no longer than naming's own share of the
 scan's time budget, so turning this on cannot make a scan overrun the time it was given. A kind that
 is not read in full, because it ran out of time, was refused, or has more than 20,000 objects, is
-skipped rather than used in part: half a Service's endpoints would show one Service as two.
+skipped rather than used in part: half a Service's endpoints would leave its other pods looking
+like no Service fronts them.
 
 ## Configuration
 

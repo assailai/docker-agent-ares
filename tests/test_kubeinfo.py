@@ -281,7 +281,8 @@ async def test_a_large_cluster_is_read_whole_across_pages() -> None:
 
 async def test_a_kind_past_the_cap_contributes_nothing_and_stops_paging() -> None:
     # the guard that stops one scan growing the agent's memory with somebody else's cluster. Part
-    # of a slice list would split one Service into two cards, so the kind contributes nothing.
+    # of a slice list would leave some of a Service's pods looking unfronted, so the kind
+    # contributes nothing.
     requests: list[str] = []
     big = _big_api(services=kubeinfo._MAX_OBJECTS + 1000, pods_per=0)
     inner = big.transport
