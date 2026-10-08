@@ -47,6 +47,10 @@ host privileges to grant.
    resolve to loopback, link-local (so not cloud metadata), private, carrier-grade NAT, multicast
    or reserved space. A destination you approved by exact name or address is unaffected, so an
    internal host you added by hand still works.
+5. **Pause** - pausing the agent in the dashboard stops it working until you resume it. The agent
+   learns of it on its next heartbeat: it cancels the scan it is running and hands that task back,
+   asks for no new tasks, and closes its tunnel. On Resume the handed-back work runs again. Agents
+   older than 3.10.0 finish the network they are scanning before they stop.
 
 ## Getting started
 
