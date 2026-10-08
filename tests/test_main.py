@@ -1489,5 +1489,5 @@ async def test_claimed_tasks_not_yet_started_go_back_when_the_agent_is_paused(
 
 def test_the_agent_reports_that_it_honours_a_pause() -> None:
     # given this build, then it reports `pause`: the control plane picks the drawer's wording from
-    # it, because an agent without it finishes the network it is on before it stops.
+    # it, because an agent without it first finishes every scan task it already claimed.
     assert "pause" in main.control_plane.CAPABILITIES
