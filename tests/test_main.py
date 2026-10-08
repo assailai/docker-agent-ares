@@ -1321,6 +1321,7 @@ def test_the_reported_mode_pauses_and_resumes_the_agent() -> None:
 
 @pytest.mark.usefixtures("_instant_loop")
 async def test_the_heartbeat_follows_the_mode_it_is_told(monkeypatch: pytest.MonkeyPatch) -> None:
+    # given a control plane that reports the agent paused, when the beat lands, then it is paused.
     beats: list[object] = [{"operational_mode": "paused"}]
     monkeypatch.setattr(main.control_plane, "heartbeat", _scripted_heartbeat(beats))
 
@@ -1354,7 +1355,7 @@ def _patch_task_posts(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
     async def _completed(_s, _t, task_id, _hosts, **_kw):
         posts["completed"].append(task_id)
 
-    async def _released(_s, _t, task_id):
+    async def _released(*, settings, token, task_id):
         posts["released"].append(task_id)
 
     async def _failed(_s, _t, task_id, *_a, **_kw):
@@ -1389,8 +1390,9 @@ async def test_a_pause_mid_scan_cancels_it_and_hands_the_task_back(
 
 
 async def test_a_shutdown_mid_scan_still_cancels_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
-    # stopping the process is not a pause: the scan is cancelled with its task, and nothing is
-    # handed back (the lease does that if the process never returns).
+    # given a scan in progress, when the process shuts down (which is not a pause), then the scan
+    # is cancelled with its task and nothing is handed back: the lease does that if it never
+    # returns.
     posts = _patch_task_posts(monkeypatch)
     scanning, cancelled = asyncio.Event(), []
     monkeypatch.setattr(main.scan, "scan_cidr", _never_ending_scan(scanning, cancelled))
@@ -1410,8 +1412,9 @@ async def test_a_shutdown_mid_scan_still_cancels_cleanly(monkeypatch: pytest.Mon
 async def test_handing_back_to_an_older_control_plane_is_not_an_error(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # a control plane from before the release route answers 404; the task's lease covers it.
-    async def _no_route(_s, _t, _task_id):
+    # given a control plane from before the release route, when it answers 404, then the hand-back
+    # logs it and carries on: the task's lease covers it.
+    async def _no_route(*, settings, token, task_id):
         request = httpx.Request("POST", "https://ares.test/api/v1/agent/tasks/t1/release")
         raise httpx.HTTPStatusError(
             "not found", request=request, response=httpx.Response(404, request=request)
@@ -1438,6 +1441,7 @@ def _sleep_until(monkeypatch: pytest.MonkeyPatch, *, calls: int) -> None:
 
 
 async def test_a_paused_agent_does_not_ask_for_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
+    # given a paused agent, when its poll loop runs a few rounds, then it never asks for a task.
     polled: list[bool] = []
 
     async def _poll(_s, _t):
@@ -1484,6 +1488,6 @@ async def test_claimed_tasks_not_yet_started_go_back_when_the_agent_is_paused(
 
 
 def test_the_agent_reports_that_it_honours_a_pause() -> None:
-    # the control plane picks the drawer's wording from this: an agent without it finishes the
-    # network it is on before it stops.
+    # given this build, then it reports `pause`: the control plane picks the drawer's wording from
+    # it, because an agent without it finishes the network it is on before it stops.
     assert "pause" in main.control_plane.CAPABILITIES

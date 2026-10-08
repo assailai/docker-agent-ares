@@ -87,7 +87,7 @@ _INSECURE_DENY_HOSTS = ("ares.assailai.com",)
 _reachable: dict[str, list[str]] = {"networks": []}
 # cadence the server hands back at register / heartbeat (sane defaults until then).
 _cadence = {"heartbeat": 30, "poll": 5}
-# Set while the dashboard has this agent paused, as the last heartbeat reported (ARES-1700): no task
+# set while the dashboard has this agent paused, as the last heartbeat reported (ARES-1700): no task
 # is polled for, and a running scan is cancelled and handed back. An Event rather than a flag so a
 # scan can be raced against it without polling. Module state for the same reason _cadence is. An
 # Event binds to the first loop that waits on it, which is the one serving loop the agent runs.
@@ -725,7 +725,7 @@ async def _hand_back(token: str, task_id: str) -> None:
     task's dispatch lease hands it back later instead, so the only cost is a delay.
     """
     try:
-        await control_plane.task_released(settings, token, task_id)
+        await control_plane.task_released(settings=settings, token=token, task_id=task_id)
     except Exception as exc:  # noqa: BLE001 - the lease is the fallback, so nothing is lost
         logger.warning("Could not hand task %s back (%s); its lease will.", task_id, exc)
 
