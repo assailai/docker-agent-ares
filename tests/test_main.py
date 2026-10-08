@@ -1309,8 +1309,8 @@ async def test_a_stalled_cluster_read_cannot_push_a_scan_past_its_budget(
 
 
 def test_the_reported_mode_pauses_and_resumes_the_agent() -> None:
-    # given beats reporting paused, then nothing, then active: the first pauses, a beat without the
-    # field changes nothing (it is not a Resume), and active resumes.
+    # beats reporting paused, then nothing, then active: when the first lands the agent pauses, a
+    # beat without the field changes nothing (it is not a Resume), and active resumes it.
     main._apply_operational_mode("paused")
     assert main._paused.is_set()
     main._apply_operational_mode(None)
@@ -1321,7 +1321,7 @@ def test_the_reported_mode_pauses_and_resumes_the_agent() -> None:
 
 @pytest.mark.usefixtures("_instant_loop")
 async def test_the_heartbeat_follows_the_mode_it_is_told(monkeypatch: pytest.MonkeyPatch) -> None:
-    # given a control plane that reports the agent paused, when the beat lands, then it is paused.
+    # when a real heartbeat says paused, then the loop leaves the agent paused.
     beats: list[object] = [{"operational_mode": "paused"}]
     monkeypatch.setattr(main.control_plane, "heartbeat", _scripted_heartbeat(beats))
 
@@ -1334,7 +1334,7 @@ async def test_the_heartbeat_follows_the_mode_it_is_told(monkeypatch: pytest.Mon
 def _never_ending_scan(scanning: asyncio.Event, cancelled: list[bool]):
     """A scan_cidr stand-in that runs until something cancels it, recording that it was."""
 
-    async def _scan(cidr, ports, **kwargs):
+    async def _scan(cidr: str, ports: list[int], **kwargs: object) -> list[dict]:
         scanning.set()
         try:
             await asyncio.Event().wait()
@@ -1349,16 +1349,18 @@ def _never_ending_scan(scanning: asyncio.Event, cancelled: list[bool]):
 def _patch_task_posts(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
     posts: dict[str, list[str]] = {"started": [], "completed": [], "released": [], "failed": []}
 
-    async def _started(_s, _t, task_id):
+    async def _started(_s: object, _t: str, task_id: str) -> None:
         posts["started"].append(task_id)
 
-    async def _completed(_s, _t, task_id, _hosts, **_kw):
+    async def _completed(
+        _s: object, _t: str, task_id: str, _hosts: list[dict], **_kw: object
+    ) -> None:
         posts["completed"].append(task_id)
 
-    async def _released(*, settings, token, task_id):
+    async def _released(*, settings: object, token: str, task_id: str) -> None:
         posts["released"].append(task_id)
 
-    async def _failed(_s, _t, task_id, *_a, **_kw):
+    async def _failed(_s: object, _t: str, task_id: str, *_a: object, **_kw: object) -> None:
         posts["failed"].append(task_id)
 
     monkeypatch.setattr(main.control_plane, "task_started", _started)
@@ -1390,9 +1392,8 @@ async def test_a_pause_mid_scan_cancels_it_and_hands_the_task_back(
 
 
 async def test_a_shutdown_mid_scan_still_cancels_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
-    # given a scan in progress, when the process shuts down (which is not a pause), then the scan
-    # is cancelled with its task and nothing is handed back: the lease does that if it never
-    # returns.
+    # a shutdown is not a pause: when the process stops mid-scan, then the scan is cancelled with
+    # its task and nothing is handed back. The lease does that if the process never returns.
     posts = _patch_task_posts(monkeypatch)
     scanning, cancelled = asyncio.Event(), []
     monkeypatch.setattr(main.scan, "scan_cidr", _never_ending_scan(scanning, cancelled))
@@ -1412,9 +1413,9 @@ async def test_a_shutdown_mid_scan_still_cancels_cleanly(monkeypatch: pytest.Mon
 async def test_handing_back_to_an_older_control_plane_is_not_an_error(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # given a control plane from before the release route, when it answers 404, then the hand-back
-    # logs it and carries on: the task's lease covers it.
-    async def _no_route(*, settings, token, task_id):
+    # an older control plane has no release route: when it answers 404, then the hand-back logs it
+    # and carries on, because the task's lease covers it.
+    async def _no_route(*, settings: object, token: str, task_id: str) -> None:
         request = httpx.Request("POST", "https://ares.test/api/v1/agent/tasks/t1/release")
         raise httpx.HTTPStatusError(
             "not found", request=request, response=httpx.Response(404, request=request)
@@ -1441,10 +1442,10 @@ def _sleep_until(monkeypatch: pytest.MonkeyPatch, *, calls: int) -> None:
 
 
 async def test_a_paused_agent_does_not_ask_for_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
-    # given a paused agent, when its poll loop runs a few rounds, then it never asks for a task.
+    # with the agent paused, a few rounds of the poll loop never ask for a task.
     polled: list[bool] = []
 
-    async def _poll(_s, _t):
+    async def _poll(_s: object, _t: str) -> list[dict]:
         polled.append(True)
         return []
 
@@ -1466,13 +1467,13 @@ async def test_claimed_tasks_not_yet_started_go_back_when_the_agent_is_paused(
     posts = _patch_task_posts(monkeypatch)
     ran: list[str] = []
 
-    async def _poll(_s, _t):
+    async def _poll(_s: object, _t: str) -> list[dict]:
         return [
             {"id": "t1", "target_network": "10.0.0.0/24"},
             {"id": "t2", "target_network": "10.0.1.0/24"},
         ]
 
-    async def _run_task(_token, task):
+    async def _run_task(_token: str, task: dict) -> None:
         ran.append(task["id"])
         main._paused.set()
 
