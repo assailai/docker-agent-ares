@@ -105,6 +105,39 @@ class Settings(BaseSettings):
     identify_http: bool = True
     # A NetBIOS node-status query (UDP 137), which names Windows machines that have no PTR.
     identify_netbios: bool = True
+    # Read the cluster API for the real Service and workload names behind pod addresses. See
+    # agent.kubeinfo.
+    #
+    # Off by default and deliberately separate from the probes above: those send bytes to the
+    # hosts being scanned, this one needs read credentials for the cluster itself, which is a
+    # power the agent does not otherwise hold. Turning it on without granting the credentials
+    # costs one failed call per scan and nothing else.
+    identify_kubernetes: bool = False
+    # Label for the cluster being read, shown beside the name it produced. One agent can watch
+    # more than one cluster, and the same Service name in the same namespace is a different
+    # workload in each. Empty means the names are reported without a cluster beside them.
+    kube_cluster_name: str = ""
+    # API server url for the cluster to read. SET THIS even when the agent runs inside the cluster:
+    # the standard Kubernetes install deliberately turns off the pod-wide ServiceAccount token and
+    # projects one into the UPDATER container alone, so the scanning container has no in-cluster
+    # credentials to fall back on. The patch file points this at https://kubernetes.default.svc
+    # with the reader token mounted beside it. Leaving it empty works only where something else
+    # mounted a ServiceAccount into this container.
+    kube_api_url: str = ""
+    # Bearer token file for kube_api_url. Required when that is set; ignored otherwise.
+    kube_token_file: str = ""
+    # CA bundle verifying kube_api_url. Empty verifies against the public roots, which is almost
+    # never right for a cluster API, so set it unless the endpoint has a publicly issued
+    # certificate.
+    kube_ca_file: str = ""
+    # Seconds one request to the cluster API may take.
+    kube_timeout: float = 15.0
+    # Wall clock for the whole cluster read, all four kinds and every page. It runs beside the
+    # sweep, and naming waits for what is left of it no longer than naming's own allowance. Capped
+    # because a task sent without a time budget has no allowance, and ares requeues a task 1800s
+    # after dispatch whatever it is doing.
+    kube_budget_seconds: float = Field(default=120.0, gt=0, le=600)
+
     # Per-source timeouts. Kept short: on a live LAN these all answer in milliseconds, and the
     # value only decides how long a host that will never answer costs us.
     identify_dns_timeout: float = 2.0

@@ -40,6 +40,8 @@ import struct
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from agent.kubeinfo import KubernetesEvidence
+
 logger = logging.getLogger("ares.agent.identify")
 
 # ports whose certificate is worth reading, in the order we would rather have them. This decides
@@ -154,9 +156,18 @@ class HostEvidence:
     hosts_file_name: str | None = None
     netbios_name: str | None = None
     services: list[ServiceEvidence] = field(default_factory=list)
+    kubernetes: KubernetesEvidence | None = None
 
     def is_empty(self) -> bool:
-        return not any((self.ptr_name, self.hosts_file_name, self.netbios_name, self.services))
+        return not any(
+            (
+                self.ptr_name,
+                self.hosts_file_name,
+                self.netbios_name,
+                self.services,
+                self.kubernetes,
+            )
+        )
 
     def as_payload(self) -> dict:
         payload: dict = {"ip": self.ip}
@@ -166,6 +177,8 @@ class HostEvidence:
                 payload[key] = value
         if self.services:
             payload["services"] = [s.as_payload() for s in self.services]
+        if self.kubernetes is not None:
+            payload["kubernetes"] = self.kubernetes.as_payload()
         return payload
 
 
@@ -471,6 +484,12 @@ class IdentityProbe:
     netbios_timeout: float = 1.0
     # resolves an address to a pinned name (agent.hostpins.HostPins.reverse)
     hosts_file_lookup: Callable[[str], str | None] | None = None
+    # what a cluster calls each address (agent.kubeinfo), read while the sweep runs
+    kubernetes_inventory: asyncio.Future[dict[str, KubernetesEvidence]] | None = None
+    # the longest a host waits for that read if it is still running: the naming allowance, so a
+    # slow cluster API costs names rather than pushing the scan past its budget. None waits for
+    # the read's own budget.
+    kubernetes_wait: float | None = None
 
     async def run(self, ip: str, services: dict[int, str]) -> HostEvidence:
         """Collect every enabled source for one host, concurrently.
@@ -487,6 +506,19 @@ class IdentityProbe:
                 evidence.hosts_file_name = self.hosts_file_lookup(ip)
             except Exception:  # noqa: BLE001 - a bad pin table must not cost the whole probe
                 logger.debug("hosts-file lookup failed for %s", ip, exc_info=True)
+
+        if self.kubernetes_inventory is not None:
+            try:
+                # shielded, so one probe giving up cannot cancel the read every host shares
+                inventory = await asyncio.wait_for(
+                    asyncio.shield(self.kubernetes_inventory), timeout=self.kubernetes_wait
+                )
+                found = inventory.get(ip)
+                evidence.kubernetes = found if found is not None and not found.is_empty() else None
+            except TimeoutError:
+                logger.debug("cluster read outlasted the naming allowance; %s named without it", ip)
+            except Exception:  # noqa: BLE001 - same rule as the pin table above
+                logger.debug("cluster lookup failed for %s", ip, exc_info=True)
 
         tls_ports = (
             _pick_ports(services, preferred=TLS_PORTS, limit=MAX_TLS_PROBES, worthy=_TLS_WORTHY)

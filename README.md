@@ -133,6 +133,49 @@ kubectl rollout status deploy/ares-agent
 To opt out of auto-update, delete the `ares-updater` container plus its ServiceAccount, Role, and
 RoleBinding, and update the image through your own pipeline instead.
 
+### Reading the cluster's API (optional)
+
+Ares already names a pod after the Service and namespace in its DNS record, such as
+`checkout (payments)`, with nothing to install or grant. Letting the agent read the cluster's API
+adds two things DNS cannot give:
+
+- **A name for a pod no Service fronts.** Kubernetes publishes no DNS record for one, so without
+  the API it is known only by its address. With it, the pod is named after the workload that owns
+  it.
+- **Whether a workload is reachable from outside the cluster**: the Service's type and any Ingress
+  hostname that routes to it. Neither is in DNS.
+
+Nothing in Ares needs this, and nothing else changes if you leave it off. It is here for an operator
+who wants those two things and is comfortable with the grant below.
+
+```bash
+kubectl apply -f deploy/k8s/ares-agent-cluster-read.yaml
+kubectl patch deploy ares-agent --patch-file deploy/k8s/ares-agent-cluster-read.patch.yaml
+```
+
+This grants `list`, and only `list`, on services, endpointslices, ingresses and pods across the
+cluster, through a ServiceAccount of its own that is separate from the updater's. `list` is the one
+verb the agent uses. No write verb, no secrets, no configmaps.
+
+Be aware of what `list pods` includes, because Kubernetes has no field-level authorisation: a Pod
+object carries its full spec, and that means container environment variables, which in many
+clusters hold inlined credentials. The agent keeps only names, owners and addresses, but the grant
+is the grant. Drop the `pods` rule if that is not acceptable; everything a Service fronts is still
+named and its exposure still read, and what you lose is the pods no Service fronts. To revoke it,
+delete those objects and unset `ARES_IDENTIFY_KUBERNETES`; the agent goes back to naming hosts from
+DNS alone.
+
+The reader token does not expire. To rotate it, delete the `ares-agent-reader` Secret, re-apply
+`deploy/k8s/ares-agent-cluster-read.yaml`, and restart the agent pod.
+
+The cluster is read once per scan, alongside the sweep, so a slow cluster API never holds up the
+sweep. The read is bounded by `ARES_KUBE_BUDGET_SECONDS` (two minutes by default) across every kind
+and page, and naming waits for whatever is left of it no longer than naming's own share of the
+scan's time budget, so turning this on cannot make a scan overrun the time it was given. A kind that
+is not read in full, because it ran out of time, was refused, or has more than 20,000 objects, is
+skipped rather than used in part: half a Service's endpoints would leave its other pods looking
+like no Service fronts them.
+
 ## Configuration
 
 The agent is configured entirely through environment variables (all prefixed `ARES_`).
@@ -231,6 +274,13 @@ redirect and never sends a credential, so it cannot trip an account lockout.
 | `ARES_IDENTIFY_TLS_TIMEOUT` | `3.0` | Seconds to wait for a TLS handshake. |
 | `ARES_IDENTIFY_HTTP_TIMEOUT` | `3.0` | Seconds to wait for an HTTP response. |
 | `ARES_IDENTIFY_NETBIOS_TIMEOUT` | `1.0` | Seconds to wait for a NetBIOS reply. |
+| `ARES_IDENTIFY_KUBERNETES` | `false` | Read a Kubernetes cluster's API for the real Service and workload names behind pod addresses. Needs cluster read credentials, so it is off until you apply `deploy/k8s/ares-agent-cluster-read.yaml` and turn it on. |
+| `ARES_KUBE_CLUSTER_NAME` | _(empty)_ | What to call the cluster being read. Shown beside the names it produces, which is what tells two clusters apart when one agent watches both. |
+| `ARES_KUBE_API_URL` | _(empty)_ | API server for the cluster to read. Set this even in-cluster: the standard install keeps the ServiceAccount token out of the scanning container on purpose, so there is nothing to fall back on. The patch file sets it to `https://kubernetes.default.svc`. |
+| `ARES_KUBE_TOKEN_FILE` | _(empty)_ | Bearer token file for `ARES_KUBE_API_URL`. Required when that is set. |
+| `ARES_KUBE_CA_FILE` | _(empty)_ | CA bundle verifying `ARES_KUBE_API_URL`. Set this unless the endpoint has a publicly issued certificate. |
+| `ARES_KUBE_TIMEOUT` | `15.0` | Seconds one request to the cluster API may take. |
+| `ARES_KUBE_BUDGET_SECONDS` | `120` | Total seconds the cluster read may take, every kind and page included (at most `600`). It runs alongside the sweep, and naming waits for what is left of it no longer than naming's share of the scan's time budget. |
 
 Identification runs once per *live* host (never per open port), under its own concurrency limit,
 and inside a fixed share of the scan's overall time budget. If that share runs out, the remaining
