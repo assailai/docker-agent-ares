@@ -22,7 +22,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from agent import control_plane, netdetect, reachability, scan, tlsconf
+from agent import control_plane, netdetect, reach_schedule, reachability, scan, tlsconf
 from agent.config import settings
 from agent.health.system_metrics import read_cpu_percent, read_memory_percent
 from agent.hostpins import HostPins
@@ -214,13 +214,19 @@ async def _preflight(state: AgentState, ssl_context: ssl.SSLContext) -> None:
     Never fatal. An agent that can reach the control plane is still useful (it enrolls, heartbeats
     and reports), and refusing to start would turn a degraded deployment into no deployment. The
     log is loud instead, and the serve loop carries on.
+
+    Its beat is also the first chance to hear the dashboard's "Rescan automatically" setting, and it
+    lands before the reachability loop decides whether to probe at start. Read here, an agent with
+    rescans off restarts without a probe; read only from the serve loop's first beat, it would race
+    that decision. When this beat fails, the setting stored from the last run stands.
     """
     token = state.agent_token or ""
     try:
-        await control_plane.heartbeat(settings, token)
+        resp = await control_plane.heartbeat(settings, token)
         # Worth its own line even though registration just succeeded: that used the one-time
         # registration token, and this is the first proof the long-lived agent token works.
         logger.info("Preflight: control plane OK (%s)", settings.base_url)
+        _apply_auto_rescan(resp.get("auto_rescan"), state=state)
     except (httpx.HTTPError, OSError) as exc:
         logger.error("Preflight: control plane FAILED: %s%s", exc, _tls_hint(exc))
 
@@ -435,6 +441,7 @@ async def _heartbeat_loop(state: AgentState, tunnel: TunnelManager) -> None:
             unauthorized = 0
             _record_contact()  # feed the watchdog + refresh the healthcheck marker
             _cadence["heartbeat"] = resp.get("heartbeat_interval_seconds", _cadence["heartbeat"])
+            _apply_auto_rescan(resp.get("auto_rescan"), state=state)
             tunnel.sync(
                 bool(resp.get("tunnel_required")),
                 _allowed_hosts(resp.get("tunnel_allowed_hosts")),
@@ -767,52 +774,153 @@ async def _run_task(token: str, task: dict) -> None:
             inventory.cancel()
 
 
-async def _redetect_loop(tunnel: TunnelManager | None = None) -> None:
-    """Work out what this agent can reach, then keep working it out.
+def _detection_scope() -> str:
+    """The settings a stored reachability answer is only good for (see AgentState.detected_scope).
 
-    Runs IMMEDIATELY rather than after a sleep, because it owns the first answer as well as every
+    The scope decides what a probe looks at and the probe flag whether it sends anything at all, so
+    an answer stored under a different value of either one answered a different question.
+    """
+    return f"{settings.scan_scope}:{settings.reach_probe}"
+
+
+def _persist(state: AgentState) -> None:
+    """Save the state file, logging rather than raising.
+
+    The identity in it was saved when it was minted. What this writes is a setting or a reachability
+    answer, and losing one costs at most a probe after the next restart, which is no reason to stop
+    the loop that asked.
+    """
+    try:
+        save_state(settings.state_path, state)
+    except OSError as exc:
+        logger.warning("Could not save agent state to %s: %s", settings.state_path, exc)
+
+
+def _apply_auto_rescan(value: object, *, state: AgentState) -> None:
+    """Follow the dashboard's "Rescan automatically" setting, as a heartbeat reports it.
+
+    Only a real bool counts. A beat without the field (a control plane older than the setting)
+    changes nothing, and neither does a malformed one, so a bad field can switch discovery neither
+    on nor off. Stored with the identity so it holds across a restart, including one whose
+    preflight beat fails; the reachability loop reads it on its next tick.
+    """
+    if not isinstance(value, bool) or value == state.auto_rescan:
+        return
+    was_on = state.auto_rescan_on
+    state.auto_rescan = value
+    _persist(state)
+    if value == was_on:
+        return  # the first word from a control plane that knows the setting, and it agrees
+    if value:
+        logger.info(
+            "Automatic rescans turned on from the dashboard: reachable networks are checked "
+            "again every %ds (ARES_REACH_REFRESH_SECONDS).",
+            settings.reach_refresh_seconds,
+        )
+    else:
+        logger.info(
+            "Automatic rescans turned off from the dashboard: keeping the networks already found "
+            "and not probing again until they are turned back on."
+        )
+
+
+def _publish_reachable(networks: list[str], tunnel: TunnelManager | None) -> None:
+    """Hand a reachability answer to the heartbeat, which reports it, and to the tunnel, which
+    dials it."""
+    if networks == _reachable["networks"]:
+        return
+    logger.info("Reachable networks: %s", ", ".join(networks) or "none")
+    _reachable["networks"] = networks
+    # Widen what the tunnel will dial as well as what ares will scan. Both halves are needed and
+    # they are decided in different places: ares scans what it is told, the agent dials what IT
+    # believes it can reach, so reporting the networks without updating this would find hosts the
+    # tunnel then refuses. A tunnel already connected keeps the snapshot it was built with until it
+    # reconnects, which is a window of one reconnect on a 6-hourly cadence.
+    if tunnel is not None:
+        tunnel.set_networks(networks)
+
+
+async def _probe_reachable(state: AgentState, tunnel: TunnelManager | None, *, scope: str) -> None:
+    """One pass of reachability discovery: publish the answer and store it with the identity.
+
+    The attempt is stamped whether or not it worked, so a probe that keeps failing is retried on the
+    refresh interval rather than on every tick (see agent.reach_schedule).
+    """
+    try:
+        networks: list[str] | None = await _resolve_networks()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a failed re-detect keeps the previous answer
+        logger.debug("reachability re-detection failed: %s", exc)
+        networks = None
+    state.reach_probed_at = time.time()
+    if networks is not None:
+        state.detected_networks = networks
+        state.detected_scope = scope
+        _publish_reachable(networks, tunnel)
+    _persist(state)
+
+
+async def _redetect_loop(state: AgentState, tunnel: TunnelManager | None = None) -> None:
+    """Work out what this agent can reach, then keep working it out while the dashboard allows.
+
+    Starts IMMEDIATELY rather than after a sleep, because it owns the first answer as well as every
     later one: ``run`` enrolls on the attached subnets alone so the agent comes online in seconds,
     and this is what widens the scope to everything reachable a minute or two later. Then it
     repeats on the refresh cadence, because registration happens exactly once (a self-updating
     agent keeps its token and never registers again), so a VLAN or a route that appeared six months
     into an install would otherwise stay invisible for as long as the container lives.
 
+    Unless the dashboard's "Rescan automatically" setting is off. Then the first answer is the only
+    one: it is stored with the identity and reused on every restart, so an estate that does not want
+    its private space probed every six hours gets one probe, at install, and no more. When to look
+    next is agent.reach_schedule's decision, asked on every heartbeat tick, so a change in the
+    dashboard is followed within a beat. A probe already running is left to finish.
+
     The result is published for the heartbeat to report; this task never calls the control plane
     itself, which is what stops a slow probe from ever delaying a beat.
 
     Off entirely when the networks were given explicitly (ARES_NETWORKS is a decision, and nothing
-    should widen it) or when the interval is 0, which is the escape hatch for an estate that wants
-    discovery to happen once and then never unprompted.
+    should widen it). An interval of 0 is the escape hatch for an estate that wants discovery once
+    per start and then never unprompted.
     """
     if settings.network_overrides() or settings.scan_scope != netdetect.REACHABLE_SCOPE:
         return
-    logger.info(
-        "Discovering reachable networks in the background (routes, neighbours%s).",
-        ", and a probe of private space" if settings.reach_probe else "",
-    )
+    scope = _detection_scope()
+    stored = state.stored_detection(scope)
+    if stored is not None:
+        # Published first, so a restart with rescans off still reports, and lets the tunnel dial,
+        # everything the agent found before. Without it the tunnel would be held to the attached
+        # subnets until a probe that, with rescans off, never comes.
+        _publish_reachable(stored, tunnel)
+    if state.auto_rescan_on or stored is None:
+        logger.info(
+            "Discovering reachable networks in the background (routes, neighbours%s).",
+            ", and a probe of private space" if settings.reach_probe else "",
+        )
+        await _probe_reachable(state, tunnel, scope=scope)
+    else:
+        logger.info(
+            "Automatic rescans are off: reusing the %d reachable network(s) found earlier rather "
+            "than probing again.",
+            len(stored),
+        )
     interval = settings.reach_refresh_seconds
+    if interval <= 0:
+        return  # a single pass was asked for: the first answer is the only answer
     while True:
-        try:
-            networks = await _resolve_networks()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - a failed re-detect keeps the previous answer
-            logger.debug("reachability re-detection failed: %s", exc)
-            networks = _reachable["networks"]
-        if networks != _reachable["networks"]:
-            logger.info("Reachable networks: %s", ", ".join(networks) or "none")
-            _reachable["networks"] = networks
-            # Widen what the tunnel will dial as well as what ares will scan. Both halves are
-            # needed and they are decided in different places: ares scans what it is told, the
-            # agent dials what IT believes it can reach, so reporting the networks without
-            # updating this would find hosts the tunnel then refuses. A tunnel already connected
-            # keeps the snapshot it was built with until it reconnects, which is a window of one
-            # reconnect on a 6-hourly cadence.
-            if tunnel is not None:
-                tunnel.set_networks(networks)
-        if interval <= 0:
-            return  # a single pass was asked for: the first answer is the only answer
-        await asyncio.sleep(interval)
+        delay = reach_schedule.probe_delay(
+            auto_rescan=state.auto_rescan_on,
+            has_result=state.stored_detection(scope) is not None,
+            probed_at=state.reach_probed_at,
+            now=time.time(),
+            interval=interval,
+        )
+        if delay == 0:
+            await _probe_reachable(state, tunnel, scope=scope)
+            continue
+        tick = _cadence["heartbeat"]
+        await asyncio.sleep(tick if delay is None else min(delay, tick))
 
 
 async def _poll_loop(state: AgentState) -> None:
@@ -972,7 +1080,7 @@ async def _serve(state: AgentState, tunnel: TunnelManager) -> None:
     _liveness["last_contact"] = time.monotonic()
     tasks = {
         asyncio.create_task(_heartbeat_loop(state, tunnel)),
-        asyncio.create_task(_redetect_loop(tunnel)),
+        asyncio.create_task(_redetect_loop(state, tunnel)),
         asyncio.create_task(_poll_loop(state)),
         asyncio.create_task(_watchdog_loop()),
     }

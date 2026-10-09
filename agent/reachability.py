@@ -81,8 +81,9 @@ SPARSE_PORTS: tuple[int, ...] = PROBE_PORTS[:3]
 #: value only decides what a dead address costs. It is the dominant term in the whole runtime.
 PROBE_TIMEOUT = 0.35
 
-#: Default wall clock for the whole probe. Generous because it runs at enrollment and on rescan,
-#: not per hunt, and a partial map of a large estate is still far better than one /16.
+#: Default wall clock for the whole probe. Generous because it runs at enrollment and on the
+#: refresh cadence (only while automatic rescans are on), not per hunt, and a partial map of a
+#: large estate is still far better than one /16.
 DEFAULT_BUDGET_SECONDS = 600.0
 
 #: Concurrent connects. The scan's own default is higher; this is deliberately below it because the

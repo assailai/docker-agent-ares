@@ -83,3 +83,78 @@ def test_the_identity_file_is_not_world_readable(tmp_path: Path) -> None:
     save_state(path, AgentState("a1", "agtk-1", fingerprint("ares_agt_one")))
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_the_rescan_setting_and_the_last_detection_round_trip(tmp_path: Path) -> None:
+    # What lets an agent with automatic rescans off restart without probing again: the setting and
+    # the answer it is told to keep both have to survive the file.
+    path = tmp_path / "agent-state.json"
+    state = AgentState(
+        agent_id="a1",
+        agent_token="agtk-1",
+        auto_rescan=False,
+        detected_networks=["172.23.0.0/16", "10.20.0.0/16"],
+        detected_scope="reachable:True",
+        reach_probed_at=1_760_000_000.5,
+    )
+
+    save_state(path, state)
+
+    assert load_state(path) == state
+
+
+def test_a_state_file_from_before_the_rescan_setting_reads_as_on_with_nothing_stored(
+    tmp_path: Path,
+) -> None:
+    # Every agent deployed before 3.10 has a file without these keys. It must read as "never told",
+    # which is on, and as "nothing stored", which is what makes it probe once as it always did.
+    path = tmp_path / "agent-state.json"
+    path.write_text(json.dumps({"agent_id": "a1", "agent_token": "agtk-1"}))
+
+    state = load_state(path)
+
+    assert state.registered
+    assert state.auto_rescan is None
+    assert state.auto_rescan_on
+    assert state.stored_detection("reachable:True") is None
+
+
+def test_a_hand_edited_detection_reads_as_nothing_stored(tmp_path: Path) -> None:
+    # A malformed value must cost a probe, never a crash and never a scope nobody detected.
+    path = tmp_path / "agent-state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "agent_id": "a1",
+                "agent_token": "agtk-1",
+                "auto_rescan": "false",
+                "detected_networks": ["10.0.0.0/8", 7],
+                "detected_scope": 3,
+                "reach_probed_at": True,
+            }
+        )
+    )
+
+    state = load_state(path)
+
+    assert state.registered
+    assert state.auto_rescan is None
+    assert state.detected_networks is None
+    assert state.detected_scope is None
+    assert state.reach_probed_at is None
+
+
+def test_a_stored_detection_answers_only_for_the_scope_that_produced_it() -> None:
+    state = AgentState(detected_networks=["10.20.0.0/16"], detected_scope="reachable:True")
+
+    assert state.stored_detection("reachable:True") == ["10.20.0.0/16"]
+    # Worked out with the probe on, asked about with it off: a different question.
+    assert state.stored_detection("reachable:False") is None
+
+
+def test_an_empty_detection_is_an_answer_not_an_absence() -> None:
+    # "Probed, and nothing private is reachable" must not read as "never probed", or an agent with
+    # rescans off would probe again on every restart of a host that genuinely reaches nothing.
+    state = AgentState(detected_networks=[], detected_scope="reachable:True")
+
+    assert state.stored_detection("reachable:True") == []

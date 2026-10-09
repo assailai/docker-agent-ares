@@ -649,7 +649,7 @@ async def test_enrollment_never_waits_for_reachability_discovery(
 
 
 async def test_redetect_publishes_reachable_networks_and_widens_the_tunnel(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # The whole point of the default scope: an agent attached to 172.23.x advertised 172.23.0.0/16
     # and nothing else, so a customer's 10.20 estate was never scanned. Discovery adds it, and
@@ -671,9 +671,10 @@ async def test_redetect_publishes_reachable_networks_and_widens_the_tunnel(
     monkeypatch.setattr(main.settings, "networks", "")
     # 0 means "one pass, then stop", which is what makes an otherwise-endless loop testable.
     monkeypatch.setattr(main.settings, "reach_refresh_seconds", 0)
+    monkeypatch.setattr(main.settings, "data_dir", tmp_path)
     monkeypatch.setitem(main._reachable, "networks", [])
 
-    await main._redetect_loop(_FakeTunnel())
+    await main._redetect_loop(AgentState(), _FakeTunnel())
 
     assert main._reachable["networks"] == ["172.23.0.0/16", "10.20.0.0/16"]
     assert widened == [["172.23.0.0/16", "10.20.0.0/16"]]
@@ -692,7 +693,7 @@ async def test_redetect_is_off_when_networks_were_given_explicitly(
     monkeypatch.setattr(main.settings, "networks", "10.1.2.0/24")
     monkeypatch.setattr(main.settings, "scan_scope", "reachable")
 
-    await main._redetect_loop(None)
+    await main._redetect_loop(AgentState(), None)
 
 
 async def test_explicit_networks_are_never_widened_by_discovery(

@@ -188,7 +188,7 @@ The agent is configured entirely through environment variables (all prefixed `AR
 | `ARES_SCAN_SCOPE` | `reachable` | How broadly to scan when `ARES_NETWORKS` is unset. See [Network discovery](#network-discovery). `reachable` (default), `supernet16`, `attached`, `rfc1918`, `host-all`. |
 | `ARES_REACH_PROBE` | `true` | Whether `reachable` runs its active probe of private space, as opposed to reading the machine's routing and neighbour tables only. |
 | `ARES_REACH_BUDGET_SECONDS` | `600` | Wall clock the probe may spend. When it runs out the agent advertises what it found and logs the truncation. |
-| `ARES_REACH_REFRESH_SECONDS` | `21600` | How often to look again, so a network that appears after the install is picked up. `0` runs discovery once, at startup. |
+| `ARES_REACH_REFRESH_SECONDS` | `21600` | How often to look again, so a network that appears after the install is picked up. `0` runs discovery once, at startup. Only applies while **Rescan automatically** is on in the dashboard; see [Automatic rescans](#automatic-rescans). |
 | `ARES_AGENT_NAME` | *(host name)* | Friendly name shown in the dashboard. |
 | `ARES_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
 | `ARES_INSECURE` | `false` | Skip TLS verification. Local and staging URLs only; the agent refuses to start with this set against a production URL. |
@@ -225,7 +225,8 @@ The default scope, `reachable`, answers the second question from three sources:
 in seconds, then discovery runs in the background and reports what it finds on the next heartbeat;
 Ares widens the scan scope and starts a scan of anything new. It repeats on
 `ARES_REACH_REFRESH_SECONDS`, because an agent registers exactly once and a self-updating one never
-registers again, so a VLAN added six months later would otherwise never be seen.
+registers again, so a VLAN added six months later would otherwise never be seen. The dashboard can
+turn that repetition off per agent; see [Automatic rescans](#automatic-rescans).
 
 The dashboard shows the difference: an agent's panel lists the networks in its scope, and separately
 anything it reported it can reach that is not in scope yet.
@@ -240,6 +241,27 @@ anything it reported it can reach that is not in scope yet.
 
 Set `ARES_REACH_PROBE=false` to keep the routing-table half and skip the packets, or set
 `ARES_NETWORKS` to skip discovery altogether.
+
+#### Automatic rescans
+
+Each agent has a **Rescan automatically** setting in the dashboard, chosen when it is deployed and
+changeable from its panel afterwards. It is on by default, which is the behaviour described above.
+Turn it off when the estate should not see a probe of its private space every
+`ARES_REACH_REFRESH_SECONDS`:
+
+- The agent still discovers what it can reach **once**, at install, so Ares has something to scan.
+- It then stops looking on its own. The answer is stored with the agent's identity in `/data`, so a
+  restart or an update reuses it instead of probing again, and the agent keeps reporting it and
+  dialling it through the tunnel.
+- Ares stops starting scans of networks the agent reports after that, and **Rescan** in the
+  dashboard still scans everything in the agent's scope whenever you press it.
+- Turning the setting back on is followed within one heartbeat: if the stored answer is older than
+  `ARES_REACH_REFRESH_SECONDS`, the agent looks again straight away.
+
+The agent reads the setting on every heartbeat, and keeps the last value it was told if the control
+plane does not send one. Agents older than 3.10 do not know the setting and go on probing on their
+own cadence; Ares says so next to the setting. For one of those, `ARES_REACH_REFRESH_SECONDS=0` on
+the container limits it to one probe each time it starts.
 
 ### Hosts added by hand
 
