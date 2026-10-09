@@ -259,7 +259,7 @@ Turn it off when the estate should not see a probe of its private space every
   `ARES_REACH_REFRESH_SECONDS`, the agent looks again straight away.
 
 The agent reads the setting on every heartbeat, and keeps the last value it was told if the control
-plane does not send one. Agents older than 3.10 do not know the setting and go on probing on their
+plane does not send one. Agents older than 3.11 do not know the setting and go on probing on their
 own cadence; Ares says so next to the setting. For one of those, `ARES_REACH_REFRESH_SECONDS=0` on
 the container limits it to one probe each time it starts.
 

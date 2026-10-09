@@ -109,7 +109,7 @@ def test_the_rescan_setting_and_the_last_detection_round_trip(tmp_path: Path) ->
 def test_a_state_file_from_before_the_rescan_setting_reads_as_on_with_nothing_stored(
     tmp_path: Path,
 ) -> None:
-    # given a file from an agent deployed before 3.10, without the new keys; when it is loaded;
+    # given a file from an agent deployed before 3.11, without the new keys; when it is loaded;
     # then it reads as "never told" (so on) and "nothing stored" (so it probes once, as it did)
     path = tmp_path / "agent-state.json"
     path.write_text(json.dumps({"agent_id": "a1", "agent_token": "agtk-1"}))
