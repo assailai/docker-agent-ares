@@ -10,6 +10,7 @@ narrate each step so an operator can self-diagnose.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ipaddress
 import json
 import logging
@@ -86,6 +87,13 @@ _INSECURE_DENY_HOSTS = ("ares.assailai.com",)
 _reachable: dict[str, list[str]] = {"networks": []}
 # cadence the server hands back at register / heartbeat (sane defaults until then).
 _cadence = {"heartbeat": 30, "poll": 5}
+# set while the dashboard has this agent paused, as the last heartbeat reported (ARES-1700): no task
+# is polled for, and a running scan is cancelled and handed back. An Event rather than a flag so a
+# scan can be raced against it without polling. Module state for the same reason _cadence is. An
+# Event binds to the first loop that waits on it, which is the one serving loop the agent runs.
+_paused = asyncio.Event()
+# the control plane's AgentMode.PAUSED, as it arrives on the heartbeat's operational_mode.
+_PAUSED_MODE = "paused"
 # captured at import (process start) so heartbeats can report uptime since connect.
 _AGENT_START_MONOTONIC = time.monotonic()
 # monotonic times of the last successful control-plane contact (heartbeat or task poll) and the
@@ -450,6 +458,7 @@ async def _heartbeat_loop(state: AgentState, tunnel: TunnelManager) -> None:
                 # nothing and widen it by nothing.
                 _allowed_hosts(resp.get("scoped_hosts")),
             )
+            _apply_operational_mode(resp.get("operational_mode"))
             if resp.get("restart_requested"):
                 logger.warning("Restart requested from dashboard; exiting for container restart.")
                 os._exit(0)
@@ -679,6 +688,55 @@ def _authorized_target(cidr: str) -> ipaddress.IPv4Network:
     return target
 
 
+def _apply_operational_mode(mode: object) -> None:
+    """Follow the pause the control plane reports. A beat without the field leaves things as they
+    are rather than reading as a Resume."""
+    if mode is None:
+        return
+    if mode == _PAUSED_MODE and not _paused.is_set():
+        logger.warning("Paused from the dashboard: stopping the running scan, taking no new tasks.")
+        _paused.set()
+    elif mode != _PAUSED_MODE and _paused.is_set():
+        logger.info("Resumed from the dashboard: taking tasks again.")
+        _paused.clear()
+
+
+async def _unless_paused(work: asyncio.Task[list[dict]]) -> list[dict] | None:
+    """The result of ``work``, or None once the agent is paused first, with ``work`` cancelled.
+
+    A cancellation of the caller (the process shutting down) cancels ``work`` too and re-raises, so
+    a scan never outlives the task that started it.
+    """
+    pause = asyncio.create_task(_paused.wait())
+    try:
+        done, _ = await asyncio.wait({work, pause}, return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError:
+        work.cancel()
+        raise
+    finally:
+        pause.cancel()
+    if work in done:
+        return work.result()
+    work.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await work
+    # a wait that failed is not a pause: raise it, so the scan is reported failed, not handed back.
+    pause.result()
+    return None
+
+
+async def _hand_back(token: str, task_id: str) -> None:
+    """Return a task the agent stopped because it was paused, so it reruns on Resume.
+
+    Never raises. A control plane older than ARES-1700 has no route for it and answers 404; the
+    task's dispatch lease hands it back later instead, so the only cost is a delay.
+    """
+    try:
+        await control_plane.task_released(settings=settings, token=token, task_id=task_id)
+    except Exception as exc:  # noqa: BLE001 - the lease is the fallback, so nothing is lost
+        logger.warning("Could not hand task %s back (%s); its lease will.", task_id, exc)
+
+
 async def _run_task(token: str, task: dict) -> None:
     task_id = task["id"]
     cidr = task.get("target_network")
@@ -742,20 +800,28 @@ async def _run_task(token: str, task: dict) -> None:
     inventory = _start_kubernetes_inventory()
     try:
         logger.info("Scanning %s across %d port(s)", cidr, len(ports))
-        hosts = await scan.scan_cidr(
-            cidr,
-            ports,
-            timeout=settings.scan_connect_timeout,
-            discovery_timeout=settings.scan_discovery_timeout,
-            concurrency=_scan_limits["concurrency"],
-            max_hosts=settings.scan_max_hosts,
-            chunk_prefix=settings.scan_chunk_prefix,
-            budget_seconds=budget,
-            on_progress=_on_progress,
-            on_hosts=_on_hosts,
-            on_identity=_on_identity,
-            identity=_identity_probe(inventory, budget_seconds=budget),
+        hosts = await _unless_paused(
+            asyncio.create_task(
+                scan.scan_cidr(
+                    cidr,
+                    ports,
+                    timeout=settings.scan_connect_timeout,
+                    discovery_timeout=settings.scan_discovery_timeout,
+                    concurrency=_scan_limits["concurrency"],
+                    max_hosts=settings.scan_max_hosts,
+                    chunk_prefix=settings.scan_chunk_prefix,
+                    budget_seconds=budget,
+                    on_progress=_on_progress,
+                    on_hosts=_on_hosts,
+                    on_identity=_on_identity,
+                    identity=_identity_probe(inventory, budget_seconds=budget),
+                )
+            )
         )
+        if hosts is None:
+            logger.warning("Paused mid-scan of %s; handing task %s back.", cidr, task_id)
+            await _hand_back(token, task_id)
+            return
         evidence = sorted(identity_seen.values(), key=lambda d: d["ip"])
         await control_plane.task_completed(
             settings, token, task_id, hosts, host_evidence=evidence
@@ -923,22 +989,33 @@ async def _redetect_loop(state: AgentState, tunnel: TunnelManager | None = None)
         await asyncio.sleep(tick if delay is None else min(delay, tick))
 
 
+async def _work_through(token: str, tasks: list[dict]) -> None:
+    """Run a polled batch in order. A poll claims several tasks at once, so a pause can land with
+    some not yet started: those go straight back rather than sitting out their lease."""
+    for task in tasks:
+        if _paused.is_set():
+            await _hand_back(token, task["id"])
+            continue
+        await _run_task(token, task)
+
+
 async def _poll_loop(state: AgentState) -> None:
     failures = 0
     while True:
-        try:
-            tasks = await control_plane.poll_tasks(settings, state.agent_token or "")
-            if failures:
-                logger.info("Task polling recovered after %d failed attempt(s).", failures)
-                failures = 0
-            _record_contact()  # a successful poll is also live contact with Ares
-            for task in tasks:
-                await _run_task(state.agent_token or "", task)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - keep polling through any transient error
-            failures += 1
-            _log_repeated_failure("task poll", failures, exc)
+        # a paused agent asks for nothing; the control plane holds its tasks until Resume.
+        if not _paused.is_set():
+            try:
+                tasks = await control_plane.poll_tasks(settings, state.agent_token or "")
+                if failures:
+                    logger.info("Task polling recovered after %d failed attempt(s).", failures)
+                    failures = 0
+                _record_contact()  # a successful poll is also live contact with Ares
+                await _work_through(state.agent_token or "", tasks)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - keep polling through any transient error
+                failures += 1
+                _log_repeated_failure("task poll", failures, exc)
         await asyncio.sleep(_cadence["poll"])
 
 
