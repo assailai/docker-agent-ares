@@ -15,6 +15,9 @@ from pathlib import Path
 
 from agent.state import AgentState, fingerprint, load_state, save_state
 
+# a fractional epoch on purpose: the float has to survive the JSON round trip intact
+_PROBED_AT = 1_760_000_000.5
+
 
 def test_a_saved_identity_round_trips_with_its_token_fingerprint(tmp_path: Path) -> None:
     path = tmp_path / "agent-state.json"
@@ -86,8 +89,8 @@ def test_the_identity_file_is_not_world_readable(tmp_path: Path) -> None:
 
 
 def test_the_rescan_setting_and_the_last_detection_round_trip(tmp_path: Path) -> None:
-    # What lets an agent with automatic rescans off restart without probing again: the setting and
-    # the answer it is told to keep both have to survive the file.
+    # given rescans off and a stored answer; when the state is saved and loaded; then both survive,
+    # which is what lets such an agent restart without probing again
     path = tmp_path / "agent-state.json"
     state = AgentState(
         agent_id="a1",
@@ -95,7 +98,7 @@ def test_the_rescan_setting_and_the_last_detection_round_trip(tmp_path: Path) ->
         auto_rescan=False,
         detected_networks=["172.23.0.0/16", "10.20.0.0/16"],
         detected_scope="reachable:True",
-        reach_probed_at=1_760_000_000.5,
+        reach_probed_at=_PROBED_AT,
     )
 
     save_state(path, state)
@@ -106,8 +109,8 @@ def test_the_rescan_setting_and_the_last_detection_round_trip(tmp_path: Path) ->
 def test_a_state_file_from_before_the_rescan_setting_reads_as_on_with_nothing_stored(
     tmp_path: Path,
 ) -> None:
-    # Every agent deployed before 3.10 has a file without these keys. It must read as "never told",
-    # which is on, and as "nothing stored", which is what makes it probe once as it always did.
+    # given a file from an agent deployed before 3.10, without the new keys; when it is loaded;
+    # then it reads as "never told" (so on) and "nothing stored" (so it probes once, as it did)
     path = tmp_path / "agent-state.json"
     path.write_text(json.dumps({"agent_id": "a1", "agent_token": "agtk-1"}))
 
@@ -120,7 +123,8 @@ def test_a_state_file_from_before_the_rescan_setting_reads_as_on_with_nothing_st
 
 
 def test_a_hand_edited_detection_reads_as_nothing_stored(tmp_path: Path) -> None:
-    # A malformed value must cost a probe, never a crash and never a scope nobody detected.
+    # given a hand-edited file with a wrongly typed value in every new field; when it is loaded;
+    # then each reads as unset, costing a probe rather than a crash or a scope nobody detected
     path = tmp_path / "agent-state.json"
     path.write_text(
         json.dumps(
@@ -145,16 +149,17 @@ def test_a_hand_edited_detection_reads_as_nothing_stored(tmp_path: Path) -> None
 
 
 def test_a_stored_detection_answers_only_for_the_scope_that_produced_it() -> None:
+    # given an answer worked out with the active probe on; when it is asked for under the same
+    # scope and under the probe off; then only the first gets it, the second is another question
     state = AgentState(detected_networks=["10.20.0.0/16"], detected_scope="reachable:True")
 
     assert state.stored_detection("reachable:True") == ["10.20.0.0/16"]
-    # Worked out with the probe on, asked about with it off: a different question.
     assert state.stored_detection("reachable:False") is None
 
 
 def test_an_empty_detection_is_an_answer_not_an_absence() -> None:
-    # "Probed, and nothing private is reachable" must not read as "never probed", or an agent with
-    # rescans off would probe again on every restart of a host that genuinely reaches nothing.
+    # given a probe that found nothing reachable; when the answer is read back; then it is an empty
+    # answer, not "never probed", or a host that reaches nothing would re-probe on every restart
     state = AgentState(detected_networks=[], detected_scope="reachable:True")
 
     assert state.stored_detection("reachable:True") == []

@@ -889,7 +889,7 @@ async def _redetect_loop(state: AgentState, tunnel: TunnelManager | None = None)
     scope = _detection_scope()
     stored = state.stored_detection(scope)
     if stored is not None:
-        # Published first, so a restart with rescans off still reports, and lets the tunnel dial,
+        # published first, so a restart with rescans off still reports, and lets the tunnel dial,
         # everything the agent found before. Without it the tunnel would be held to the attached
         # subnets until a probe that, with rescans off, never comes.
         _publish_reachable(stored, tunnel)
@@ -898,7 +898,7 @@ async def _redetect_loop(state: AgentState, tunnel: TunnelManager | None = None)
             "Discovering reachable networks in the background (routes, neighbours%s).",
             ", and a probe of private space" if settings.reach_probe else "",
         )
-        await _probe_reachable(state, tunnel, scope=scope)
+        await _probe_reachable(state=state, tunnel=tunnel, scope=scope)
     else:
         logger.info(
             "Automatic rescans are off: reusing the %d reachable network(s) found earlier rather "
@@ -917,7 +917,7 @@ async def _redetect_loop(state: AgentState, tunnel: TunnelManager | None = None)
             interval=interval,
         )
         if delay == 0:
-            await _probe_reachable(state, tunnel, scope=scope)
+            await _probe_reachable(state=state, tunnel=tunnel, scope=scope)
             continue
         tick = _cadence["heartbeat"]
         await asyncio.sleep(tick if delay is None else min(delay, tick))

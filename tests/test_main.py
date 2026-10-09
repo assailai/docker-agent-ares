@@ -651,11 +651,9 @@ async def test_enrollment_never_waits_for_reachability_discovery(
 async def test_redetect_publishes_reachable_networks_and_widens_the_tunnel(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # The whole point of the default scope: an agent attached to 172.23.x advertised 172.23.0.0/16
-    # and nothing else, so a customer's 10.20 estate was never scanned. Discovery adds it, and
-    # BOTH halves have to move: the heartbeat reports it (so ares scans it) and the tunnel's
-    # allowed networks widen (so the agent will actually dial what the scan finds). Reporting
-    # without the second half finds hosts the tunnel then refuses.
+    # given an agent attached to 172.23.x that can also reach 10.20 (the estate the default scope
+    # exists for); when discovery runs; then BOTH halves move: the heartbeat reports 10.20 so ares
+    # scans it, and the tunnel widens so the agent dials what that scan finds instead of refusing
     async def _discover(*, attached: list[str], **_kwargs: object) -> list[str]:
         return [*attached, "10.20.0.0/16"]
 
@@ -683,9 +681,9 @@ async def test_redetect_publishes_reachable_networks_and_widens_the_tunnel(
 async def test_redetect_is_off_when_networks_were_given_explicitly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # ARES_NETWORKS is a decision. Nothing widens it, including the loop that runs for the life of
-    # the container, or an operator who scoped an agent to one subnet would find it sweeping the
-    # estate six hours later.
+    # given ARES_NETWORKS scoping the agent to one subnet; when the reachability loop starts; then
+    # it returns without discovering, since that setting is a decision nothing may widen, the loop
+    # that runs for the life of the container included
     async def _explode(**_kwargs: object) -> list[str]:
         raise AssertionError("discovery must not run when ARES_NETWORKS is set")
 

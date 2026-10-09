@@ -40,21 +40,22 @@ class AgentState:
     # meaning is the same either way: "presenting this token again would tell us nothing new".
     # None for a state file written before the field existed; see minted_with.
     registration_token_fingerprint: str | None = None
-    # What the dashboard's "Rescan automatically" setting last said, as the heartbeat reported it.
+    # what the dashboard's "Rescan automatically" setting last said, as the heartbeat reported it.
     # None means never told, which reads as on: that is what every agent did before the setting
     # existed, and a control plane older than it never sends one.
     auto_rescan: bool | None = None
-    # The last reachability answer, and the settings that produced it (see detection_scope), so a
-    # restart with automatic rescans off reuses it rather than probing again. An answer worked out
-    # under a different ARES_SCAN_SCOPE or ARES_REACH_PROBE is not this agent's answer any more.
+    # the last reachability answer, and the settings that produced it (see
+    # agent.main._detection_scope), so a restart with automatic rescans off reuses it rather than
+    # probing again. An answer worked out under a different ARES_SCAN_SCOPE or ARES_REACH_PROBE is
+    # not this agent's answer any more.
     detected_networks: list[str] | None = None
     detected_scope: str | None = None
-    # When reachability was last probed, successfully or not, in epoch seconds. Wall clock rather
+    # when reachability was last probed, successfully or not, in epoch seconds. Wall clock rather
     # than monotonic because it has to mean the same thing after a restart.
     reach_probed_at: float | None = None
 
     def __post_init__(self) -> None:
-        # A hand-edited or half-written file must cost at most one extra probe, never a crash and
+        # a hand-edited or half-written file must cost at most one extra probe, never a crash and
         # never a scope nobody detected. Anything malformed reads as "not stored".
         if not isinstance(self.auto_rescan, bool):
             self.auto_rescan = None
@@ -66,6 +67,7 @@ class AgentState:
         if not isinstance(self.detected_scope, str):
             self.detected_scope = None
         probed = self.reach_probed_at
+        # bool is an int subclass, so a stray `true` would otherwise read as a probe at epoch 1
         if isinstance(probed, bool) or not isinstance(probed, (int, float)):
             self.reach_probed_at = None
 

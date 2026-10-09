@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import ssl
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -21,8 +22,16 @@ from agent.state import AgentState, load_state, save_state
 
 _ATTACHED = "172.23.0.0/16"
 _FOUND = [_ATTACHED, "10.20.0.0/16"]
+# the default ARES_REACH_REFRESH_SECONDS: six hours
 _INTERVAL = 21_600
+# the heartbeat cadence, in seconds, which is also how often the reachability loop wakes
+_TICK = 30
+# what main._detection_scope() yields under _reach_env's settings
 _SCOPE = "reachable:True"
+# an arbitrary fixed wall clock for the loop to read
+_START = 1_760_000_000.0
+# when the stored answer was probed: about eleven days before _START, so stale under any interval
+_STORED_AT = 1_759_000_000.0
 
 
 class _FakeTunnel:
@@ -33,6 +42,10 @@ class _FakeTunnel:
         self.widened.append(networks)
 
 
+def _attached_only(_scope: str) -> list[str]:
+    return [_ATTACHED]
+
+
 @pytest.fixture
 def _reach_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """The default "reachable" scope, a state file in tmp, and nothing left over between tests."""
@@ -41,9 +54,9 @@ def _reach_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(main.settings, "reach_probe", True)
     monkeypatch.setattr(main.settings, "reach_refresh_seconds", _INTERVAL)
     monkeypatch.setattr(main.settings, "data_dir", tmp_path)
-    monkeypatch.setattr(main.netdetect, "scan_targets", lambda scope: [_ATTACHED])
+    monkeypatch.setattr(main.netdetect, "scan_targets", _attached_only)
     monkeypatch.setitem(main._reachable, "networks", [])
-    monkeypatch.setitem(main._cadence, "heartbeat", 30)
+    monkeypatch.setitem(main._cadence, "heartbeat", _TICK)
 
 
 def _counting_discover(monkeypatch: pytest.MonkeyPatch, answer: list[str]) -> dict[str, int]:
@@ -69,14 +82,14 @@ def _clock(
     *,
     advance: float,
     ticks: int,
-    on_tick=None,
-) -> list[float]:
+    on_tick: Callable[[int], None] | None = None,
+) -> None:
     """A wall clock moving ``advance`` seconds per sleep, ending the loop after ``ticks`` sleeps.
 
     The loop under test is endless by design, so the only way out is a cancellation, which is
     exactly what the serve loop does to it on shutdown.
     """
-    now = [1_760_000_000.0]
+    now = [_START]
     slept = {"n": 0}
 
     async def _sleep(_seconds: float) -> None:
@@ -89,7 +102,6 @@ def _clock(
 
     monkeypatch.setattr(main.asyncio, "sleep", _sleep)
     monkeypatch.setattr(main.time, "time", lambda: now[0])
-    return now
 
 
 def _stored(**overrides: object) -> AgentState:
@@ -98,7 +110,7 @@ def _stored(**overrides: object) -> AgentState:
         "agent_token": "agtk-1",
         "detected_networks": list(_FOUND),
         "detected_scope": _SCOPE,
-        "reach_probed_at": 1_759_000_000.0,
+        "reach_probed_at": _STORED_AT,
     }
     fields.update(overrides)
     return AgentState(**fields)
@@ -108,11 +120,11 @@ def _stored(**overrides: object) -> AgentState:
 async def test_off_with_a_stored_answer_sends_nothing_and_still_publishes_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The restart case, and the one the setting is for: not one connect into private space. The
-    # stored answer still has to reach the heartbeat and the tunnel, or a hunt into 10.20 would be
-    # refused by an agent that found 10.20 perfectly well at install.
+    # given rescans off and an answer stored (the restart the setting exists for); when the loop
+    # runs for days; then not one connect goes out, yet the answer still reaches the heartbeat and
+    # the tunnel, or a hunt into 10.20 would be refused by an agent that found 10.20 at install
     _no_probe_allowed(monkeypatch)
-    _clock(monkeypatch, advance=10 * _INTERVAL, ticks=5)
+    _clock(monkeypatch=monkeypatch, advance=10 * _INTERVAL, ticks=5)
     tunnel = _FakeTunnel()
 
     with pytest.raises(asyncio.CancelledError):
@@ -126,9 +138,10 @@ async def test_off_with_a_stored_answer_sends_nothing_and_still_publishes_it(
 async def test_off_with_nothing_stored_probes_exactly_once_and_keeps_the_answer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The install case: one discovery whatever the setting, then nothing however much time passes.
+    # given rescans off on a fresh install; when days pass; then it probes once, because every
+    # install gets one discovery, and saves that answer beside the setting for the next restart
     probes = _counting_discover(monkeypatch, _FOUND)
-    _clock(monkeypatch, advance=10 * _INTERVAL, ticks=5)
+    _clock(monkeypatch=monkeypatch, advance=10 * _INTERVAL, ticks=5)
     state = AgentState(agent_id="a1", agent_token="agtk-1", auto_rescan=False)
 
     with pytest.raises(asyncio.CancelledError):
@@ -145,10 +158,10 @@ async def test_off_with_nothing_stored_probes_exactly_once_and_keeps_the_answer(
 async def test_on_probes_at_start_and_again_once_the_interval_has_passed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Unchanged behaviour for every agent that leaves the setting on, including one with an answer
-    # already stored: it looks at start, then on the refresh cadence.
+    # given rescans on and an answer already stored; when a full interval passes; then it probes at
+    # start and once more, the cadence every agent that leaves the setting on has always had
     probes = _counting_discover(monkeypatch, _FOUND)
-    _clock(monkeypatch, advance=_INTERVAL, ticks=1)
+    _clock(monkeypatch=monkeypatch, advance=_INTERVAL, ticks=1)
 
     with pytest.raises(asyncio.CancelledError):
         await main._redetect_loop(_stored(), _FakeTunnel())
@@ -160,9 +173,10 @@ async def test_on_probes_at_start_and_again_once_the_interval_has_passed(
 async def test_on_does_not_probe_again_before_the_interval(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The loop wakes on every heartbeat tick to re-read the setting. Waking must not mean probing.
+    # given rescans on; when the loop wakes on every heartbeat tick to re-read the setting; then
+    # waking alone never probes before the interval is up
     probes = _counting_discover(monkeypatch, _FOUND)
-    _clock(monkeypatch, advance=30, ticks=20)
+    _clock(monkeypatch=monkeypatch, advance=_TICK, ticks=20)
 
     with pytest.raises(asyncio.CancelledError):
         await main._redetect_loop(_stored(), _FakeTunnel())
@@ -174,8 +188,8 @@ async def test_on_does_not_probe_again_before_the_interval(
 async def test_turning_rescans_back_on_probes_at_the_next_tick_when_the_answer_is_stale(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Followed within a beat, not after the six-hour sleep the loop used to take. The stored answer
-    # is days old, so the first tick after the switch owes a probe.
+    # given rescans off and a days-old answer; when the dashboard turns them on at the second tick;
+    # then the next tick probes, within a beat rather than after the six-hour sleep of old
     probes = _counting_discover(monkeypatch, _FOUND)
     state = _stored(auto_rescan=False)
 
@@ -183,7 +197,7 @@ async def test_turning_rescans_back_on_probes_at_the_next_tick_when_the_answer_i
         if tick == 2:
             main._apply_auto_rescan(True, state=state)
 
-    _clock(monkeypatch, advance=30, ticks=3, on_tick=_switch_on)
+    _clock(monkeypatch=monkeypatch, advance=_TICK, ticks=3, on_tick=_switch_on)
 
     with pytest.raises(asyncio.CancelledError):
         await main._redetect_loop(state, _FakeTunnel())
@@ -193,6 +207,8 @@ async def test_turning_rescans_back_on_probes_at_the_next_tick_when_the_answer_i
 
 @pytest.mark.usefixtures("_reach_env")
 async def test_turning_rescans_off_stops_the_next_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    # given rescans on; when the dashboard turns them off after the first tick; then the probe at
+    # start is the only one, however many intervals pass
     probes = _counting_discover(monkeypatch, _FOUND)
     state = _stored()
 
@@ -200,22 +216,22 @@ async def test_turning_rescans_off_stops_the_next_probe(monkeypatch: pytest.Monk
         if tick == 1:
             main._apply_auto_rescan(False, state=state)
 
-    _clock(monkeypatch, advance=_INTERVAL, ticks=5, on_tick=_switch_off)
+    _clock(monkeypatch=monkeypatch, advance=_INTERVAL, ticks=5, on_tick=_switch_off)
 
     with pytest.raises(asyncio.CancelledError):
         await main._redetect_loop(state, _FakeTunnel())
 
-    assert probes["n"] == 1  # the probe at start, and none after the switch
+    assert probes["n"] == 1
 
 
 @pytest.mark.usefixtures("_reach_env")
 async def test_an_answer_stored_under_another_scope_is_not_reused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Stored with the active probe off, read with it on: a different question, so it is neither
-    # published nor trusted, and the agent looks once, as it would on a fresh install.
+    # given rescans off and an answer stored with the active probe off; when the agent starts with
+    # it on; then that answer is neither published nor trusted, and it probes once as on install
     probes = _counting_discover(monkeypatch, _FOUND)
-    _clock(monkeypatch, advance=10 * _INTERVAL, ticks=3)
+    _clock(monkeypatch=monkeypatch, advance=10 * _INTERVAL, ticks=3)
     tunnel = _FakeTunnel()
     state = _stored(
         auto_rescan=False,
@@ -235,6 +251,8 @@ async def test_an_answer_stored_under_another_scope_is_not_reused(
 async def test_a_failed_first_probe_is_retried_on_the_interval_not_every_tick(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # given a first probe that fails; when the loop keeps ticking inside the interval; then it does
+    # not retry on each tick, so a failing probe never becomes a stream of connects
     attempts = {"n": 0}
 
     async def _fails(**_kwargs: object) -> list[str]:
@@ -242,7 +260,7 @@ async def test_a_failed_first_probe_is_retried_on_the_interval_not_every_tick(
         raise OSError("no route")
 
     monkeypatch.setattr(main.reachability, "discover", _fails)
-    _clock(monkeypatch, advance=30, ticks=20)
+    _clock(monkeypatch=monkeypatch, advance=_TICK, ticks=20)
 
     with pytest.raises(asyncio.CancelledError):
         await main._redetect_loop(AgentState(auto_rescan=False), _FakeTunnel())
@@ -254,7 +272,8 @@ async def test_a_failed_first_probe_is_retried_on_the_interval_not_every_tick(
 async def test_a_single_pass_interval_still_means_one_look_per_start_with_rescans_on(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # ARES_REACH_REFRESH_SECONDS=0 keeps its meaning: look at start, then return.
+    # given ARES_REACH_REFRESH_SECONDS=0 and rescans on; when the agent starts; then it looks once
+    # and the loop returns, which is what that setting has always meant
     monkeypatch.setattr(main.settings, "reach_refresh_seconds", 0)
     probes = _counting_discover(monkeypatch, _FOUND)
 
@@ -267,8 +286,10 @@ async def test_a_single_pass_interval_still_means_one_look_per_start_with_rescan
 async def test_preflight_applies_the_setting_before_the_first_probe_and_persists_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # given a preflight beat that says rescans are off; when the agent preflights; then the setting
+    # is applied and saved before the reachability loop decides whether to probe at start
     async def _beat(*_args: object, **_kwargs: object) -> dict:
-        return {"heartbeat_interval_seconds": 30, "auto_rescan": False}
+        return {"heartbeat_interval_seconds": _TICK, "auto_rescan": False}
 
     async def _tunnel_ok(*_args: object, **_kwargs: object) -> None:
         return None
@@ -307,11 +328,11 @@ def _beats(monkeypatch: pytest.MonkeyPatch, beats: list[dict]) -> None:
 async def test_a_beat_without_the_field_leaves_the_setting_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A control plane older than the setting, or an appliance on an older release, never sends it.
-    # Its silence must not read as "on" and undo what the operator chose.
+    # given rescans off and a control plane (or appliance) too old to send the field; when a beat
+    # arrives without it; then that silence does not read as "on" and undo the operator's choice
     state = AgentState(agent_id="a1", agent_token="agtk-1", auto_rescan=False)
     save_state(main.settings.state_path, state)
-    _beats(monkeypatch, [{"heartbeat_interval_seconds": 30}])
+    _beats(monkeypatch, [{"heartbeat_interval_seconds": _TICK}])
 
     with pytest.raises(asyncio.CancelledError):
         await main._heartbeat_loop(state, Mock())
@@ -324,6 +345,8 @@ async def test_a_beat_without_the_field_leaves_the_setting_alone(
 async def test_a_malformed_field_moves_the_setting_neither_way(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # given rescans off; when beats carry a string, an int and a null for the field; then none of
+    # them moves the setting
     state = AgentState(agent_id="a1", agent_token="agtk-1", auto_rescan=False)
     _beats(monkeypatch, [{"auto_rescan": "true"}, {"auto_rescan": 1}, {"auto_rescan": None}])
 
@@ -337,17 +360,17 @@ async def test_a_malformed_field_moves_the_setting_neither_way(
 async def test_the_heartbeat_follows_the_setting_and_persists_each_change(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    # given an agent never told the setting; when beats say on, then off, then off again; then it
+    # ends off and saved, with one log line for the switch to off: the first beat agreed with what
+    # the agent was already doing, and the repeat changes nothing
     state = AgentState(agent_id="a1", agent_token="agtk-1")
     _beats(monkeypatch, [{"auto_rescan": True}, {"auto_rescan": False}, {"auto_rescan": False}])
 
-    with caplog.at_level("INFO", logger="ares.agent"):
-        with pytest.raises(asyncio.CancelledError):
-            await main._heartbeat_loop(state, Mock())
+    with caplog.at_level("INFO", logger="ares.agent"), pytest.raises(asyncio.CancelledError):
+        await main._heartbeat_loop(state, Mock())
 
     assert state.auto_rescan is False
     assert load_state(main.settings.state_path).auto_rescan is False
-    # The first beat agreed with what the agent was already doing, so only the switch to off is
-    # worth a line, and the repeat of it is not.
     switches = [
         r.getMessage() for r in caplog.records if "Automatic rescans turned" in r.getMessage()
     ]
@@ -356,6 +379,6 @@ async def test_the_heartbeat_follows_the_setting_and_persists_each_change(
 
 
 def test_the_capability_is_advertised() -> None:
-    # ares reads its absence as "this build still re-probes every six hours on its own" and says so
-    # next to the setting, so a build that follows the setting has to claim it.
+    # given a build that follows the setting; when it lists its capabilities; then it claims
+    # auto_rescan, since ares reads the absence as "still re-probes every six hours on its own"
     assert "auto_rescan" in control_plane.capabilities(main.settings)

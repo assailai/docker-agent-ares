@@ -12,32 +12,60 @@ import pytest
 
 from agent.reach_schedule import probe_delay
 
+# the default ARES_REACH_REFRESH_SECONDS: six hours
 _INTERVAL = 21_600
+# an arbitrary fixed wall clock; only the offsets from it matter
 _NOW = 1_760_000_000.0
+# seconds since a recent probe, and since a recent failed one: both well inside the interval
+_PROBED_AGO = 100
+_FAILED_AGO = 30
 
 
 @pytest.mark.parametrize(
     ("auto_rescan", "has_result", "probed_at", "interval", "expected"),
     [
-        # never probed: now, whatever the setting, because an install that never looked has
-        # nothing to report and nothing for ares to scan
-        (True, False, None, _INTERVAL, 0.0),
-        (False, False, None, _INTERVAL, 0.0),
-        (False, False, None, 0, 0.0),
-        # rescans off with an answer stored: never, however old the answer is
-        (False, True, _NOW - 10 * _INTERVAL, _INTERVAL, None),
-        (False, True, None, _INTERVAL, None),
-        # rescans on: once the last look is older than the interval
-        (True, True, _NOW - 100, _INTERVAL, _INTERVAL - 100),
-        (True, True, _NOW - _INTERVAL, _INTERVAL, 0.0),
-        (True, True, _NOW - 3 * _INTERVAL, _INTERVAL, 0.0),
-        # an attempt that failed is retried on the interval, not on every tick, with rescans on
-        # or off: a probe that keeps failing must not become a stream of connects
-        (False, False, _NOW - 30, _INTERVAL, _INTERVAL - 30),
-        (True, False, _NOW - 30, _INTERVAL, _INTERVAL - 30),
-        # ARES_REACH_REFRESH_SECONDS=0: no re-detection once a look has been made
-        (True, True, _NOW - 3 * _INTERVAL, 0, None),
-        (True, False, _NOW - 30, 0, None),
+        # given nothing was ever probed, then probe now whatever the setting: an install that
+        # never looked has nothing to report and nothing for ares to scan
+        pytest.param(True, False, None, _INTERVAL, 0.0, id="never-probed-on-now"),
+        pytest.param(False, False, None, _INTERVAL, 0.0, id="never-probed-off-now"),
+        pytest.param(False, False, None, 0, 0.0, id="never-probed-single-pass-now"),
+        # given rescans off and an answer stored, then never, however old the answer is
+        pytest.param(
+            False, True, _NOW - 10 * _INTERVAL, _INTERVAL, None, id="off-stored-stale-never"
+        ),
+        pytest.param(False, True, None, _INTERVAL, None, id="off-stored-unstamped-never"),
+        # given rescans on, then probe once the last look is older than the interval
+        pytest.param(
+            True,
+            True,
+            _NOW - _PROBED_AGO,
+            _INTERVAL,
+            _INTERVAL - _PROBED_AGO,
+            id="on-recent-waits-out-the-interval",
+        ),
+        pytest.param(True, True, _NOW - _INTERVAL, _INTERVAL, 0.0, id="on-due-now"),
+        pytest.param(True, True, _NOW - 3 * _INTERVAL, _INTERVAL, 0.0, id="on-overdue-now"),
+        # given a failed attempt and nothing stored, then retry on the interval rather than on
+        # every tick, with rescans on or off: a failing probe must not become a stream of connects
+        pytest.param(
+            False,
+            False,
+            _NOW - _FAILED_AGO,
+            _INTERVAL,
+            _INTERVAL - _FAILED_AGO,
+            id="off-failed-retries-on-the-interval",
+        ),
+        pytest.param(
+            True,
+            False,
+            _NOW - _FAILED_AGO,
+            _INTERVAL,
+            _INTERVAL - _FAILED_AGO,
+            id="on-failed-retries-on-the-interval",
+        ),
+        # given ARES_REACH_REFRESH_SECONDS=0 and a look already made, then no re-detection
+        pytest.param(True, True, _NOW - 3 * _INTERVAL, 0, None, id="single-pass-stored-never"),
+        pytest.param(True, False, _NOW - _FAILED_AGO, 0, None, id="single-pass-failed-never"),
     ],
 )
 def test_probe_delay(
@@ -47,6 +75,8 @@ def test_probe_delay(
     interval: int,
     expected: float | None,
 ) -> None:
+    """Given the setting, whether an answer is stored, the last attempt and the interval; when the
+    loop asks for its next probe; then it gets the row's delay (0 is now, None is none owed)."""
     assert (
         probe_delay(
             auto_rescan=auto_rescan,
