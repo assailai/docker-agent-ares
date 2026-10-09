@@ -11,11 +11,16 @@ The rules, in the order they apply:
 * **Nothing usable stored, an attempt already failed:** try again on the refresh interval, never in
   a hot loop. A probe that keeps failing must not turn into a stream of connects.
 * **Automatic rescans off, an answer stored:** never. The stored answer stands until the operator
-  turns rescans back on or presses Rescan in the dashboard.
+  turns rescans back on. (Rescan in the dashboard re-scans what is known; it does not re-probe.)
 * **Automatic rescans on:** once the last probe is older than the interval.
 
 An interval of 0 (``ARES_REACH_REFRESH_SECONDS=0``) means no re-detection at all, so it only ever
 answers "now" for an agent that has never probed.
+
+One decision is made before this is first asked, by agent.main's reachability loop at start: a
+fresh start probes at once when rescans are on (today's behaviour, unchanged) or when nothing usable
+is stored, even if an earlier attempt failed. A restart is the operator's own retry, so it does not
+wait out the interval the second rule above imposes on a loop that keeps failing.
 """
 
 from __future__ import annotations
