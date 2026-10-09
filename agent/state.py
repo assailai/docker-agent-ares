@@ -3,6 +3,9 @@
 A deployed agent needs to remember two things: who it is (its id + bearer token), and which
 registration token that identity was minted from. The file is written 0600 so the token is not
 world-readable.
+
+It also keeps the last reachability answer and the dashboard's "Rescan automatically" setting, so
+an agent told not to look again does not probe the customer's private space on every restart.
 """
 
 from __future__ import annotations
@@ -37,10 +40,53 @@ class AgentState:
     # meaning is the same either way: "presenting this token again would tell us nothing new".
     # None for a state file written before the field existed; see minted_with.
     registration_token_fingerprint: str | None = None
+    # what the dashboard's "Rescan automatically" setting last said, as the heartbeat reported it.
+    # None means never told, which reads as on: that is what every agent did before the setting
+    # existed, and a control plane older than it never sends one.
+    auto_rescan: bool | None = None
+    # the last reachability answer, and the settings that produced it (see
+    # agent.main._detection_scope), so a restart with automatic rescans off reuses it rather than
+    # probing again. An answer worked out under a different ARES_SCAN_SCOPE or ARES_REACH_PROBE is
+    # not this agent's answer any more.
+    detected_networks: list[str] | None = None
+    detected_scope: str | None = None
+    # when reachability was last probed, successfully or not, in epoch seconds. Wall clock rather
+    # than monotonic because it has to mean the same thing after a restart.
+    reach_probed_at: float | None = None
+
+    def __post_init__(self) -> None:
+        # a hand-edited or half-written file must cost at most one extra probe, never a crash and
+        # never a scope nobody detected. Anything malformed reads as "not stored".
+        if not isinstance(self.auto_rescan, bool):
+            self.auto_rescan = None
+        if not (
+            isinstance(self.detected_networks, list)
+            and all(isinstance(n, str) for n in self.detected_networks)
+        ):
+            self.detected_networks = None
+        if not isinstance(self.detected_scope, str):
+            self.detected_scope = None
+        probed = self.reach_probed_at
+        # bool is an int subclass, so a stray `true` would otherwise read as a probe at epoch 1
+        if isinstance(probed, bool) or not isinstance(probed, (int, float)):
+            self.reach_probed_at = None
 
     @property
     def registered(self) -> bool:
         return bool(self.agent_id and self.agent_token)
+
+    @property
+    def auto_rescan_on(self) -> bool:
+        return self.auto_rescan is not False
+
+    def stored_detection(self, scope: str) -> list[str] | None:
+        """The last reachability answer if it was worked out under ``scope``, else None.
+
+        An empty list is an answer ("probed, found nothing reachable"), not an absence of one.
+        """
+        if self.detected_networks is None or self.detected_scope != scope:
+            return None
+        return self.detected_networks
 
     def minted_with(self, registration_token: str) -> bool:
         """True if this identity is already accounted for by ``registration_token``.

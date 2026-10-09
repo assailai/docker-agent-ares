@@ -31,6 +31,10 @@ CAPABILITIES = [
     "tunnel_dns",  # resolve a hostname destination locally and dial it through the tunnel
     "host_identity",  # collect naming evidence (PTR, TLS cert, HTTP, NetBIOS) per live host
     "pause",  # abort the running scan and hand it back when paused from the dashboard (3.10.0)
+    # follow the dashboard's "Rescan automatically" setting (the heartbeat's auto_rescan): with it
+    # off, stop re-probing reachability and reuse the stored answer across restarts. ares reads its
+    # absence as "this build still re-probes on its own" and says so next to the setting.
+    "auto_rescan",
 ]
 # read Services, EndpointSlices and workloads from a cluster API. Reported only when the operator
 # turned it on, unlike the list above, which is what the build can do. The distinction is the

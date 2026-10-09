@@ -55,6 +55,8 @@ services:
       # - ARES_REACH_PROBE=false                   # keep the tables, skip the active probe
       # - ARES_REACH_BUDGET_SECONDS=600            # wall clock the probe may spend
       # - ARES_REACH_REFRESH_SECONDS=21600         # how often to look again; 0 = once, at startup
+      #     Only while "Rescan automatically" is on in the dashboard. With it off the agent looks
+      #     once, at install, and reuses that answer across restarts.
       # - ARES_HOST_ALIASES=sso.acme.internal=10.1.2.3,portal.acme.internal=10.1.2.4
       #     Pin a name the host's resolver will not answer. Only needed when the pin is not already
       #     in this host's /etc/hosts (mounted above).
