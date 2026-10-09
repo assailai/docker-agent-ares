@@ -30,6 +30,7 @@ CAPABILITIES = [
     "local_network_scan",  # the TCP-connect discovery scan
     "tunnel_dns",  # resolve a hostname destination locally and dial it through the tunnel
     "host_identity",  # collect naming evidence (PTR, TLS cert, HTTP, NetBIOS) per live host
+    "pause",  # abort the running scan and hand it back when paused from the dashboard (3.10.0)
 ]
 # read Services, EndpointSlices and workloads from a cluster API. Reported only when the operator
 # turned it on, unlike the list above, which is what the build can do. The distinction is the
@@ -198,6 +199,15 @@ async def task_completed(
             f"/api/v1/agent/tasks/{task_id}/complete",
             json=body,
             headers=_auth(token),
+        )
+    resp.raise_for_status()
+
+
+async def task_released(settings: Settings, token: str, task_id: str) -> None:
+    """Hand a task back because the agent was paused, so it reruns on Resume (ARES-1700)."""
+    async with _client(settings) as client:
+        resp = await client.post(
+            f"/api/v1/agent/tasks/{task_id}/release", json={}, headers=_auth(token)
         )
     resp.raise_for_status()
 

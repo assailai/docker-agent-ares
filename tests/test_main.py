@@ -46,6 +46,13 @@ def _unauthorized() -> httpx.HTTPStatusError:
     return httpx.HTTPStatusError("401", request=request, response=response)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_pause_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+    # an asyncio.Event binds to the first loop that waits on it, and every test runs its own loop,
+    # so the agent's pause signal is made fresh for each one (and starts unpaused).
+    monkeypatch.setattr(main, "_paused", asyncio.Event())
+
+
 @pytest.fixture
 def _instant_loop(monkeypatch: pytest.MonkeyPatch) -> None:
     """Strip the real delays / sampling out of the heartbeat loop so it iterates instantly."""
@@ -1296,3 +1303,192 @@ async def test_a_stalled_cluster_read_cannot_push_a_scan_past_its_budget(
     assert loop.time() - started < 2.0
     assert _cluster_naming == []
     assert [hit["ip"] for hit in completed[0]] == ["10.0.0.5"]
+
+
+# --- pausing from the dashboard (ARES-1700) -------------------------------------------------------
+
+
+def test_the_reported_mode_pauses_and_resumes_the_agent() -> None:
+    # beats reporting paused, then nothing, then active: when the first lands the agent pauses, a
+    # beat without the field changes nothing (it is not a Resume), and active resumes it.
+    main._apply_operational_mode("paused")
+    assert main._paused.is_set()
+    main._apply_operational_mode(None)
+    assert main._paused.is_set()
+    main._apply_operational_mode("active")
+    assert not main._paused.is_set()
+
+
+@pytest.mark.usefixtures("_instant_loop")
+async def test_the_heartbeat_follows_the_mode_it_is_told(monkeypatch: pytest.MonkeyPatch) -> None:
+    # when a real heartbeat says paused, then the loop leaves the agent paused.
+    beats: list[object] = [{"operational_mode": "paused"}]
+    monkeypatch.setattr(main.control_plane, "heartbeat", _scripted_heartbeat(beats))
+
+    with pytest.raises(asyncio.CancelledError):
+        await main._heartbeat_loop(AgentState(agent_id="agent-1", agent_token="tok"), Mock())
+
+    assert main._paused.is_set()
+
+
+def _never_ending_scan(scanning: asyncio.Event, cancelled: list[bool]):
+    """A scan_cidr stand-in that runs until something cancels it, recording that it was."""
+
+    async def _scan(cidr: str, ports: list[int], **kwargs: object) -> list[dict]:
+        scanning.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        return []
+
+    return _scan
+
+
+def _patch_task_posts(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
+    posts: dict[str, list[str]] = {"started": [], "completed": [], "released": [], "failed": []}
+
+    async def _started(_s: object, _t: str, task_id: str) -> None:
+        posts["started"].append(task_id)
+
+    async def _completed(
+        _s: object, _t: str, task_id: str, _hosts: list[dict], **_kw: object
+    ) -> None:
+        posts["completed"].append(task_id)
+
+    async def _released(*, settings: object, token: str, task_id: str) -> None:
+        posts["released"].append(task_id)
+
+    async def _failed(_s: object, _t: str, task_id: str, *_a: object, **_kw: object) -> None:
+        posts["failed"].append(task_id)
+
+    monkeypatch.setattr(main.control_plane, "task_started", _started)
+    monkeypatch.setattr(main.control_plane, "task_completed", _completed)
+    monkeypatch.setattr(main.control_plane, "task_released", _released)
+    monkeypatch.setattr(main.control_plane, "task_failed", _failed)
+    return posts
+
+
+async def test_a_pause_mid_scan_cancels_it_and_hands_the_task_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given a scan in progress, when the agent is paused, then the scan is cancelled and the task is
+    # handed back to rerun on Resume, never reported complete or failed.
+    posts = _patch_task_posts(monkeypatch)
+    scanning, cancelled = asyncio.Event(), []
+    monkeypatch.setattr(main.scan, "scan_cidr", _never_ending_scan(scanning, cancelled))
+
+    running = asyncio.create_task(
+        main._run_task("tok", {"id": "t1", "target_network": "10.0.0.0/24"})
+    )
+    await scanning.wait()
+    main._paused.set()
+    await running
+
+    assert cancelled == [True]
+    assert posts["released"] == ["t1"]
+    assert posts["completed"] == [] and posts["failed"] == []
+
+
+async def test_a_shutdown_mid_scan_still_cancels_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
+    # a shutdown is not a pause: when the process stops mid-scan, then the scan is cancelled with
+    # its task and nothing is handed back. The lease does that if the process never returns.
+    posts = _patch_task_posts(monkeypatch)
+    scanning, cancelled = asyncio.Event(), []
+    monkeypatch.setattr(main.scan, "scan_cidr", _never_ending_scan(scanning, cancelled))
+
+    running = asyncio.create_task(
+        main._run_task("tok", {"id": "t1", "target_network": "10.0.0.0/24"})
+    )
+    await scanning.wait()
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    assert cancelled == [True]
+    assert posts["released"] == []
+
+
+async def test_handing_back_to_an_older_control_plane_is_not_an_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # an older control plane has no release route: when it answers 404, then the hand-back logs it
+    # and carries on, because the task's lease covers it.
+    async def _no_route(*, settings: object, token: str, task_id: str) -> None:
+        request = httpx.Request("POST", "https://ares.test/api/v1/agent/tasks/t1/release")
+        raise httpx.HTTPStatusError(
+            "not found", request=request, response=httpx.Response(404, request=request)
+        )
+
+    monkeypatch.setattr(main.control_plane, "task_released", _no_route)
+
+    with caplog.at_level(logging.WARNING, logger="ares.agent"):
+        await main._hand_back("tok", "t1")
+
+    assert any("its lease will" in record.getMessage() for record in caplog.records)
+
+
+def _sleep_until(monkeypatch: pytest.MonkeyPatch, *, calls: int) -> None:
+    """End the poll loop after ``calls`` sleeps, the way the heartbeat stub ends its loop."""
+    seen = {"n": 0}
+
+    async def _sleep(_seconds: float) -> None:
+        seen["n"] += 1
+        if seen["n"] >= calls:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(main.asyncio, "sleep", _sleep)
+
+
+async def test_a_paused_agent_does_not_ask_for_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
+    # with the agent paused, a few rounds of the poll loop never ask for a task.
+    polled: list[bool] = []
+
+    async def _poll(_s: object, _t: str) -> list[dict]:
+        polled.append(True)
+        return []
+
+    monkeypatch.setattr(main.control_plane, "poll_tasks", _poll)
+    _sleep_until(monkeypatch, calls=3)
+    main._paused.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await main._poll_loop(AgentState(agent_id="agent-1", agent_token="tok"))
+
+    assert polled == []
+
+
+async def test_claimed_tasks_not_yet_started_go_back_when_the_agent_is_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given a poll that claimed two tasks, when a pause lands while the first runs, then the second
+    # is handed back straight away rather than sitting out its lease.
+    posts = _patch_task_posts(monkeypatch)
+    ran: list[str] = []
+
+    async def _poll(_s: object, _t: str) -> list[dict]:
+        return [
+            {"id": "t1", "target_network": "10.0.0.0/24"},
+            {"id": "t2", "target_network": "10.0.1.0/24"},
+        ]
+
+    async def _run_task(_token: str, task: dict) -> None:
+        ran.append(task["id"])
+        main._paused.set()
+
+    monkeypatch.setattr(main.control_plane, "poll_tasks", _poll)
+    monkeypatch.setattr(main, "_run_task", _run_task)
+    _sleep_until(monkeypatch, calls=1)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main._poll_loop(AgentState(agent_id="agent-1", agent_token="tok"))
+
+    assert ran == ["t1"]
+    assert posts["released"] == ["t2"]
+
+
+def test_the_agent_reports_that_it_honours_a_pause() -> None:
+    # given this build, then it reports `pause`: the control plane picks the drawer's wording from
+    # it, because an agent without it first finishes every scan task it already claimed.
+    assert "pause" in main.control_plane.CAPABILITIES
