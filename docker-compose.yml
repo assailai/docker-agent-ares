@@ -15,7 +15,7 @@
 
 services:
   ares-agent:
-    image: assailai/ares-agent:3.9.0  # pin to a version (see Settings -> Agents); avoid :latest
+    image: assailai/ares-agent:3.12.0  # pin to a version (see Settings -> Agents); avoid :latest
     container_name: ares-agent
     hostname: ares-agent
     volumes:
@@ -63,12 +63,21 @@ services:
     restart: unless-stopped
 
   ares-updater:
-    image: assailai/ares-updater:3.9.0
+    image: assailai/ares-updater:3.12.0
     container_name: ares-updater
     volumes:
       - ares-agent-data:/data:ro                  # reads the agent's update-target.json
-      - /var/run/docker.sock:/var/run/docker.sock  # recreates the agent on a new version
+      # Recreates the agent on a new version. On Podman there is no /var/run/docker.sock: use
+      # /run/podman/podman.sock (rootful, after `sudo systemctl enable --now podman.socket`) or
+      # $XDG_RUNTIME_DIR/podman/podman.sock (rootless, after `systemctl --user enable --now
+      # podman.socket`) as the left-hand side, or the updater cannot start and the agent never
+      # updates.
+      - /var/run/docker.sock:/var/run/docker.sock
       - /etc/ssl/certs:/host-ca:ro                 # cosign needs the host CAs through an inspecting proxy
+    # Under SELinux (RHEL, Fedora) a container may not connect to the engine socket without this.
+    # It confines nothing that matters: whoever holds the engine socket already holds the host.
+    security_opt:
+      - label=disable
     environment:
       # Fail-closed: verify the image's cosign signature before applying (CI signs published images
       # keyless via OIDC). The expected signer identity + issuer are baked into the updater image;

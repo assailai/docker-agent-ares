@@ -491,6 +491,13 @@ platform access, verifies the target image's signature, and applies it:
   confirmed up before the old container is removed, so a bad version never takes the agent down).
 - **Kubernetes** (`deploy/k8s/ares-agent.yaml`): the updater runs as a sidecar with a
   ServiceAccount scoped to patch only the agent Deployment, triggering a native rolling update.
+- **Podman** (RHEL, Fedora): there is no `/var/run/docker.sock`. The updater talks to Podman's own
+  API socket instead, which `scripts/bootstrap.sh` enables for you (`podman.socket`, system-wide
+  as root or per-user when rootless). Running by hand or with Compose, enable it yourself and mount
+  `/run/podman/podman.sock` (rootful) or `$XDG_RUNTIME_DIR/podman/podman.sock` (rootless) in place
+  of the Docker socket. Without it the updater cannot start, and the agent stays on the version it
+  was installed at. Rootful Podman also needs `podman-restart.service` enabled for the agent to
+  come back after a reboot, which the installer does as well.
 
 Notes:
 
