@@ -11,11 +11,16 @@ accident: whoever edits one gets a failure telling them the other exists.
 from __future__ import annotations
 
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import NamedTuple
+
+import pytest
 
 _REPO = Path(__file__).resolve().parents[1]
 BOOTSTRAP = _REPO / "scripts" / "bootstrap.sh"
@@ -110,6 +115,8 @@ def test_the_reset_is_opt_in() -> None:
 # and the agent stayed on its install version for good. Three customer hosts sat on 3.6.0 through
 # four releases that way.
 
+BASH = shutil.which("bash") or "/bin/bash"
+
 
 def _function(name: str) -> str:
     match = re.search(
@@ -119,6 +126,15 @@ def _function(name: str) -> str:
     return match.group(0)
 
 
+@pytest.fixture
+def short_tmp() -> Iterator[Path]:
+    """A short /tmp directory: a Unix socket path is capped at ~104 bytes on macOS, which a pytest
+    tmp_path can exceed."""
+    workdir = Path(tempfile.mkdtemp(prefix="ab", dir="/tmp"))
+    yield workdir
+    shutil.rmtree(workdir, ignore_errors=True)
+
+
 class _SocketRun(NamedTuple):
     engine_sock: str
     systemctl_calls: list[str]
@@ -126,36 +142,45 @@ class _SocketRun(NamedTuple):
 
 
 def _setup_podman(
-    *, is_podman: bool, uid: int, systemctl_succeeds: bool, disable_autoupdate: bool = False
+    workdir: Path,
+    *,
+    is_podman: bool,
+    uid: int,
+    systemctl_succeeds: bool,
+    disable_autoupdate: bool = False,
+    socket_already_there: bool = False,
 ) -> _SocketRun:
-    """Run setup_rootful_podman in bash with `id` and `systemctl` stubbed.
-
-    The stubbed `enable --now podman.socket` creates a real Unix socket, as socket activation
-    would. It lives under a short /tmp directory because a Unix socket path is capped at ~104 bytes
-    on macOS, which a pytest tmp_path can exceed.
-    """
-    workdir = Path(tempfile.mkdtemp(prefix="ab", dir="/tmp"))
+    """Run setup_rootful_podman in bash with `id` and `systemctl` stubbed. The stubbed
+    `enable --now podman.socket` creates a real Unix socket, as socket activation would."""
     sock = workdir / "podman.sock"
     calls = workdir / "calls"
     calls.touch()
     bind = (
-        f"{sys.executable} -c "
+        f"{shlex.quote(sys.executable)} -c "
         "'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])'"
     )
+    if socket_already_there:
+        subprocess.run(f"{bind} {shlex.quote(str(sock))}", shell=True, check=True)
     script = f"""
 set -euo pipefail
 id() {{ echo {uid}; }}
 systemctl() {{
-    echo "$*" >> {calls}
-    [ {int(systemctl_succeeds)} -eq 1 ] || return 1
-    if [ "$*" = "enable --now podman.socket" ]; then {bind} {sock}; fi
+    echo "$*" >> {shlex.quote(str(calls))}
+    if [ {int(systemctl_succeeds)} -ne 1 ]; then
+        echo "Failed to connect to bus: No such file or directory"
+        return 1
+    fi
+    if [ "$*" = "enable --now podman.socket" ] && [ ! -S {shlex.quote(str(sock))} ]; then
+        {bind} {shlex.quote(str(sock))}
+    fi
 }}
 step() {{ :; }}
 info() {{ echo "INFO $1"; }}
 warn() {{ echo "WARN $1"; }}
 IS_PODMAN={"true" if is_podman else "false"}
 ENGINE_SOCK=/var/run/docker.sock
-PODMAN_ROOTFUL_SOCK={sock}
+PODMAN_ROOTFUL_SOCK={shlex.quote(str(sock))}
+{_function("first_error_line")}
 {_function("setup_rootful_podman")}
 setup_rootful_podman
 echo "ENGINE_SOCK=$ENGINE_SOCK"
@@ -164,7 +189,7 @@ echo "ENGINE_SOCK=$ENGINE_SOCK"
     if disable_autoupdate:
         env["ARES_DISABLE_AUTOUPDATE"] = "1"
     done = subprocess.run(
-        ["bash", "-c", script], capture_output=True, text=True, env=env, check=True, timeout=30
+        [BASH, "-c", script], capture_output=True, text=True, env=env, check=True, timeout=30
     )
     engine_sock = done.stdout.strip().splitlines()[-1].removeprefix("ENGINE_SOCK=")
     return _SocketRun(
@@ -174,10 +199,12 @@ echo "ENGINE_SOCK=$ENGINE_SOCK"
     )
 
 
-def test_rootful_podman_enables_its_api_socket_and_hands_that_to_the_updater() -> None:
+def test_rootful_podman_enables_its_api_socket_and_hands_that_to_the_updater(
+    short_tmp: Path,
+) -> None:
     # given a rootful Podman host where podman.socket is not yet enabled (a stock RHEL host)
     # when the installer sets up the runtime
-    run = _setup_podman(is_podman=True, uid=0, systemctl_succeeds=True)
+    run = _setup_podman(short_tmp, is_podman=True, uid=0, systemctl_succeeds=True)
 
     # then it enables podman.socket and uses Podman's own socket, not /var/run/docker.sock
     assert "enable --now podman.socket" in run.systemctl_calls
@@ -185,12 +212,27 @@ def test_rootful_podman_enables_its_api_socket_and_hands_that_to_the_updater() -
     assert "INFO Enabled podman.socket" in run.output
 
 
-def test_rootful_podman_restarts_the_agent_after_a_reboot() -> None:
+def test_a_socket_file_left_behind_does_not_stand_in_for_enabling_the_service(
+    short_tmp: Path,
+) -> None:
+    # given a socket file already at Podman's path, as systemd leaves it once the unit is stopped
+    # when the installer sets up the runtime
+    run = _setup_podman(
+        short_tmp, is_podman=True, uid=0, systemctl_succeeds=True, socket_already_there=True
+    )
+
+    # then it still enables the service, which is what makes the socket answer, and keep answering
+    # after a reboot
+    assert "enable --now podman.socket" in run.systemctl_calls
+
+
+def test_rootful_podman_restarts_the_agent_after_a_reboot(short_tmp: Path) -> None:
     # given rootful Podman, which has no daemon to honour --restart=always across a reboot
     # when the installer sets up the runtime, with or without auto-update
-    run = _setup_podman(is_podman=True, uid=0, systemctl_succeeds=True)
+    run = _setup_podman(short_tmp, is_podman=True, uid=0, systemctl_succeeds=True)
+    (short_tmp / "calls").unlink()
     no_update = _setup_podman(
-        is_podman=True, uid=0, systemctl_succeeds=True, disable_autoupdate=True
+        short_tmp, is_podman=True, uid=0, systemctl_succeeds=True, disable_autoupdate=True
     )
 
     # then podman-restart is enabled either way: it is about the agent, not the updater
@@ -198,26 +240,224 @@ def test_rootful_podman_restarts_the_agent_after_a_reboot() -> None:
     assert no_update.systemctl_calls == ["enable podman-restart.service"]
 
 
-def test_rootful_podman_that_cannot_enable_the_socket_says_so() -> None:
+def test_rootful_podman_that_cannot_enable_the_socket_says_why(short_tmp: Path) -> None:
     # given a rootful Podman host where podman.socket cannot be enabled (no systemd, or a policy)
     # when the installer sets up the runtime
-    run = _setup_podman(is_podman=True, uid=0, systemctl_succeeds=False)
+    run = _setup_podman(short_tmp, is_podman=True, uid=0, systemctl_succeeds=False)
 
-    # then it still points at Podman's socket, so the updater fails on the real reason, and warns
+    # then it still points at Podman's socket, so the updater fails on the real reason, and the
+    # warning carries systemctl's own reason rather than discarding it
     assert run.engine_sock == "<podman.sock>"
-    assert "WARN Could not enable podman.socket" in run.output
+    assert (
+        "WARN Could not enable podman.socket, which the auto-update companion needs: "
+        "Failed to connect to bus: No such file or directory"
+    ) in run.output
 
 
-def test_docker_and_rootless_podman_keep_the_socket_they_already_had() -> None:
+def test_docker_and_rootless_podman_keep_the_socket_they_already_had(short_tmp: Path) -> None:
     # given Docker, or rootless Podman (whose socket setup_persistence already chose)
     # when the installer sets up the runtime
-    docker = _setup_podman(is_podman=False, uid=0, systemctl_succeeds=True)
-    rootless = _setup_podman(is_podman=True, uid=1000, systemctl_succeeds=True)
+    docker = _setup_podman(short_tmp, is_podman=False, uid=0, systemctl_succeeds=True)
+    rootless = _setup_podman(short_tmp, is_podman=True, uid=1000, systemctl_succeeds=True)
 
     # then nothing changes and no system service is touched
     assert docker.engine_sock == "/var/run/docker.sock"
     assert rootless.engine_sock == "/var/run/docker.sock"
     assert docker.systemctl_calls == rootless.systemctl_calls == []
+
+
+# ── Telling the operator when the updater cannot work ────────────────────────────────────────────
+
+
+class _UpdaterRun(NamedTuple):
+    status: int
+    output: str
+    calls: list[str]
+
+
+def _start_updater(
+    workdir: Path,
+    *,
+    run_rc: int = 0,
+    run_out: str = "",
+    inspect: str = "true 0",
+    exec_rc: int = 0,
+    exec_out: str = "",
+    logs: str = "",
+    is_podman: bool = False,
+    uid: int = 0,
+) -> _UpdaterRun:
+    """Run start_updater then report_autoupdate_failure, against a stub container engine whose
+    `run`, `inspect`, `exec` and `logs` answer as given. Exit status and output are what an
+    operator, or the automation running the installer, would see."""
+    calls = workdir / "engine-calls"
+    calls.touch()
+    script = f"""
+set -euo pipefail
+id() {{ echo {uid}; }}
+step() {{ :; }}
+info() {{ echo "INFO $1"; }}
+warn() {{ echo "WARN $1"; }}
+error() {{ echo "ERROR $1"; }}
+host_ca_dir() {{ :; }}
+replace_existing() {{ :; }}
+sleep() {{ :; }}
+engine() {{
+    echo "$1" >> {shlex.quote(str(calls))}
+    case "$1" in
+        run) printf '%s' "$RUN_OUT"; return "$RUN_RC" ;;
+        inspect) printf '%s' "$INSPECT" ;;
+        exec) printf '%s' "$EXEC_OUT"; return "$EXEC_RC" ;;
+        logs) printf '%s' "$LOGS" ;;
+    esac
+}}
+RUNTIME=engine
+IS_PODMAN={"true" if is_podman else "false"}
+ENGINE_SOCK=/var/run/docker.sock
+CONTAINER_NAME=ares-agent
+UPDATER_CONTAINER_NAME=ares-updater
+VOLUME_NAME=ares-agent-data
+UPDATER_IMAGE=assailai/ares-updater:3.12.0
+UPDATER_SETTLE_SECONDS=0
+AUTOUPDATE_FAILED=false
+AUTOUPDATE_REASON=""
+AUTOUPDATE_ADVICE=""
+EXIT_NO_AUTOUPDATE=3
+ENGINE_PING=ping
+{_function("first_error_line")}
+{_function("socket_advice")}
+{_function("autoupdate_failed")}
+{_function("start_updater")}
+{_function("report_autoupdate_failure")}
+start_updater
+report_autoupdate_failure
+echo "NOTHING TO REPORT"
+"""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "RUN_RC": str(run_rc),
+        "RUN_OUT": run_out,
+        "INSPECT": inspect,
+        "EXEC_RC": str(exec_rc),
+        "EXEC_OUT": exec_out,
+        "LOGS": logs,
+    }
+    done = subprocess.run([BASH, "-c", script], capture_output=True, text=True, env=env, timeout=30)
+    return _UpdaterRun(
+        status=done.returncode,
+        output=done.stdout + done.stderr,
+        calls=calls.read_text().splitlines(),
+    )
+
+
+def _error_lines(run: _UpdaterRun) -> list[str]:
+    return [line for line in run.output.splitlines() if line.startswith("ERROR ")]
+
+
+def test_a_working_updater_is_reported_as_started(short_tmp: Path) -> None:
+    # given an engine that starts the updater, keeps it up, and answers its ping
+    # when the installer starts the updater
+    run = _start_updater(short_tmp)
+
+    # then it says so, exits 0, and only after the ping went through the updater's own socket
+    assert run.status == 0
+    assert "INFO Auto-update companion started." in run.output
+    assert "NOTHING TO REPORT" in run.output
+    assert run.calls == ["run", "inspect", "exec"]
+
+
+def test_a_failed_docker_run_reports_the_engine_error_not_the_help_line(short_tmp: Path) -> None:
+    # given Docker refusing a socket that is not there; its output ends with a --help line
+    run_out = (
+        'docker: Error response from daemon: invalid mount config for type "bind": bind source '
+        "path does not exist: /var/run/docker.sock\n\nRun 'docker run --help' for more information"
+    )
+    # when the installer starts the updater
+    run = _start_updater(short_tmp, run_rc=125, run_out=run_out)
+
+    # then the failure names Docker's own reason, says what to check, and exits 3
+    errors = _error_lines(run)
+    assert run.status == 3
+    assert any("bind source path does not exist: /var/run/docker.sock" in e for e in errors)
+    assert not any("--help" in e for e in errors)
+    advice = "Check that /var/run/docker.sock is the running engine's socket"
+    assert any(advice in e for e in errors), errors
+
+
+def test_rootful_podman_without_a_socket_is_told_to_enable_podman_socket(short_tmp: Path) -> None:
+    # given the podman-docker shim's banner, then Podman refusing the missing socket (ARES-1725)
+    run_out = (
+        "Emulate Docker CLI using podman. Create /etc/containers/nodocker to quiet msg.\n"
+        "Error: statfs /run/podman/podman.sock: no such file or directory"
+    )
+    # when the installer starts the updater as root
+    run = _start_updater(short_tmp, run_rc=125, run_out=run_out, is_podman=True, uid=0)
+
+    # then the reason is Podman's, not the banner, and the fix is the one that applies
+    errors = _error_lines(run)
+    assert run.status == 3
+    assert any("statfs /run/podman/podman.sock: no such file or directory" in e for e in errors)
+    assert not any("Emulate Docker CLI" in e for e in errors)
+    assert any("'systemctl enable --now podman.socket'" in e for e in errors)
+
+
+def test_an_image_that_cannot_be_pulled_gets_pull_advice_not_socket_advice(short_tmp: Path) -> None:
+    run_out = (
+        "Error: initializing source docker://assailai/ares-updater:3.12.0: reading manifest "
+        "3.12.0 in docker.io/assailai/ares-updater: toomanyrequests: too many requests"
+    )
+    run = _start_updater(short_tmp, run_rc=125, run_out=run_out, is_podman=True, uid=0)
+
+    errors = _error_lines(run)
+    assert run.status == 3
+    assert any("pull assailai/ares-updater:3.12.0" in e for e in errors)
+    assert not any("podman.socket" in e for e in errors)
+
+
+def test_an_engine_that_fails_silently_is_still_a_failure(short_tmp: Path) -> None:
+    # given a run that fails with no output at all
+    run = _start_updater(short_tmp, run_rc=1, run_out="")
+
+    # then it is still reported, rather than an empty reason reading as success
+    assert run.status == 3
+    assert "NOTHING TO REPORT" not in run.output
+    assert any("no further detail from the engine" in e for e in _error_lines(run))
+
+
+def test_an_updater_that_crashes_on_start_is_caught(short_tmp: Path) -> None:
+    # given an updater that is already being restarted when the installer looks
+    run = _start_updater(
+        short_tmp,
+        inspect="true 2",
+        logs="2026-10-13 ERROR ares.updater no Docker socket and not running in Kubernetes",
+    )
+
+    errors = _error_lines(run)
+    assert run.status == 3
+    assert any("no Docker socket and not running in Kubernetes" in e for e in errors)
+    assert "exec" not in run.calls
+
+
+def test_an_updater_that_runs_but_cannot_use_the_socket_is_caught(short_tmp: Path) -> None:
+    # given an updater that starts and stays up, but whose socket the engine refuses (SELinux): the
+    # case a "still running" check alone passed, because the updater only uses the socket once an
+    # update is queued and logs, rather than exits, when it cannot
+    run = _start_updater(
+        short_tmp,
+        exec_rc=1,
+        exec_out="ConnectError: [Errno 13] Permission denied",
+        is_podman=True,
+        uid=0,
+    )
+
+    errors = _error_lines(run)
+    assert run.status == 3
+    assert any(
+        "cannot use the container engine through /var/run/docker.sock: "
+        "ConnectError: [Errno 13] Permission denied" in e
+        for e in errors
+    )
+    assert "INFO Auto-update companion started." not in run.output
 
 
 def test_the_socket_is_resolved_before_the_updater_starts_and_a_failure_is_reported_last() -> None:
@@ -235,9 +475,6 @@ def test_the_socket_is_resolved_before_the_updater_starts_and_a_failure_is_repor
         "the rootful socket has to be resolved after setup_persistence (which owns the rootless "
         "one) and before the updater starts; a failed updater is reported after the summary, so "
         "it is the last thing the operator reads rather than a warning above 'Done'"
-    )
-    assert "exit 1" in _function("report_autoupdate_failure"), (
-        "an install whose updater could not run must exit non-zero"
     )
 
 
