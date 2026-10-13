@@ -4,9 +4,13 @@
 # =============================================================================
 # Zero-touch installer: picks the container runtime (Docker or Podman), starts the agent and its
 # auto-update companion, and waits until the agent reports online. Cross-platform (macOS, Linux,
-# Windows Git Bash / WSL). On rootless Podman it also enables linger + the user podman services so
-# the agent survives the operator logging out. Set ARES_DISABLE_AUTOUPDATE to install the agent
-# alone (no self-update).
+# Windows Git Bash / WSL). Podman has no daemon: on rootless Podman it also enables linger + the
+# user podman services so the agent survives the operator logging out, and on rootful Podman the
+# system podman-restart + podman.socket units, for reboots and for the updater's engine socket.
+# Set ARES_DISABLE_AUTOUPDATE to install the agent alone (no self-update).
+#
+# Exit status: 0 installed; 1 the agent did not install; 3 the agent is installed and running but
+# its auto-update companion cannot update it (the reason and the fix are printed last).
 #
 # Usage:
 #   ARES_TOKEN=<token> bash scripts/bootstrap.sh
@@ -25,16 +29,38 @@
 set -euo pipefail
 
 # Defaults to the current pinned release; override with ARES_VERSION=X.Y.Z or ARES_IMAGE=<full ref>.
-IMAGE="${ARES_IMAGE:-assailai/ares-agent:${ARES_VERSION:-3.9.0}}"
+# Fully qualified (docker.io/...): RHEL's Podman enforces short-name resolution, so a bare
+# assailai/ares-agent stops at an interactive "which registry?" prompt, and with no terminal to
+# answer it (Ansible, cloud-init, ssh with a command) the install simply fails. ARES-1725.
+IMAGE="${ARES_IMAGE:-docker.io/assailai/ares-agent:${ARES_VERSION:-3.12.0}}"
 # The companion updater keeps the agent on the release the dashboard marks current; it is the only
 # component that touches the Docker socket (the agent stays unprivileged). Set ARES_DISABLE_AUTOUPDATE
 # to opt out (change-control-sensitive hosts). Override the image with ARES_UPDATER_IMAGE=<full ref>.
-UPDATER_IMAGE="${ARES_UPDATER_IMAGE:-assailai/ares-updater:${ARES_VERSION:-3.9.0}}"
+UPDATER_IMAGE="${ARES_UPDATER_IMAGE:-docker.io/assailai/ares-updater:${ARES_VERSION:-3.12.0}}"
 CONTAINER_NAME="ares-agent"
 UPDATER_CONTAINER_NAME="ares-updater"
 VOLUME_NAME="ares-agent-data"
 ONLINE_TIMEOUT=120
 ONLINE_INTERVAL=3
+# how long a freshly started updater must stay up before it counts as started (see start_updater).
+UPDATER_SETTLE_SECONDS=5
+# set by start_updater when the updater cannot update the agent; reported after the summary.
+AUTOUPDATE_FAILED=false
+AUTOUPDATE_REASON=""
+AUTOUPDATE_ADVICE=""
+# The exit status of an install whose agent is running but whose updater cannot update it. Not 1,
+# which means the agent itself did not install, so automation can tell the two apart.
+EXIT_NO_AUTOUPDATE=3
+# Asks the engine for /_ping through the socket exactly as the updater will use it. python and
+# httpx are what the updater image runs on, in every version, so this needs nothing added to it.
+ENGINE_PING='import sys, httpx
+try:
+    httpx.Client(transport=httpx.HTTPTransport(uds="/var/run/docker.sock"), base_url="http://engine", timeout=5).get("/_ping").raise_for_status()
+except Exception as exc:
+    print(f"{type(exc).__name__}: {exc}")
+    sys.exit(1)'
+# rootful Podman's API socket, socket-activated by the system podman.socket unit.
+PODMAN_ROOTFUL_SOCK="/run/podman/podman.sock"
 
 if [ -t 1 ]; then
     RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
@@ -88,7 +114,7 @@ setup_persistence() {
     # Rootless Podman has no daemon, so a --restart policy is not enough on its own: without linger
     # the container is killed when the operator's login session ends, and the user podman-restart /
     # podman.socket services are what bring it back after a reboot and expose the engine socket to
-    # the updater. Docker and rootful Podman persist via their system daemon, so this is a no-op.
+    # the updater. Docker persists via its daemon; rootful Podman is setup_rootful_podman's.
     { [ "$IS_PODMAN" = true ] && [ "$(id -u)" -ne 0 ]; } || return 0
     step "Enabling rootless Podman persistence"
     if sudo loginctl enable-linger "$(id -un)"; then
@@ -98,6 +124,73 @@ setup_persistence() {
     fi
     systemctl --user enable --now podman.socket podman-restart.service 2>/dev/null || true
     ENGINE_SOCK="${XDG_RUNTIME_DIR}/podman/podman.sock"
+}
+
+setup_rootful_podman() {
+    # Rootful Podman is not Docker with another name: it has no daemon and no Docker socket, and
+    # both used to be assumed here (ARES-1725).
+    { [ "$IS_PODMAN" = true ] && [ "$(id -u)" -eq 0 ]; } || return 0
+    step "Setting up rootful Podman"
+    local out
+    # With no daemon, --restart=always does not survive a reboot on its own; podman-restart starts
+    # those containers at boot. Without it the agent goes offline at the host's first restart.
+    if out="$(systemctl enable podman-restart.service 2>&1)"; then
+        info "Enabled podman-restart.service so the agent comes back after a reboot."
+    else
+        warn "Could not enable podman-restart.service, so the agent will not restart after a reboot: $(first_error_line "$out")"
+    fi
+    [ -z "${ARES_DISABLE_AUTOUPDATE:-}" ] || return 0
+    # /var/run/docker.sock exists only when podman-docker is installed AND the system podman.socket
+    # is active, and a stock RHEL host has neither, so the updater used to be handed a path that
+    # was not there: Podman refused the mount ("statfs /var/run/docker.sock: no such file or
+    # directory"), the agent came up without its updater, and it never moved off the version it
+    # was installed at. Podman's own API socket is activated by podman.socket, at every boot too.
+    ENGINE_SOCK="$PODMAN_ROOTFUL_SOCK"
+    # Enabled even when the socket file is already there: systemd leaves the file behind when the
+    # unit is stopped or disabled, and a file nobody listens on is no socket at all. Idempotent.
+    if out="$(systemctl enable --now podman.socket 2>&1)" && [ -S "$ENGINE_SOCK" ]; then
+        info "Enabled podman.socket ($ENGINE_SOCK) for the auto-update companion."
+    elif [ -S "$ENGINE_SOCK" ]; then
+        warn "Could not enable podman.socket ($(first_error_line "$out")); using the socket already at $ENGINE_SOCK, which may not come back after a reboot."
+    else
+        warn "Could not enable podman.socket, which the auto-update companion needs: $(first_error_line "$out")"
+    fi
+}
+
+first_error_line() {
+    # The line of an engine's output that says what went wrong. Not the last line: a failed
+    # `docker run` ends with "Run 'docker run --help' for more information", and the podman-docker
+    # shim prefixes its own banner. Not the first error-looking line either: Podman logs each pull
+    # retry as a warning before its final "Error: ...", which is the conclusive one. `|| true`
+    # because a grep that matches nothing fails the pipeline under pipefail, which would abort the
+    # install over a diagnostic.
+    local line
+    line="$(printf '%s\n' "$1" | grep -E '^(Error|[a-z]+: Error)' | tail -n 1 || true)"
+    if [ -z "$line" ]; then
+        line="$(printf '%s\n' "$1" | grep -iE 'error|denied|refused|no such|not found|unauthorized|timed out|timeout|too many requests' | grep -v -e '--help' -e 'Emulate Docker CLI' | head -n 1 || true)"
+    fi
+    if [ -z "$line" ]; then
+        line="$(printf '%s\n' "$1" | grep -v -e '--help' -e 'Emulate Docker CLI' -e '^[[:space:]]*$' | head -n 1 || true)"
+    fi
+    printf '%s' "${line:-no further detail from the engine}"
+}
+
+socket_advice() {
+    if [ "$IS_PODMAN" = true ] && [ "$(id -u)" -eq 0 ]; then
+        printf '%s' "Enable Podman's API socket with 'systemctl enable --now podman.socket', then re-run this installer."
+    elif [ "$IS_PODMAN" = true ]; then
+        printf '%s' "Enable Podman's API socket with 'systemctl --user enable --now podman.socket', then re-run this installer."
+    else
+        printf '%s' "Check that $ENGINE_SOCK is the running engine's socket, then re-run this installer."
+    fi
+}
+
+autoupdate_failed() {
+    # A flag of its own rather than "the reason is non-empty": an engine that fails with no output
+    # must still be reported as a failure.
+    AUTOUPDATE_FAILED=true
+    AUTOUPDATE_REASON="$1"
+    AUTOUPDATE_ADVICE="$2"
 }
 
 resolve_token() {
@@ -131,7 +224,8 @@ reset_state() {
     step "Discarding the stored agent identity (ARES_RESET)"
     # Both containers first: the updater mounts the same volume read-only, and the engine refuses
     # to remove a volume any container still references, however stopped it is.
-    "$RUNTIME" rm -f "$CONTAINER_NAME" "$UPDATER_CONTAINER_NAME" >/dev/null 2>&1 || true
+    # ...and the updater's half-made replacement, if a failed swap left one: it mounts the volume too.
+    "$RUNTIME" rm -f "$CONTAINER_NAME" "$UPDATER_CONTAINER_NAME" "${CONTAINER_NAME}-next" >/dev/null 2>&1 || true
     if ! "$RUNTIME" volume inspect "$VOLUME_NAME" >/dev/null 2>&1; then
         info "There was no '${VOLUME_NAME}' volume; this host enrolls from scratch anyway."
         return 0
@@ -178,6 +272,9 @@ host_ca_dir() {
 start_container() {
     step "Starting the agent"
     replace_existing "$CONTAINER_NAME"
+    # A replacement an older updater created and could not start (Podman on cgroup v2) carries
+    # restart=always, so podman-restart would try it at boot beside the agent. Never wanted here.
+    "$RUNTIME" rm -f "${CONTAINER_NAME}-next" >/dev/null 2>&1 || true
 
     local run_args=(-d --name "$CONTAINER_NAME" -e "ARES_TOKEN=$TOKEN")
 
@@ -219,8 +316,9 @@ start_container() {
             run_args+=(--dns "$dns")
         done
     fi
-    # --restart=always pairs with the persistence set up in setup_persistence (linger on rootless
-    # Podman; the system daemon on Docker), so the agent comes back after logout and reboot.
+    # --restart=always pairs with the persistence set up for each engine (the daemon on Docker,
+    # linger + podman-restart on rootless Podman, podman-restart on rootful Podman), so the agent
+    # comes back after logout and reboot.
     run_args+=(-v "${VOLUME_NAME}:/data" --restart=always)
 
     if ! "$RUNTIME" run "${run_args[@]}" "$IMAGE" >/dev/null; then
@@ -239,15 +337,19 @@ start_updater() {
     replace_existing "$UPDATER_CONTAINER_NAME"
     # Only the updater touches the engine socket; it recreates the agent on a new, cosign-verified
     # image when the dashboard marks a release current (the signer identity is baked into the image).
-    # ENGINE_SOCK is the Docker socket, or the rootless Podman one when setup_persistence set it up.
-    # Non-fatal: if it cannot start (e.g. no socket access), the agent still runs, just without
-    # auto-update.
+    # ENGINE_SOCK is the Docker socket, or the Podman one (rootless: setup_persistence, rootful:
+    # setup_rootful_podman).
     # The updater needs the host CAs too: cosign has to reach the registry and the Sigstore log
     # through the same inspecting proxy, and it fails closed when it cannot verify a signature.
     local updater_args=(-d --name "$UPDATER_CONTAINER_NAME")
     updater_args+=(-e "ARES_UPDATE_CONTAINER=$CONTAINER_NAME")
     updater_args+=(-v "${VOLUME_NAME}:/data:ro")
     updater_args+=(-v "${ENGINE_SOCK}:/var/run/docker.sock")
+    # Under SELinux (enforcing by default on RHEL and Fedora) a container may not connect to the
+    # engine socket, so the updater would start and then fail every check with "Permission
+    # denied". Lifting the label confines nothing that matters here: whoever holds the engine
+    # socket already holds the host. Docker and Podman both accept it where SELinux is off.
+    updater_args+=(--security-opt label=disable)
     local ca_dir
     ca_dir="$(host_ca_dir)"
     if [ -n "$ca_dir" ]; then
@@ -255,12 +357,51 @@ start_updater() {
     fi
     updater_args+=(--restart=always)
 
-    if "$RUNTIME" run "${updater_args[@]}" "$UPDATER_IMAGE" >/dev/null 2>&1; then
-        info "Auto-update companion started."
-    else
-        warn "Could not start the ares-updater companion; the agent will run but will not auto-update."
-        warn "Check engine socket access, or pull it manually with: $RUNTIME pull $UPDATER_IMAGE"
+    # The agent runs either way, so this does not stop the install, but it is reported as a failure
+    # in the summary and the exit status. It used to be one warning in the middle of the output,
+    # followed by "Done", and a missing updater is invisible from the dashboard until the next
+    # release, where it only reads as an agent that never arrived.
+    local out rc=0
+    out="$("$RUNTIME" run "${updater_args[@]}" "$UPDATER_IMAGE" 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        case "$out" in
+            *"$ENGINE_SOCK"* | *docker.sock* | *statfs*)
+                autoupdate_failed "$(first_error_line "$out")" "$(socket_advice)" ;;
+            *)
+                autoupdate_failed "$(first_error_line "$out")" \
+                    "If the image could not be pulled, try '$RUNTIME pull $UPDATER_IMAGE', then re-run this installer." ;;
+        esac
+        return 0
     fi
+    # A crash on startup (a bad CA bundle, the wrong architecture) shows as a container that is not
+    # running or has already been restarted.
+    sleep "$UPDATER_SETTLE_SECONDS"
+    if [ "$("$RUNTIME" inspect -f '{{.State.Running}} {{.RestartCount}}' "$UPDATER_CONTAINER_NAME" 2>/dev/null)" != "true 0" ]; then
+        out="$("$RUNTIME" logs --tail 20 "$UPDATER_CONTAINER_NAME" 2>&1 || true)"
+        autoupdate_failed "$(first_error_line "$out")" "Its log says more: $RUNTIME logs $UPDATER_CONTAINER_NAME"
+        return 0
+    fi
+    # Running is not the same as able to update. The updater only uses the socket once an update is
+    # queued, and logs an error rather than exiting when it cannot, so a socket it may not use
+    # (SELinux, a file nobody listens on, the empty directory Docker makes for a missing source)
+    # would sit there looking healthy. Ask the engine for /_ping through that socket, from inside.
+    if ! out="$("$RUNTIME" exec "$UPDATER_CONTAINER_NAME" python -c "$ENGINE_PING" 2>&1)"; then
+        autoupdate_failed "it cannot use the container engine through $ENGINE_SOCK: $(first_error_line "$out")" \
+            "$(socket_advice)"
+        return 0
+    fi
+    info "Auto-update companion started."
+}
+
+report_autoupdate_failure() {
+    [ "$AUTOUPDATE_FAILED" = true ] || return 0
+    printf "\n"
+    error "Auto-update is NOT working on this host: the ares-updater companion cannot update the agent."
+    error "  ${AUTOUPDATE_REASON:-no further detail from the engine}"
+    error "The agent itself is installed, but it will stay on this version until this is fixed."
+    error "$AUTOUPDATE_ADVICE"
+    error "Re-running keeps this agent's identity. To install without auto-update, set ARES_DISABLE_AUTOUPDATE=1."
+    exit "$EXIT_NO_AUTOUPDATE"
 }
 
 wait_until_online() {
@@ -330,11 +471,13 @@ main() {
     check_runtime
     resolve_token "$@"
     setup_persistence
+    setup_rootful_podman
     reset_state
     start_container
     start_updater
     wait_until_online
     print_summary
+    report_autoupdate_failure
 }
 
 main "$@"

@@ -40,6 +40,19 @@ def test_repeated_failure_logging_escalates_then_quiets(caplog: pytest.LogCaptur
     assert by_message["heartbeat failing (attempt 10): boom"] == logging.WARNING
 
 
+def test_a_timeout_is_named_rather_than_logged_blank(caplog: pytest.LogCaptureFixture) -> None:
+    # given httpx's timeouts, which carry no message (str() is ""), as a slow network raises them
+    # when the agent logs a failed heartbeat
+    with caplog.at_level(logging.DEBUG, logger="ares.agent"):
+        main._log_repeated_failure("heartbeat", 1, httpx.ConnectTimeout(""))
+        main._log_repeated_failure("heartbeat", 2, httpx.ReadTimeout(""))
+
+    # then the line names what happened instead of ending in nothing (ARES-1725)
+    messages = [record.getMessage() for record in caplog.records]
+    assert "heartbeat failing (attempt 1): ConnectTimeout" in messages
+    assert "heartbeat failed (attempt 2): ReadTimeout" in messages
+
+
 def _unauthorized() -> httpx.HTTPStatusError:
     request = httpx.Request("POST", "http://ares.example/api/v1/agent/heartbeat")
     response = httpx.Response(401, request=request)

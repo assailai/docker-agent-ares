@@ -244,6 +244,104 @@ def test_docker_apply_carries_only_the_operator_owned_config(
         assert key not in body, f"{key} must come from the new image, not the old container"
 
 
+@pytest.mark.parametrize("reported", [0, -1, None])
+def test_docker_apply_does_not_replay_an_unset_swappiness(
+    monkeypatch: pytest.MonkeyPatch, reported: int | None
+) -> None:
+    # given Podman's inspect of a container that never set a swappiness (it reports 0; Docker
+    # reports null or -1), on a cgroup v2 host where crun refuses any explicit value
+    host_config = {**_OLD_CONTAINER["HostConfig"], "MemorySwappiness": reported}
+    old = {**_OLD_CONTAINER, "HostConfig": host_config}
+
+    # when the updater re-creates the agent from it
+    body = _apply_capturing_create_body(
+        monkeypatch, old_container=old, image_response=httpx.Response(200, json={"Config": {}})
+    )
+
+    # then the swappiness is left unset, and everything else the operator set is carried over
+    assert "MemorySwappiness" not in body["HostConfig"]
+    assert body["HostConfig"]["Binds"] == _OLD_CONTAINER["HostConfig"]["Binds"]
+    assert body["HostConfig"]["RestartPolicy"] == {"Name": "always"}
+
+
+def test_docker_apply_keeps_a_swappiness_the_operator_actually_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host_config = {**_OLD_CONTAINER["HostConfig"], "MemorySwappiness": 10}
+    old = {**_OLD_CONTAINER, "HostConfig": host_config}
+
+    body = _apply_capturing_create_body(
+        monkeypatch, old_container=old, image_response=httpx.Response(200, json={"Config": {}})
+    )
+
+    assert body["HostConfig"]["MemorySwappiness"] == 10
+
+
+def test_docker_apply_replays_a_podman_cpu_limit_without_the_conflicting_nanocpus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given Podman's inspect of an agent run with --cpus=1.5: the limit three ways at once, which
+    # its own compat create refuses ("NanoCpus conflicts with CpuPeriod and CpuQuota")
+    cpu = {"CpuPeriod": 100000, "CpuQuota": 150000, "NanoCpus": 1500000000}
+    host_config = {**_OLD_CONTAINER["HostConfig"], **cpu}
+    old = {**_OLD_CONTAINER, "HostConfig": host_config}
+
+    # when the updater re-creates the agent from it
+    body = _apply_capturing_create_body(
+        monkeypatch, old_container=old, image_response=httpx.Response(200, json={"Config": {}})
+    )
+
+    # then the limit survives as period and quota, which are the exact original
+    assert "NanoCpus" not in body["HostConfig"]
+    assert body["HostConfig"]["CpuPeriod"] == 100000
+    assert body["HostConfig"]["CpuQuota"] == 150000
+
+
+def test_docker_apply_keeps_a_docker_cpu_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Docker reports --cpus as NanoCpus alone, with period and quota zero: nothing to drop.
+    host_config = {**_OLD_CONTAINER["HostConfig"], "NanoCpus": 1500000000, "CpuPeriod": 0}
+    old = {**_OLD_CONTAINER, "HostConfig": host_config}
+
+    body = _apply_capturing_create_body(
+        monkeypatch, old_container=old, image_response=httpx.Response(200, json={"Config": {}})
+    )
+
+    assert body["HostConfig"]["NanoCpus"] == 1500000000
+
+
+def test_docker_apply_removes_a_replacement_it_could_not_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given an engine that creates the replacement but refuses to start it (as Podman did on
+    # cgroup v2 before the swappiness fix)
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        path = request.url.path
+        if path == "/containers/create":
+            return httpx.Response(201, json={"Id": "new123"})
+        if path == "/containers/new123/start":
+            return httpx.Response(500, json={"message": "crun: OCI runtime error"})
+        if path.startswith("/images/") and path.endswith("/json"):
+            return httpx.Response(200, json={"Config": {}})
+        if path.endswith("/json"):
+            return httpx.Response(200, json=_OLD_CONTAINER)
+        return httpx.Response(204)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://docker")
+    monkeypatch.setattr(dockerd, "_client", lambda: client)
+
+    # when the updater applies an update, then the failure still surfaces to the caller
+    with pytest.raises(httpx.HTTPStatusError):
+        DockerBackend().apply(_settings(), "assailai/ares-agent:3.3.3")
+
+    # and the half-made replacement is gone, while the running agent is untouched
+    after_start = calls[calls.index(("POST", "/containers/new123/start")) + 1 :]
+    assert ("DELETE", "/containers/ares-agent-next") in after_start
+    assert ("DELETE", "/containers/ares-agent") not in calls
+
+
 def test_docker_apply_drops_labels_when_the_old_image_is_unreadable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -236,7 +236,7 @@ async def _preflight(state: AgentState, ssl_context: ssl.SSLContext) -> None:
         logger.info("Preflight: control plane OK (%s)", settings.base_url)
         _apply_auto_rescan(resp.get("auto_rescan"), state=state)
     except (httpx.HTTPError, OSError) as exc:
-        logger.error("Preflight: control plane FAILED: %s%s", exc, _tls_hint(exc))
+        logger.error("Preflight: control plane FAILED: %s%s", _reason(exc), _tls_hint(exc))
 
     url = tunnel_url(settings.base_url)
     try:
@@ -252,14 +252,24 @@ async def _preflight(state: AgentState, ssl_context: ssl.SSLContext) -> None:
         )
 
 
+def _reason(exc: BaseException) -> str:
+    """What went wrong, for a log line. httpx's timeouts (ConnectTimeout, ReadTimeout, ...) carry
+    no message, so logging the exception alone printed "heartbeat failing (attempt 1): " with
+    nothing after it, which is the one moment an operator needs the reason (ARES-1725). The type
+    name says it when the message does not."""
+    return str(exc) or type(exc).__name__
+
+
 def _log_repeated_failure(what: str, failures: int, exc: Exception) -> None:
     """Surface sustained trouble without spamming the log: the first failure and every
     tenth after it are WARNING (visible at the default INFO level); the rest stay DEBUG.
     The caller logs the matching recovery once the call succeeds again."""
     if failures == 1 or failures % 10 == 0:
-        logger.warning("%s failing (attempt %d): %s%s", what, failures, exc, _tls_hint(exc))
+        logger.warning(
+            "%s failing (attempt %d): %s%s", what, failures, _reason(exc), _tls_hint(exc)
+        )
     else:
-        logger.debug("%s failed (attempt %d): %s", what, failures, exc)
+        logger.debug("%s failed (attempt %d): %s", what, failures, _reason(exc))
 
 
 async def _resolve_networks() -> list[str]:
@@ -1035,7 +1045,7 @@ async def _register_with_retries(state: AgentState, networks: list[str]) -> Agen
             logger.error(
                 "Cannot reach Ares at %s: %s.%s Retrying in %ds.",
                 settings.base_url,
-                exc,
+                _reason(exc),
                 _tls_hint(exc),
                 _REGISTER_RETRY_SECONDS,
             )
@@ -1141,7 +1151,7 @@ async def _reenroll(networks: list[str]) -> AgentState | None:
     except control_plane.RegistrationRejected:
         return None
     except (httpx.HTTPError, OSError) as exc:
-        logger.debug("re-enrollment could not reach Ares: %s", exc)
+        logger.debug("re-enrollment could not reach Ares: %s", _reason(exc))
         return None
 
 
