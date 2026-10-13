@@ -32,11 +32,11 @@ set -euo pipefail
 # Fully qualified (docker.io/...): RHEL's Podman enforces short-name resolution, so a bare
 # assailai/ares-agent stops at an interactive "which registry?" prompt, and with no terminal to
 # answer it (Ansible, cloud-init, ssh with a command) the install simply fails. ARES-1725.
-IMAGE="${ARES_IMAGE:-docker.io/assailai/ares-agent:${ARES_VERSION:-3.12.0}}"
+IMAGE="${ARES_IMAGE:-docker.io/assailai/ares-agent:${ARES_VERSION:-3.12.1}}"
 # The companion updater keeps the agent on the release the dashboard marks current; it is the only
 # component that touches the Docker socket (the agent stays unprivileged). Set ARES_DISABLE_AUTOUPDATE
 # to opt out (change-control-sensitive hosts). Override the image with ARES_UPDATER_IMAGE=<full ref>.
-UPDATER_IMAGE="${ARES_UPDATER_IMAGE:-docker.io/assailai/ares-updater:${ARES_VERSION:-3.12.0}}"
+UPDATER_IMAGE="${ARES_UPDATER_IMAGE:-docker.io/assailai/ares-updater:${ARES_VERSION:-3.12.1}}"
 CONTAINER_NAME="ares-agent"
 UPDATER_CONTAINER_NAME="ares-updater"
 VOLUME_NAME="ares-agent-data"
