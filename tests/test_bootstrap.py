@@ -414,6 +414,25 @@ def test_an_image_that_cannot_be_pulled_gets_pull_advice_not_socket_advice(short
     assert not any("podman.socket" in e for e in errors)
 
 
+def test_podman_retry_warnings_give_way_to_its_final_error(short_tmp: Path) -> None:
+    # given Podman's output for a pull it retried and then gave up on (seen on a real host)
+    retry = (
+        'time="2026-10-13T08:07:58Z" level=warning msg="Failed, retrying in 1s ... (1/3). Error: '
+        'initializing source docker://assailai/ares-updater:3.9.1: pinging container registry"'
+    )
+    final = (
+        "Error: initializing source docker://assailai/ares-updater:3.9.1: pinging container "
+        'registry registry-1.docker.io: Get "https://registry-1.docker.io/v2/": i/o timeout'
+    )
+    run_out = f"{retry}\n{retry}\n{final}"
+    run = _start_updater(short_tmp, run_rc=125, run_out=run_out, is_podman=True)
+
+    # then the reason shown is the conclusive error, not the first retry
+    errors = _error_lines(run)
+    assert any(e == f"ERROR   {final}" for e in errors), errors
+    assert not any("retrying" in e for e in errors)
+
+
 def test_an_engine_that_fails_silently_is_still_a_failure(short_tmp: Path) -> None:
     # given a run that fails with no output at all
     run = _start_updater(short_tmp, run_rc=1, run_out="")

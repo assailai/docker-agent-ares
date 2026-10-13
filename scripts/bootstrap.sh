@@ -157,10 +157,15 @@ setup_rootful_podman() {
 first_error_line() {
     # The line of an engine's output that says what went wrong. Not the last line: a failed
     # `docker run` ends with "Run 'docker run --help' for more information", and the podman-docker
-    # shim prefixes its own banner. `|| true` because a grep that matches nothing fails the
-    # pipeline under pipefail, which would abort the install over a diagnostic.
+    # shim prefixes its own banner. Not the first error-looking line either: Podman logs each pull
+    # retry as a warning before its final "Error: ...", which is the conclusive one. `|| true`
+    # because a grep that matches nothing fails the pipeline under pipefail, which would abort the
+    # install over a diagnostic.
     local line
-    line="$(printf '%s\n' "$1" | grep -iE 'error|denied|refused|no such|not found|unauthorized|timed out|timeout|too many requests' | grep -v -e '--help' -e 'Emulate Docker CLI' | head -n 1 || true)"
+    line="$(printf '%s\n' "$1" | grep -E '^(Error|[a-z]+: Error)' | tail -n 1 || true)"
+    if [ -z "$line" ]; then
+        line="$(printf '%s\n' "$1" | grep -iE 'error|denied|refused|no such|not found|unauthorized|timed out|timeout|too many requests' | grep -v -e '--help' -e 'Emulate Docker CLI' | head -n 1 || true)"
+    fi
     if [ -z "$line" ]; then
         line="$(printf '%s\n' "$1" | grep -v -e '--help' -e 'Emulate Docker CLI' -e '^[[:space:]]*$' | head -n 1 || true)"
     fi
