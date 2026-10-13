@@ -46,12 +46,13 @@ class DockerBackend:
 
             # clear any leftover from a prior aborted run, then start the replacement carrying only
             # what the operator owns: the new image supplies the rest. HostConfig is preserved
-            # wholesale because it *is* the operator's (mounts, restart policy, network).
+            # wholesale because it *is* the operator's (mounts, restart policy, network), less what
+            # an engine reports but will not accept back (see _replayable_host_config).
             docker.delete(f"/containers/{next_name}", params={"force": "true"})
             body = {
                 **_operator_config(docker, attrs),
                 "Image": image_ref,
-                "HostConfig": attrs["HostConfig"],
+                "HostConfig": _replayable_host_config(attrs["HostConfig"]),
             }
             created = docker.post("/containers/create", params={"name": next_name}, json=body)
             created.raise_for_status()
@@ -67,6 +68,22 @@ class DockerBackend:
             docker.delete(f"/containers/{name}", params={"force": "true"})
             docker.post(f"/containers/{cid}/rename", params={"name": name})
             logger.info("updated %s to %s", name, image_ref)
+
+
+def _replayable_host_config(host_config: dict) -> dict:
+    """The old container's HostConfig, minus what an engine reports but will not take back.
+
+    Podman's Docker-compatible inspect reports ``MemorySwappiness`` 0 for a container that never set
+    one (Docker reports null), and crun refuses any explicit swappiness under cgroup v2, which every
+    RHEL 9 and Fedora host runs. Copied back, it failed every Podman update at the swap with "crun:
+    cannot set memory swappiness with cgroupv2" (ARES-1725, found on a real RHEL 9 host). Docker's
+    own "unset" is null or -1, so dropping 0 as well loses only an explicit 0, a cgroup v1 tuning
+    that no agent install sets.
+    """
+    config = dict(host_config)
+    if config.get("MemorySwappiness") in (None, 0, -1):
+        config.pop("MemorySwappiness", None)
+    return config
 
 
 def _client() -> httpx.Client:

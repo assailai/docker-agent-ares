@@ -75,7 +75,7 @@ docker run -d --name ares-agent \
   -e ARES_TOKEN=<your-registration-token> \
   -v ares-agent-data:/data \
   --restart unless-stopped \
-  assailai/ares-agent:<version>
+  docker.io/assailai/ares-agent:<version>
 ```
 
 Watch it enroll and come online:
@@ -460,7 +460,7 @@ holds the agent's identity, so an upgrade is a pull and re-create on the new tag
 
 ```bash
 docker rm -f ares-agent
-docker pull assailai/ares-agent:<new-version>
+docker pull docker.io/assailai/ares-agent:<new-version>
 # re-run the docker run command from Getting started with the new tag (the volume is reused)
 ```
 
@@ -498,6 +498,9 @@ platform access, verifies the target image's signature, and applies it:
   of the Docker socket. Without it the updater cannot start, and the agent stays on the version it
   was installed at. Rootful Podman also needs `podman-restart.service` enabled for the agent to
   come back after a reboot, which the installer does as well.
+- **Image names are fully qualified** (`docker.io/assailai/...`). RHEL's Podman enforces short-name
+  resolution: a bare `assailai/ares-agent` stops at an interactive "which registry?" prompt, and
+  with no terminal to answer it (Ansible, cloud-init, a command over ssh) the install fails.
 
 Notes:
 
@@ -509,8 +512,8 @@ Notes:
   need it installed locally):
 
   ```bash
-  docker run --rm --entrypoint cosign assailai/ares-updater:3.3.3 \
-    verify assailai/ares-agent:3.3.3 \
+  docker run --rm --entrypoint cosign docker.io/assailai/ares-updater:3.3.3 \
+    verify docker.io/assailai/ares-agent:3.3.3 \
     --certificate-identity-regexp '^https://github\.com/assailai/docker-agent-ares/\.github/workflows/docker-build\.yml@refs/(heads/main|tags/v.*)$' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```

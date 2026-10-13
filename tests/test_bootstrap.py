@@ -504,6 +504,16 @@ def test_the_updater_may_use_the_engine_socket_under_selinux() -> None:
     assert "      - label=disable" in COMPOSE.read_text()
 
 
+def test_every_install_path_names_its_images_fully_qualified() -> None:
+    # RHEL's Podman (and OpenShift's CRI-O) enforce short-name resolution: "assailai/ares-agent"
+    # stops at an interactive registry prompt and, with no terminal, fails the install outright.
+    for path in (BOOTSTRAP, COMPOSE, K8S):
+        # an image reference is followed by its tag; the GitHub script URLs are followed by "/"
+        refs = re.findall(r"(?:docker\.io/)?assailai/ares-(?:agent|updater)(?=:)", path.read_text())
+        assert refs, f"{path.name} names no agent image"
+        assert all(ref.startswith("docker.io/") for ref in refs), f"{path.name}: {refs}"
+
+
 def test_every_install_path_pins_the_release_being_cut() -> None:
     # 3.10.0 and 3.11.0 were cut without moving these, so the installer fetched from the v3.11.0
     # tag installed 3.9.0 and left the catch-up to the updater, which is the one part that may not

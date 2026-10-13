@@ -244,6 +244,39 @@ def test_docker_apply_carries_only_the_operator_owned_config(
         assert key not in body, f"{key} must come from the new image, not the old container"
 
 
+@pytest.mark.parametrize("reported", [0, -1, None])
+def test_docker_apply_does_not_replay_an_unset_swappiness(
+    monkeypatch: pytest.MonkeyPatch, reported: int | None
+) -> None:
+    # given Podman's inspect of a container that never set a swappiness (it reports 0; Docker
+    # reports null or -1), on a cgroup v2 host where crun refuses any explicit value
+    host_config = {**_OLD_CONTAINER["HostConfig"], "MemorySwappiness": reported}
+    old = {**_OLD_CONTAINER, "HostConfig": host_config}
+
+    # when the updater re-creates the agent from it
+    body = _apply_capturing_create_body(
+        monkeypatch, old_container=old, image_response=httpx.Response(200, json={"Config": {}})
+    )
+
+    # then the swappiness is left unset, and everything else the operator set is carried over
+    assert "MemorySwappiness" not in body["HostConfig"]
+    assert body["HostConfig"]["Binds"] == _OLD_CONTAINER["HostConfig"]["Binds"]
+    assert body["HostConfig"]["RestartPolicy"] == {"Name": "always"}
+
+
+def test_docker_apply_keeps_a_swappiness_the_operator_actually_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host_config = {**_OLD_CONTAINER["HostConfig"], "MemorySwappiness": 10}
+    old = {**_OLD_CONTAINER, "HostConfig": host_config}
+
+    body = _apply_capturing_create_body(
+        monkeypatch, old_container=old, image_response=httpx.Response(200, json={"Config": {}})
+    )
+
+    assert body["HostConfig"]["MemorySwappiness"] == 10
+
+
 def test_docker_apply_drops_labels_when_the_old_image_is_unreadable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
