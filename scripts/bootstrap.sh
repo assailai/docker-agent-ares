@@ -437,6 +437,13 @@ wait_until_online() {
                 info "The agent is online."; return 0 ;;
             *"Registration token rejected"*)
                 printf "\n"; error "The registration token was rejected (expired or already used). Generate a fresh one in the dashboard."; exit 1 ;;
+            # Ares answered and said no to something in the request, most often an ARES_NETWORKS
+            # entry that is not a CIDR. The token is still unspent, so fixing it and re-running works.
+            *"Ares refused the registration"*)
+                printf "\n"
+                error "$(printf '%s\n' "$logs" | grep "Ares refused the registration" | tail -n 1)"
+                error "Fix the setting it names and re-run this installer with the same token."
+                exit 1 ;;
             *"Refusing to start"*)
                 printf "\n"; error "The agent refused to start. Recent logs:"; "$RUNTIME" logs --tail 20 "$CONTAINER_NAME" 2>&1; exit 1 ;;
         esac

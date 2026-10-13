@@ -64,6 +64,12 @@ _FD_RESERVE = 256
 # floor so a tiny fd budget still leaves the scanner usable.
 _MIN_CONCURRENCY = 64
 _REGISTER_RETRY_SECONDS = 10
+# added to a refused registration that names internal_networks, which operators only know by the
+# setting that fills it.
+_NETWORKS_HINT = (
+    " internal_networks is ARES_NETWORKS: set it to CIDRs such as 10.0.0.0/24 (not network or"
+    " interface names), or unset it to auto-detect, then restart the agent."
+)
 # Consecutive 401s on the heartbeat before we attempt to re-enroll. A single 401 can be a
 # momentary blip (a load balancer mid-rollover); a streak means the stored agent token was
 # rejected for real (stale kept-volume creds or a decommissioned agent). The re-enroll it
@@ -258,6 +264,36 @@ def _reason(exc: BaseException) -> str:
     nothing after it, which is the one moment an operator needs the reason (ARES-1725). The type
     name says it when the message does not."""
     return str(exc) or type(exc).__name__
+
+
+def _refusal(exc: BaseException) -> str | None:
+    """Why Ares turned a request down, when it answered with a 4xx; None for anything else.
+
+    Keeps only each error's field and message. A 422 also echoes the submitted value, which for
+    the registration token is the secret itself, so that part never reaches the log.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError) or not 400 <= exc.response.status_code < 500:
+        return None
+    try:
+        detail = exc.response.json().get("detail")
+    except (ValueError, AttributeError):
+        detail = None
+    if isinstance(detail, str):
+        reason = detail
+    elif isinstance(detail, list):
+        reason = "; ".join(_field_error(item) for item in detail if isinstance(item, dict))
+    else:
+        reason = ""
+    status = f"HTTP {exc.response.status_code}"
+    return f"{status}: {reason[:300]}" if reason else status
+
+
+def _field_error(item: dict) -> str:
+    """One entry of a 422's ``detail`` as ``field: message``, leaving out the submitted value."""
+    loc = item.get("loc")
+    field = ".".join(str(p) for p in loc if p != "body") if isinstance(loc, list) else ""
+    message = str(item.get("msg") or "invalid")
+    return f"{field}: {message}" if field else message
 
 
 def _log_repeated_failure(what: str, failures: int, exc: Exception) -> None:
@@ -1042,13 +1078,25 @@ async def _register_with_retries(state: AgentState, networks: list[str]) -> Agen
         except control_plane.RegistrationRejected:
             return None
         except (httpx.HTTPError, OSError) as exc:
-            logger.error(
-                "Cannot reach Ares at %s: %s.%s Retrying in %ds.",
-                settings.base_url,
-                _reason(exc),
-                _tls_hint(exc),
-                _REGISTER_RETRY_SECONDS,
-            )
+            refused = _refusal(exc)
+            if refused is not None:
+                # Ares answered, so this is a setting to fix, not a network to open. Still retried:
+                # a refusal caused on the server side clears without anyone touching this host.
+                # scripts/bootstrap.sh greps "Ares refused the registration" to fail the install.
+                logger.error(
+                    "Ares refused the registration (%s).%s Retrying in %ds.",
+                    refused,
+                    _NETWORKS_HINT if "internal_networks" in refused else "",
+                    _REGISTER_RETRY_SECONDS,
+                )
+            else:
+                logger.error(
+                    "Cannot reach Ares at %s: %s.%s Retrying in %ds.",
+                    settings.base_url,
+                    _reason(exc),
+                    _tls_hint(exc),
+                    _REGISTER_RETRY_SECONDS,
+                )
             await asyncio.sleep(_REGISTER_RETRY_SECONDS)
 
 

@@ -533,3 +533,67 @@ def test_every_install_path_pins_the_release_being_cut() -> None:
         assert set(found) == {expected}, (
             f"{path} pins {found}, but agent/__version__.py is {expected}"
         )
+
+
+# ── A refused registration ──────────────────────────────────────────────────────────────────────
+#
+# Ares answering a 4xx used to read as "Cannot reach Ares" in the agent's log, and the installer
+# waited out its whole timeout on it. A prod agent with ARES_NETWORKS set to docker network names
+# did exactly that, while Ares was perfectly reachable.
+
+_REFUSED = (
+    "ERROR Ares refused the registration (HTTP 422: internal_networks: Value error, none of"
+    " internal_networks is a CIDR / IP network). internal_networks is ARES_NETWORKS: set it to"
+    " CIDRs such as 10.0.0.0/24. Retrying in 10s."
+)
+
+
+def _wait_until_online(logs: str) -> subprocess.CompletedProcess[str]:
+    """Run wait_until_online against a stub engine whose running container has logged ``logs``."""
+    script = f"""
+set -euo pipefail
+step() {{ :; }}
+info() {{ echo "INFO $1"; }}
+warn() {{ echo "WARN $1"; }}
+error() {{ echo "ERROR $1"; }}
+sleep() {{ :; }}
+engine() {{
+    case "$1" in
+        inspect) echo running ;;
+        logs) printf '%s\\n' "$LOGS" ;;
+    esac
+}}
+RUNTIME=engine
+CONTAINER_NAME=ares-agent
+ONLINE_TIMEOUT=2
+ONLINE_INTERVAL=1
+{_function("wait_until_online")}
+wait_until_online
+echo "RETURNED"
+"""
+    env = {"PATH": "/usr/bin:/bin", "LOGS": logs}
+    return subprocess.run([BASH, "-c", script], capture_output=True, text=True, env=env, timeout=30)
+
+
+def test_a_refused_registration_fails_the_install_with_the_reason() -> None:
+    # given an agent whose registration Ares refused; when the installer waits for it
+    done = _wait_until_online(f"Registering with https://ares.example (networks=x)\n{_REFUSED}")
+
+    # then it stops at once, non-zero, and shows the agent's own line, which names what to fix
+    assert done.returncode == 1, done.stdout
+    assert "RETURNED" not in done.stdout
+    assert "Ares refused the registration (HTTP 422: internal_networks" in done.stdout
+    assert "re-run this installer with the same token" in done.stdout
+
+
+def test_a_refusal_that_cleared_before_the_agent_came_online_is_a_success() -> None:
+    # a refusal fixed on the Ares side mid-install leaves both lines in the log; the agent is online
+    done = _wait_until_online(f"{_REFUSED}\nAgent online as agent-1")
+
+    assert done.returncode == 0, done.stdout
+    assert "INFO The agent is online." in done.stdout
+
+
+def test_the_installer_greps_the_words_the_agent_logs() -> None:
+    # two files, one phrase: a reworded log line would silently turn the fail-fast back off
+    assert '"Ares refused the registration (%s).' in (_REPO / "agent" / "main.py").read_text()
