@@ -32,11 +32,11 @@ set -euo pipefail
 # Fully qualified (docker.io/...): RHEL's Podman enforces short-name resolution, so a bare
 # assailai/ares-agent stops at an interactive "which registry?" prompt, and with no terminal to
 # answer it (Ansible, cloud-init, ssh with a command) the install simply fails. ARES-1725.
-IMAGE="${ARES_IMAGE:-docker.io/assailai/ares-agent:${ARES_VERSION:-3.12.0}}"
+IMAGE="${ARES_IMAGE:-docker.io/assailai/ares-agent:${ARES_VERSION:-3.12.1}}"
 # The companion updater keeps the agent on the release the dashboard marks current; it is the only
 # component that touches the Docker socket (the agent stays unprivileged). Set ARES_DISABLE_AUTOUPDATE
 # to opt out (change-control-sensitive hosts). Override the image with ARES_UPDATER_IMAGE=<full ref>.
-UPDATER_IMAGE="${ARES_UPDATER_IMAGE:-docker.io/assailai/ares-updater:${ARES_VERSION:-3.12.0}}"
+UPDATER_IMAGE="${ARES_UPDATER_IMAGE:-docker.io/assailai/ares-updater:${ARES_VERSION:-3.12.1}}"
 CONTAINER_NAME="ares-agent"
 UPDATER_CONTAINER_NAME="ares-updater"
 VOLUME_NAME="ares-agent-data"
@@ -437,6 +437,13 @@ wait_until_online() {
                 info "The agent is online."; return 0 ;;
             *"Registration token rejected"*)
                 printf "\n"; error "The registration token was rejected (expired or already used). Generate a fresh one in the dashboard."; exit 1 ;;
+            # Ares answered and said no to something in the request, most often an ARES_NETWORKS
+            # entry that is not a CIDR. The token is still unspent, so fixing it and re-running works.
+            *"Ares refused the registration"*)
+                printf "\n"
+                error "$(printf '%s\n' "$logs" | grep "Ares refused the registration" | tail -n 1)"
+                error "Fix the setting it names and re-run this installer with the same token."
+                exit 1 ;;
             *"Refusing to start"*)
                 printf "\n"; error "The agent refused to start. Recent logs:"; "$RUNTIME" logs --tail 20 "$CONTAINER_NAME" 2>&1; exit 1 ;;
         esac

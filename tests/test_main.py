@@ -1081,6 +1081,74 @@ async def test_an_unreachable_ares_retries_instead_of_settling_for_the_old_ident
     assert len(attempts) == 3
 
 
+def _register_answer(status: int, **body: object) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "http://ares.example/api/v1/agent/register")
+    response = httpx.Response(status, request=request, **body)
+    return httpx.HTTPStatusError(str(status), request=request, response=response)
+
+
+@pytest.mark.usefixtures("_instant_loop")
+async def test_a_refused_registration_names_the_field_and_never_the_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # given ARES_NETWORKS set to docker network names, which Ares answers with a 422; when the
+    # agent registers; then the log says Ares refused it and why, rather than "Cannot reach Ares",
+    # and the submitted values (the token among them, when it is the field at fault) stay out.
+    monkeypatch.setattr(main.settings, "data_dir", tmp_path)
+    refusal = _register_answer(
+        422,
+        json={
+            "detail": [
+                {
+                    "type": "value_error",
+                    "loc": ["body", "internal_networks"],
+                    "msg": "Value error, none of internal_networks is a CIDR / IP network",
+                    "input": ["campaign-range_targets"],
+                },
+                {"loc": ["body", "registration_token"], "msg": "bad", "input": "ares_agt_secret"},
+            ]
+        },
+    )
+    enrolled = AgentState("agent-1", "agtk-1")
+    answers: list[AgentState | Exception] = [refusal, enrolled]
+
+    async def _register(_state: AgentState, _networks: list[str]) -> AgentState:
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(main, "_register", _register)
+
+    with caplog.at_level(logging.INFO, logger="ares.agent"):
+        state = await main._register_with_retries(AgentState(), ["campaign-range_targets"])
+
+    assert state is enrolled  # still retried, and the next attempt enrolls
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert (
+        "Ares refused the registration (HTTP 422: internal_networks: Value error, none of "
+        "internal_networks is a CIDR / IP network; registration_token: bad)"
+    ) in logged
+    assert "ARES_NETWORKS" in logged
+    assert "Cannot reach Ares" not in logged
+    assert "ares_agt_secret" not in logged
+    assert "campaign-range_targets" not in logged
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (_register_answer(400, json={"detail": "Agent exists"}), "HTTP 400: Agent exists"),
+        (_register_answer(403, text="<html>blocked by proxy</html>"), "HTTP 403"),
+        (_register_answer(500, json={"detail": "Internal server error"}), None),
+        (httpx.ConnectError("no route to host"), None),
+    ],
+)
+def test_only_a_4xx_reads_as_a_refusal(exc: Exception, expected: str | None) -> None:
+    # a 5xx or a dead network still means "cannot reach Ares"; a 4xx means it answered and said no.
+    assert main._refusal(exc) == expected
+
+
 async def test_a_first_install_still_enrolls_and_still_reports_a_rejected_token(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
