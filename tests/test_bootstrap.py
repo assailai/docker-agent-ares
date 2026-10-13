@@ -317,7 +317,7 @@ ENGINE_SOCK=/var/run/docker.sock
 CONTAINER_NAME=ares-agent
 UPDATER_CONTAINER_NAME=ares-updater
 VOLUME_NAME=ares-agent-data
-UPDATER_IMAGE=assailai/ares-updater:3.12.0
+UPDATER_IMAGE=docker.io/assailai/ares-updater:3.12.0
 UPDATER_SETTLE_SECONDS=0
 AUTOUPDATE_FAILED=false
 AUTOUPDATE_REASON=""
@@ -403,14 +403,14 @@ def test_rootful_podman_without_a_socket_is_told_to_enable_podman_socket(short_t
 
 def test_an_image_that_cannot_be_pulled_gets_pull_advice_not_socket_advice(short_tmp: Path) -> None:
     run_out = (
-        "Error: initializing source docker://assailai/ares-updater:3.12.0: reading manifest "
+        "Error: initializing source docker://docker.io/assailai/ares-updater:3.12.0: reading manifest "
         "3.12.0 in docker.io/assailai/ares-updater: toomanyrequests: too many requests"
     )
     run = _start_updater(short_tmp, run_rc=125, run_out=run_out, is_podman=True, uid=0)
 
     errors = _error_lines(run)
     assert run.status == 3
-    assert any("pull assailai/ares-updater:3.12.0" in e for e in errors)
+    assert any("pull docker.io/assailai/ares-updater:3.12.0" in e for e in errors)
     assert not any("podman.socket" in e for e in errors)
 
 

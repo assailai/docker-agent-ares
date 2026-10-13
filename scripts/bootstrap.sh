@@ -224,7 +224,8 @@ reset_state() {
     step "Discarding the stored agent identity (ARES_RESET)"
     # Both containers first: the updater mounts the same volume read-only, and the engine refuses
     # to remove a volume any container still references, however stopped it is.
-    "$RUNTIME" rm -f "$CONTAINER_NAME" "$UPDATER_CONTAINER_NAME" >/dev/null 2>&1 || true
+    # ...and the updater's half-made replacement, if a failed swap left one: it mounts the volume too.
+    "$RUNTIME" rm -f "$CONTAINER_NAME" "$UPDATER_CONTAINER_NAME" "${CONTAINER_NAME}-next" >/dev/null 2>&1 || true
     if ! "$RUNTIME" volume inspect "$VOLUME_NAME" >/dev/null 2>&1; then
         info "There was no '${VOLUME_NAME}' volume; this host enrolls from scratch anyway."
         return 0
@@ -271,6 +272,9 @@ host_ca_dir() {
 start_container() {
     step "Starting the agent"
     replace_existing "$CONTAINER_NAME"
+    # A replacement an older updater created and could not start (Podman on cgroup v2) carries
+    # restart=always, so podman-restart would try it at boot beside the agent. Never wanted here.
+    "$RUNTIME" rm -f "${CONTAINER_NAME}-next" >/dev/null 2>&1 || true
 
     local run_args=(-d --name "$CONTAINER_NAME" -e "ARES_TOKEN=$TOKEN")
 

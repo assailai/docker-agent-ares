@@ -501,6 +501,8 @@ platform access, verifies the target image's signature, and applies it:
 - **Image names are fully qualified** (`docker.io/assailai/...`). RHEL's Podman enforces short-name
   resolution: a bare `assailai/ares-agent` stops at an interactive "which registry?" prompt, and
   with no terminal to answer it (Ansible, cloud-init, a command over ssh) the install fails.
+  Pulling from an internal registry instead? Set `ARES_IMAGE` and `ARES_UPDATER_IMAGE` to its full
+  references; a `docker load`ed offline bundle needs nothing, since it is tagged `docker.io/...`.
 
 Notes:
 

@@ -54,10 +54,18 @@ class DockerBackend:
                 "Image": image_ref,
                 "HostConfig": _replayable_host_config(attrs["HostConfig"]),
             }
-            created = docker.post("/containers/create", params={"name": next_name}, json=body)
-            created.raise_for_status()
-            cid = created.json()["Id"]
-            docker.post(f"/containers/{cid}/start").raise_for_status()
+            try:
+                created = docker.post("/containers/create", params={"name": next_name}, json=body)
+                created.raise_for_status()
+                cid = created.json()["Id"]
+                docker.post(f"/containers/{cid}/start").raise_for_status()
+            except httpx.HTTPError:
+                # Never leave the replacement behind. A created-but-unstarted one keeps the data
+                # volume in use (so an ARES_RESET install cannot remove it) and carries the old
+                # restart=always, so podman-restart would try it at every boot: a second agent, the
+                # day some future failure leaves one that does start.
+                docker.delete(f"/containers/{next_name}", params={"force": "true"})
+                raise
 
             if not _stays_up(docker, cid):
                 logger.error("replacement did not stay up; aborting, the old agent keeps running")
@@ -83,6 +91,12 @@ def _replayable_host_config(host_config: dict) -> dict:
     config = dict(host_config)
     if config.get("MemorySwappiness") in (None, 0, -1):
         config.pop("MemorySwappiness", None)
+    # A CPU limit (--cpus=N) comes back from Podman three ways at once: CpuPeriod, CpuQuota, and
+    # NanoCpus derived from them. Podman's compat create refuses NanoCpus beside the other two
+    # ("NanoCpus conflicts with CpuPeriod and CpuQuota"), so an agent run with a CPU limit failed
+    # every update. Period and quota are the exact original; Docker never reports all three.
+    if config.get("NanoCpus") and (config.get("CpuPeriod") or config.get("CpuQuota")):
+        config.pop("NanoCpus")
     return config
 
 
