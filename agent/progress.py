@@ -5,16 +5,10 @@ The scanner calls its progress callback once per percentage point it advances, f
 time out at the same instant, so every point the chunk is worth arrives at once: up to 90 posts
 for one task within a millisecond, each one awaited inside the gather it was reported from.
 
-On 2026-10-14 that was most of an outage (ARES-1743). The control plane handles a task's posts one
-at a time, because each one takes that task's row lock, and on a 20,000-task discovery operation
-each post also cost a few hundred milliseconds. A burst of 90 queued for 40 seconds, parked most of
-the API's database connections in lock waits, and held the scan up the whole time, since every
-gather branch waited for its own post.
-
-So a percentage is a value to keep current, not an event to deliver. :class:`ProgressReporter`
-keeps the latest one, sends at most one post at a time, and leaves at least ``min_interval``
-between posts; nothing the scanner calls ever waits on the network. Posts that carry discovered
-hosts or naming evidence do not go through here: they are data, and each one is sent as it comes.
+The control plane takes a task's posts one at a time on that task's row lock, so on 2026-10-14 a
+burst of 90 queued for 40 seconds and stalled the scan behind it (ARES-1743). Only the latest
+percentage matters, so :class:`ProgressReporter` keeps that, sends one post at a time and spaces
+them ``min_interval`` apart. Posts carrying hosts or naming evidence do not go through here.
 """
 
 from __future__ import annotations
@@ -66,10 +60,10 @@ class ProgressReporter:
     async def close(self) -> None:
         """Drop whatever has not been sent, and stop a post in flight.
 
-        Called when the scan is over, because what comes next settles the task's progress on the
-        server whatever it was: a completion or a failure pins it at 100, and a task handed back
-        after a pause starts again from nothing. A last percentage sent first would be overwritten
-        a moment later, after holding the task up for a round trip.
+        Called once the task is over. The report that settled it already set its progress on the
+        server (a completion or a failure pins it at 100, a hand-back after a pause clears it), and
+        the server ignores a progress post for a task that is no longer running, so a percentage
+        still waiting here is worth nothing.
         """
         self._pending = None
         if self._sender is not None and not self._sender.done():
@@ -79,15 +73,19 @@ class ProgressReporter:
 
     async def _drain(self) -> None:
         while self._pending is not None:
-            if self._last_sent_at is not None:
-                wait = self._last_sent_at + self._min_interval - self._clock()
-                if wait > 0:
-                    await self._sleep(wait)
+            await self._wait_out_interval()
             percent, self._pending = self._pending, None
-            if percent is None:
+            if percent is None:  # close() dropped it while this was waiting
                 return
             self._last_sent_at = self._clock()
             try:
                 await self._send(percent)
             except Exception as exc:  # noqa: BLE001 - one lost post must not stop the next
                 logger.debug("progress post failed: %s", exc)
+
+    async def _wait_out_interval(self) -> None:
+        if self._last_sent_at is None:
+            return
+        remaining = self._last_sent_at + self._min_interval - self._clock()
+        if remaining > 0:
+            await self._sleep(remaining)

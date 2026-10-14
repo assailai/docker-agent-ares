@@ -87,10 +87,7 @@ class Settings(BaseSettings):
     scan_chunk_prefix: int = 24
     # safety ceiling on hosts scanned per task; truncation beyond this is logged, never silent.
     scan_max_hosts: int = 262_144
-    # least time (seconds) between two percent-only progress posts for one task. The latest
-    # percentage is kept and sent when it is up, so a /24 whose dead hosts time out together costs
-    # one post rather than one per percentage point (see agent.progress, ARES-1743). Posts carrying
-    # hosts or naming evidence are never held back by this.
+    # least time (seconds) between two percent-only progress posts for one task (agent.progress).
     progress_min_interval: float = 2.0
 
     # After the port sweep, ask each live host what it is called (reverse DNS, the host file, the

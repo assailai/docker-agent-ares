@@ -833,8 +833,6 @@ async def _run_task(token: str, task: dict) -> None:
                 )
             )
         )
-        # before the report that settles the task, which sets its progress whatever this was
-        await percentages.close()
         if hosts is None:
             logger.warning("Paused mid-scan of %s; handing task %s back.", cidr, task_id)
             await _hand_back(token, task_id)
@@ -855,7 +853,8 @@ async def _run_task(token: str, task: dict) -> None:
         # nothing awaits the read when the scan finds nothing live; it must not outlive the task
         if inventory is not None:
             inventory.cancel()
-        # nor a progress post, when the scan raised before the close above
+        # nor a percentage still waiting to be sent: the report that settled the task set its
+        # progress, and the server ignores a progress post for a task that is no longer running
         await percentages.close()
 
 
