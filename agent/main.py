@@ -29,6 +29,7 @@ from agent.health.system_metrics import read_cpu_percent, read_memory_percent
 from agent.hostpins import HostPins
 from agent.identify import IdentityProbe
 from agent.kubeinfo import KubeApi, KubeConfigError, KubernetesEvidence, safe_collect
+from agent.progress import ProgressReporter
 from agent.state import AgentState, fingerprint, load_state, save_state
 from agent.tunnel import (
     TunnelManager,
@@ -794,10 +795,14 @@ async def _run_task(token: str, task: dict) -> None:
         except Exception as exc:  # noqa: BLE001 - a dropped progress post is not fatal
             logger.debug("progress report for task %s failed: %s", task_id, exc)
 
+    # a bare percentage is coalesced rather than posted per point: a /24 whose dead hosts time out
+    # together reports every point at once, which was 90 posts for one task (see agent.progress).
+    percentages = ProgressReporter(_report, min_interval=settings.progress_min_interval)
+
     async def _on_progress(percent: int) -> None:
         nonlocal last_pct
         last_pct = percent
-        await _report(percent)
+        percentages.update(percent)
 
     async def _on_hosts(chunk: list[dict]) -> None:
         await _report(last_pct, chunk)
@@ -848,6 +853,9 @@ async def _run_task(token: str, task: dict) -> None:
         # nothing awaits the read when the scan finds nothing live; it must not outlive the task
         if inventory is not None:
             inventory.cancel()
+        # nor a percentage still waiting to be sent: the report that settled the task set its
+        # progress, and the server ignores a progress post for a task that is no longer running
+        await percentages.close()
 
 
 def _detection_scope() -> str:
