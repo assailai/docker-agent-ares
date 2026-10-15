@@ -253,6 +253,8 @@ async def test_the_probe_keeps_many_subnets_in_flight_at_once(monkeypatch) -> No
 
 # --- a box answering for every address (ARES-1878) -----------------------------------------------
 
+FakeNetwork = Callable[..., list[str]]
+
 
 def _proxy(*ports: int) -> Rule:
     """A transparent proxy in front of 10.20.0.0/16: it completes the handshake on ``ports`` at
@@ -267,52 +269,81 @@ def _proxy(*ports: int) -> Rule:
     return rule
 
 
-async def test_a_range_a_proxy_answers_for_is_not_advertised(_fake_network, caplog) -> None:
-    """The ARES-1878 field case: the proxy took 80 everywhere, so .1 and .254 of every /24
-    "answered", every /16 earned the dense pass, and the agent advertised all of private space.
-    Addresses picked at random accept just as readily, so the answers prove no network."""
+def _behind_proxy(ip: str, port: int, answer: reachability.Answer) -> Rule:
+    """The port-80 proxy, plus one real machine behind it answering ``port`` with ``answer``."""
+    proxy = _proxy(80)
+
+    def rule(address: str, probed: int) -> reachability.Answer | None:
+        if (address, probed) == (ip, port):
+            return answer
+        return proxy(address, probed)
+
+    return rule
+
+
+async def test_a_range_a_proxy_answers_for_is_not_advertised(
+    _fake_network: FakeNetwork, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The field case: three agents scoped to one /16 each advertised most of private space."""
+    # given a proxy taking port 80 at every address of 10.20.0.0/16 and nothing behind it
     _fake_network(set(), rule=_proxy(80))
 
+    # when the agent probes the range
     with caplog.at_level(logging.WARNING, logger="ares.agent.reachability"):
         found = await reachability.probe_private_space(spaces=["10.20.0.0/16"])
 
+    # then none of it is advertised, and the warning says how much was skipped and on which port
     assert found == []
     assert "ignored 256 network(s)" in caplog.text
     assert "port(s) 80 " in caplog.text
 
 
-async def test_a_host_behind_the_proxy_still_puts_its_network_on_the_map(_fake_network) -> None:
-    """A gateway with SSH open shows a port the proxy does not fake, so its /24 counts."""
-    _fake_network(set(), rule=lambda ip, port: (
-        reachability.Answer.ACCEPTED if ip == "10.20.5.1" and port == 22 else _proxy(80)(ip, port)
-    ))
+async def test_a_host_behind_the_proxy_still_puts_its_network_on_the_map(
+    _fake_network: FakeNetwork,
+) -> None:
+    # given a gateway at 10.20.5.1 with SSH open, which the proxy does not fake
+    _fake_network(set(), rule=_behind_proxy("10.20.5.1", 22, reachability.Answer.ACCEPTED))
 
-    assert await reachability.probe_private_space(spaces=["10.20.0.0/16"]) == ["10.20.5.0/24"]
+    # when the agent probes the range
+    found = await reachability.probe_private_space(spaces=["10.20.0.0/16"])
 
-
-async def test_a_reset_behind_the_proxy_still_counts(_fake_network) -> None:
-    """A proxy completes handshakes; it does not refuse them. A reset is a stack that got the
-    packet, behind a proxy or not."""
-    _fake_network(set(), rule=lambda ip, port: (
-        reachability.Answer.REFUSED if ip == "10.20.5.254" and port == 443 else _proxy(80)(ip, port)
-    ))
-
-    assert await reachability.probe_private_space(spaces=["10.20.0.0/16"]) == ["10.20.5.0/24"]
+    # then that /24 is advertised and every other one stays hidden behind the proxy
+    assert found == ["10.20.5.0/24"]
 
 
-async def test_a_real_host_that_only_accepts_is_not_mistaken_for_the_box(_fake_network) -> None:
-    """The ordinary case: .1 accepts and nothing else in the /24 is there, so the random
-    addresses are silent and the answer stands."""
+async def test_a_reset_behind_the_proxy_still_counts(_fake_network: FakeNetwork) -> None:
+    # given a machine at 10.20.5.254 that resets 443: a proxy completes handshakes, it never
+    # refuses one, so the reset can only come from a real stack
+    _fake_network(set(), rule=_behind_proxy("10.20.5.254", 443, reachability.Answer.REFUSED))
+
+    # when the agent probes the range
+    found = await reachability.probe_private_space(spaces=["10.20.0.0/16"])
+
+    # then the reset alone is enough for its /24
+    assert found == ["10.20.5.0/24"]
+
+
+async def test_a_real_host_that_only_accepts_is_not_mistaken_for_the_box(
+    _fake_network: FakeNetwork,
+) -> None:
+    # given an ordinary network: .1 accepts and nothing else in its /24 is there
     _fake_network({"10.20.5.1"})
 
-    assert await reachability.probe_private_space(spaces=["10.20.0.0/16"]) == ["10.20.5.0/24"]
+    # when the agent probes, the addresses picked at random stay silent
+    found = await reachability.probe_private_space(spaces=["10.20.0.0/16"])
+
+    # then the accept stands as evidence
+    assert found == ["10.20.5.0/24"]
 
 
-def test_canaries_are_drawn_from_the_middle_of_the_24_and_never_resample() -> None:
+def test_canaries_never_land_on_an_address_the_probe_already_sampled() -> None:
     net = ipaddress.ip_network("10.20.5.0/24")
-    for octets in (reachability.SPARSE_OCTETS, reachability.DENSE_OCTETS):
-        canaries = reachability._canary_addresses(net, avoid=octets)
-        drawn = [int(ip.rsplit(".", 1)[1]) for ip in canaries]
-        assert len(set(drawn)) == reachability.CANARIES
-        assert all(2 <= octet <= 253 and octet not in octets for octet in drawn)
+    for sampled in (reachability.SPARSE_OCTETS, reachability.DENSE_OCTETS):
+        # when canaries are drawn after either stage's sample
+        canaries = reachability._canary_addresses(net, avoid=sampled)
+
+        # then they are distinct host addresses of the same /24, none of them resampled
+        octets = [int(ip.rsplit(".", 1)[1]) for ip in canaries]
+        assert len(set(octets)) == reachability.CANARIES
+        assert all(o in reachability._HOST_OCTETS and o not in sampled for o in octets)
         assert all(ip.startswith("10.20.5.") for ip in canaries)

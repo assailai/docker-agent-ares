@@ -92,23 +92,27 @@ DEFAULT_BUDGET_SECONDS = 600.0
 #: probe reaches across a customer's whole private space rather than one advertised network.
 DEFAULT_CONCURRENCY = 1024
 
-#: How many addresses picked at random a /24 is re-knocked at before an accepted connect counts.
-#: A box in front of a network can complete the handshake for every address in it, whether or not
-#: a machine is there: one customer's transparent proxy answered 80, 110, 3128 and 8080 at every
-#: address it fronted, so .1 and .254 "answered" in every /24 it covered and the agent advertised
-#: the whole of private space (ARES-1878). Three is enough for the false alarm to need three
-#: arbitrary addresses all to hold a live host listening on the same port.
+#: addresses picked at random that a /24 is re-knocked at before an accepted connect counts (see
+#: ``_Probe._alive``). With three, a real network is only mistaken for a box when three arbitrary
+#: addresses all hold a live host listening on the same port.
 CANARIES = 3
+
+#: the host octets of a /24 a canary may be drawn from: all but the network and broadcast
+#: addresses, which no host holds and a box may treat differently.
+_HOST_OCTETS = range(1, 255)
+
+#: how many of the networks it skipped the probe's warning names, so the line stays one line.
+_LOGGED_EXAMPLES = 5
 
 
 class Answer(StrEnum):
-    """What one connect attempt said about the address it was sent to."""
+    """What one connect attempt said about the address it was sent to. A reset means a stack got
+    the packet; silence (a timeout or an unreachable) means nothing at all."""
 
-    #: the handshake completed. A host listening there, or a box completing it on the host's behalf.
+    #: a host listening there, or a box completing the handshake on its behalf. Only this one can
+    #: be faked for an empty address.
     ACCEPTED = "accepted"
-    #: a reset. A stack received the packet, so the address is routed and something is there.
     REFUSED = "refused"
-    #: a timeout or an unreachable: no evidence of anything.
     SILENT = "silent"
 
 
@@ -271,11 +275,11 @@ def _sample_addresses(net: ipaddress.IPv4Network, octets: Iterable[int]) -> list
 def _canary_addresses(
     net: ipaddress.IPv4Network, *, avoid: Iterable[int], count: int = CANARIES
 ) -> list[str]:
-    """``count`` addresses of one /24 picked at random from .2 to .253, none of them one the probe
-    already sampled. Random rather than fixed, so no address a real network happens to use for a
-    server can make the check misfire in every /24 at once."""
+    """``count`` host addresses of one /24 picked at random, none of them one the probe already
+    sampled. Random rather than fixed, so no address a real network happens to use for a server
+    can make the check misfire in every /24 at once."""
     taken = set(avoid)
-    pool = [octet for octet in range(2, 254) if octet not in taken]
+    pool = [octet for octet in _HOST_OCTETS if octet not in taken]
     return _sample_addresses(net, random.sample(pool, min(count, len(pool))))
 
 
@@ -338,16 +342,23 @@ class _Probe:
         accepted = {port for port, answer in answers if answer is Answer.ACCEPTED}
         if not accepted:
             return False
-        canaries = await self._knock(_canary_addresses(net, avoid=octets), sorted(accepted))
-        faked = frozenset(
-            port
-            for port in accepted
-            if all(answer is Answer.ACCEPTED for p, answer in canaries if p == port)
-        )
+        faked = await self._faked(net, ports=accepted, avoid=octets)
         if accepted - faked:
             return True
         self.intercepted[net] = faked
         return False
+
+    async def _faked(
+        self, net: ipaddress.IPv4Network, *, ports: set[int], avoid: tuple[int, ...]
+    ) -> frozenset[int]:
+        """The ``ports`` that accept at every canary address of ``net`` as well: whatever answers
+        on them answers for addresses no host was picked for."""
+        canaries = await self._knock(_canary_addresses(net, avoid=avoid), sorted(ports))
+        return frozenset(
+            port
+            for port in ports
+            if all(answer is Answer.ACCEPTED for p, answer in canaries if p == port)
+        )
 
     async def live_subnets(
         self,
@@ -437,7 +448,8 @@ async def probe_private_space(
 
     alive = sorted(set(sparse_hits) | set(dense_hits))
     # a /24 a later stage found real evidence in is not one the box hid
-    ignored = {net: ports for net, ports in probe.intercepted.items() if net not in set(alive)}
+    found = set(alive)
+    ignored = {net: ports for net, ports in probe.intercepted.items() if net not in found}
     if ignored:
         logger.warning(
             "Reachability probe ignored %d network(s) where addresses picked at random accepted "
@@ -445,7 +457,7 @@ async def probe_private_space(
             "answers for addresses no host holds. First: %s. Set ARES_NETWORKS to scan them anyway.",
             len(ignored),
             ", ".join(str(p) for p in sorted(frozenset().union(*ignored.values()))),
-            ", ".join(str(n) for n in sorted(ignored)[:5]),
+            ", ".join(str(n) for n in sorted(ignored)[:_LOGGED_EXAMPLES]),
         )
     if probe.truncated:
         logger.warning(
