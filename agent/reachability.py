@@ -41,9 +41,11 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
+import random
 import subprocess
 import time
 from collections.abc import Iterable, Iterator
+from enum import StrEnum
 
 logger = logging.getLogger("ares.agent.reachability")
 
@@ -89,6 +91,29 @@ DEFAULT_BUDGET_SECONDS = 600.0
 #: Concurrent connects. The scan's own default is higher; this is deliberately below it because the
 #: probe reaches across a customer's whole private space rather than one advertised network.
 DEFAULT_CONCURRENCY = 1024
+
+#: addresses picked at random that a /24 is re-knocked at before an accepted connect counts (see
+#: ``_Probe._alive``). With three, a real network is only mistaken for a box when three arbitrary
+#: addresses all hold a live host listening on the same port.
+CANARIES = 3
+
+#: the host octets of a /24 a canary may be drawn from: all but the network and broadcast
+#: addresses, which no host holds and a box may treat differently.
+_HOST_OCTETS = range(1, 255)
+
+#: how many of the networks it skipped the probe's warning names, so the line stays one line.
+_LOGGED_EXAMPLES = 5
+
+
+class Answer(StrEnum):
+    """What one connect attempt said about the address it was sent to. A reset means a stack got
+    the packet; silence (a timeout or an unreachable) means nothing at all."""
+
+    #: a host listening there, or a box completing the handshake on its behalf. Only this one can
+    #: be faked for an empty address.
+    ACCEPTED = "accepted"
+    REFUSED = "refused"
+    SILENT = "silent"
 
 
 def _private_networks() -> list[ipaddress.IPv4Network]:
@@ -215,34 +240,47 @@ def kernel_reachable() -> list[str]:
 # ── active probe ─────────────────────────────────────────────────────────────────────────────
 
 
-async def _answers(ip: str, port: int, timeout: float) -> bool:
-    """Whether ``ip:port`` proves something is there.
+async def _answers(ip: str, port: int, timeout: float) -> Answer:
+    """What a connect to ``ip:port`` said.
 
-    A refusal counts. A host that RSTs is a host: it received the packet, so the address is routed
-    and something is listening on that segment even if not on that port. Only silence (a timeout or
-    an unreachable) is evidence of absence, which is the same classification ``agent.scan`` phase 1
-    makes and for the same reason.
+    A refusal counts as much as a connection. A host that RSTs is a host: it received the packet,
+    so the address is routed and something is listening on that segment even if not on that port.
+    Only silence (a timeout or an unreachable) is evidence of absence, which is the same
+    classification ``agent.scan`` phase 1 makes and for the same reason. The two kinds of answer
+    are kept apart because only an accepted connect can be faked for an empty address (see
+    :data:`CANARIES`).
     """
     try:
         _, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=timeout)
     except (asyncio.TimeoutError, TimeoutError):
-        return False
+        return Answer.SILENT
     except ConnectionRefusedError:
-        return True
+        return Answer.REFUSED
     except OSError:
-        return False
+        return Answer.SILENT
     try:
         writer.close()
         await writer.wait_closed()
     except OSError:
         pass
-    return True
+    return Answer.ACCEPTED
 
 
 def _sample_addresses(net: ipaddress.IPv4Network, octets: Iterable[int]) -> list[str]:
     """The addresses to try inside one /24, as ``x.y.z.<octet>``."""
     base = int(net.network_address)
     return [str(ipaddress.IPv4Address(base + octet)) for octet in octets]
+
+
+def _canary_addresses(
+    net: ipaddress.IPv4Network, *, avoid: Iterable[int], count: int = CANARIES
+) -> list[str]:
+    """``count`` host addresses of one /24 picked at random, none of them one the probe already
+    sampled. Random rather than fixed, so no address a real network happens to use for a server
+    can make the check misfire in every /24 at once."""
+    taken = set(avoid)
+    pool = [octet for octet in _HOST_OCTETS if octet not in taken]
+    return _sample_addresses(net, random.sample(pool, min(count, len(pool))))
 
 
 class _Probe:
@@ -255,6 +293,9 @@ class _Probe:
         self._timeout = timeout
         self._started = time.monotonic()
         self.truncated = False
+        #: the /24s that answered only on ports a box answers for at any address, with those
+        #: ports. Not advertised, and logged once at the end so the gap is explainable.
+        self.intercepted: dict[ipaddress.IPv4Network, frozenset[int]] = {}
 
     @property
     def _spent(self) -> bool:
@@ -263,9 +304,15 @@ class _Probe:
         self.truncated = True
         return True
 
-    async def _bounded(self, ip: str, port: int) -> bool:
+    async def _bounded(self, ip: str, port: int) -> Answer:
         async with self._semaphore:
             return await _answers(ip, port, self._timeout)
+
+    async def _knock(self, ips: list[str], ports: Iterable[int]) -> list[tuple[int, Answer]]:
+        """Every ``(port, answer)`` for these addresses on these ports, all at once."""
+        pairs = [(ip, port) for ip in ips for port in ports]
+        answers = await asyncio.gather(*(self._bounded(ip, port) for ip, port in pairs))
+        return [(port, answer) for (_, port), answer in zip(pairs, answers)]
 
     async def _alive(
         self,
@@ -273,21 +320,45 @@ class _Probe:
         octets: tuple[int, ...],
         ports: tuple[int, ...],
     ) -> bool:
-        """Whether anything in ``net`` answers on any sampled address/port.
+        """Whether anything in ``net`` answers on any sampled address/port, and the answer is
+        evidence of a network rather than of a box in front of one.
+
+        A refusal is always evidence: something received the packet. An accepted connect is
+        evidence only on a port that does not ALSO accept at addresses picked at random
+        (:data:`CANARIES`). A box completing the handshake on the hosts' behalf accepts at all of
+        them; a real segment, where most addresses hold nothing, leaves them silent. So a /24
+        behind such a box still counts the moment one address shows anything the box does not
+        fake: a reset, or a port it does not answer on.
 
         Every probe for one /24 is fired at once rather than sequentially with an early exit. The
         sequential version is cheaper on a LIVE /24 and much slower on a dead one, and dead /24s
         outnumber live ones by orders of magnitude here, so the concurrent shape is the one that
-        decides the runtime.
+        decides the runtime. The canaries cost nothing on a dead /24 and are skipped on any /24 a
+        refusal already settled.
         """
-        results = await asyncio.gather(
-            *(
-                self._bounded(ip, port)
-                for ip in _sample_addresses(net, octets)
-                for port in ports
-            )
+        answers = await self._knock(_sample_addresses(net, octets), ports)
+        if any(answer is Answer.REFUSED for _, answer in answers):
+            return True
+        accepted = {port for port, answer in answers if answer is Answer.ACCEPTED}
+        if not accepted:
+            return False
+        faked = await self._faked(net, ports=accepted, avoid=octets)
+        if accepted - faked:
+            return True
+        self.intercepted[net] = faked
+        return False
+
+    async def _faked(
+        self, net: ipaddress.IPv4Network, *, ports: set[int], avoid: tuple[int, ...]
+    ) -> frozenset[int]:
+        """The ``ports`` that accept at every canary address of ``net`` as well: whatever answers
+        on them answers for addresses no host was picked for."""
+        canaries = await self._knock(_canary_addresses(net, avoid=avoid), sorted(ports))
+        return frozenset(
+            port
+            for port in ports
+            if all(answer is Answer.ACCEPTED for p, answer in canaries if p == port)
         )
-        return any(results)
 
     async def live_subnets(
         self,
@@ -376,6 +447,18 @@ async def probe_private_space(
     )
 
     alive = sorted(set(sparse_hits) | set(dense_hits))
+    # a /24 a later stage found real evidence in is not one the box hid
+    found = set(alive)
+    ignored = {net: ports for net, ports in probe.intercepted.items() if net not in found}
+    if ignored:
+        logger.warning(
+            "Reachability probe ignored %d network(s) where addresses picked at random accepted "
+            "connections on port(s) %s as readily as the sampled ones: a device in front of them "
+            "answers for addresses no host holds. First: %s. Set ARES_NETWORKS to scan them anyway.",
+            len(ignored),
+            ", ".join(str(p) for p in sorted(frozenset().union(*ignored.values()))),
+            ", ".join(str(n) for n in sorted(ignored)[:_LOGGED_EXAMPLES]),
+        )
     if probe.truncated:
         logger.warning(
             "Reachability probe budget of %.0fs is spent; advertising the %d network(s) found so "
