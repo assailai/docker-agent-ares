@@ -1130,6 +1130,9 @@ async def test_a_refused_registration_names_the_field_and_never_the_token(
         "internal_networks is a CIDR / IP network; registration_token: bad)"
     ) in logged
     assert "ARES_NETWORKS" in logged
+    # the same instruction the installer prints next: a restart keeps the env the container has.
+    assert "re-run the installer with the same token" in logged
+    assert "restart the agent" not in logged
     assert "Cannot reach Ares" not in logged
     assert "ares_agt_secret" not in logged
     assert "campaign-range_targets" not in logged

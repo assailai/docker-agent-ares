@@ -65,10 +65,12 @@ _FD_RESERVE = 256
 _MIN_CONCURRENCY = 64
 _REGISTER_RETRY_SECONDS = 10
 # added to a refused registration that names internal_networks, which operators only know by the
-# setting that fills it.
+# setting that fills it. A restart keeps the env the container was created with, so the fix is a
+# re-run, matching what scripts/bootstrap.sh prints next.
 _NETWORKS_HINT = (
     " internal_networks is ARES_NETWORKS: set it to CIDRs such as 10.0.0.0/24 (not network or"
-    " interface names), or unset it to auto-detect, then restart the agent."
+    " interface names), or unset it to auto-detect, then re-run the installer with the same token"
+    " (on Kubernetes, update the Secret and restart the pod)."
 )
 # Consecutive 401s on the heartbeat before we attempt to re-enroll. A single 401 can be a
 # momentary blip (a load balancer mid-rollover); a streak means the stored agent token was
