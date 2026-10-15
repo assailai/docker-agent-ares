@@ -97,7 +97,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: ares-agent          # the patched container; ARES_UPDATE_CONTAINER matches this
-          image: docker.io/assailai/ares-agent:3.12.1   # pinned; the updater rolls this forward
+          image: docker.io/assailai/ares-agent:3.12.2   # pinned; the updater rolls this forward
           envFrom:
             - secretRef:
                 name: ares-agent
@@ -134,7 +134,7 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 3
         - name: ares-updater         # companion; keeps ares-agent on the marked version
-          image: docker.io/assailai/ares-updater:3.12.1
+          image: docker.io/assailai/ares-updater:3.12.2
           env:
             - name: ARES_UPDATE_CONTAINER
               value: "ares-agent"
