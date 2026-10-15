@@ -64,6 +64,7 @@ _FD_RESERVE = 256
 # floor so a tiny fd budget still leaves the scanner usable.
 _MIN_CONCURRENCY = 64
 _REGISTER_RETRY_SECONDS = 10
+_REFUSAL_MAX_CHARS = 300  # keeps one refusal to one log line, even when Ares lists every field
 # added to a refused registration that names internal_networks, which operators only know by the
 # setting that fills it. A restart keeps the env the container was created with, so the fix is a
 # re-run, matching what scripts/bootstrap.sh prints next.
@@ -288,7 +289,7 @@ def _refusal(exc: BaseException) -> str | None:
     else:
         reason = ""
     status = f"HTTP {exc.response.status_code}"
-    return f"{status}: {reason[:300]}" if reason else status
+    return f"{status}: {reason[:_REFUSAL_MAX_CHARS]}" if reason else status
 
 
 def _field_error(item: dict) -> str:
