@@ -1139,13 +1139,20 @@ async def test_a_refused_registration_names_the_field_and_never_the_token(
     ("exc", "expected"),
     [
         (_register_answer(400, json={"detail": "Agent exists"}), "HTTP 400: Agent exists"),
-        (_register_answer(403, text="<html>blocked by proxy</html>"), "HTTP 403"),
+        (
+            _register_answer(429, json={"detail": "Trial limit reached"}),
+            "HTTP 429: Trial limit reached",
+        ),
+        # a proxy or WAF answered, not Ares, so the fix is egress and "cannot reach" stays right.
+        (_register_answer(403, text="<html>blocked by proxy</html>"), None),
+        (_register_answer(407, text="Proxy Authentication Required"), None),
         (_register_answer(500, json={"detail": "Internal server error"}), None),
         (httpx.ConnectError("no route to host"), None),
     ],
 )
-def test_only_a_4xx_reads_as_a_refusal(exc: Exception, expected: str | None) -> None:
-    # a 5xx or a dead network still means "cannot reach Ares"; a 4xx means it answered and said no.
+def test_only_a_4xx_from_ares_reads_as_a_refusal(exc: Exception, expected: str | None) -> None:
+    # a 5xx, a dead network, or a 4xx without Ares's JSON `detail` still means "cannot reach Ares";
+    # a 4xx in Ares's own shape means it answered and said no.
     assert main._refusal(exc) == expected
 
 

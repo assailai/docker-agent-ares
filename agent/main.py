@@ -267,7 +267,8 @@ def _reason(exc: BaseException) -> str:
 
 
 def _refusal(exc: BaseException) -> str | None:
-    """Why Ares turned a request down, when it answered with a 4xx; None for anything else.
+    """Why Ares turned a request down, when it answered with a 4xx in its own shape (JSON with a
+    ``detail`` key); None for anything else, including a proxy's or a WAF's 4xx page.
 
     Keeps only each error's field and message. A 422 also echoes the submitted value, which for
     the registration token is the secret itself, so that part never reaches the log.
@@ -275,9 +276,9 @@ def _refusal(exc: BaseException) -> str | None:
     if not isinstance(exc, httpx.HTTPStatusError) or not 400 <= exc.response.status_code < 500:
         return None
     try:
-        detail = exc.response.json().get("detail")
-    except (ValueError, AttributeError):
-        detail = None
+        detail = exc.response.json()["detail"]
+    except (ValueError, KeyError, TypeError):
+        return None  # not Ares's answer (a proxy page, a WAF): keep the "cannot reach" path
     if isinstance(detail, str):
         reason = detail
     elif isinstance(detail, list):
