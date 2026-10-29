@@ -15,15 +15,33 @@ LABEL org.opencontainers.image.vendor="Assail AI"
 # static binary, so it runs on alpine, and is pinned to a release so builds are reproducible.
 # TARGETARCH is set by buildx per target platform (amd64 / arm64) and matches cosign's asset
 # naming, so one Dockerfile builds for both architectures.
+#
+# v3.1.4, not the last v2: scanned on 2026-10-29, v2.6.5 still carried 37 fixable High/Critical
+# findings in its Go dependencies and v3.1.4 none. Checked against verify.py before the move: the
+# same arguments verify the signatures CI produces, `--output json` keeps the shape
+# _verified_digest reads, and a wrong signer or an unsigned image is still refused.
+#
+# checked against the release's own cosign_checksums.txt before it is made executable: every
+# auto-update trusts this binary's answer, so it has to be the release we pinned and not just
+# whatever the URL served that day.
 ARG TARGETARCH
-ARG COSIGN_VERSION=v2.4.1
+ARG COSIGN_VERSION=v3.1.4
+ARG COSIGN_SHA256_AMD64=424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa
+ARG COSIGN_SHA256_ARM64=ade83b7aac62e131cacfe96d958948b2150cc9efec46a570a2649b8e27dedad2
+COPY requirements-updater.txt /tmp/requirements-updater.txt
 RUN apk add --no-cache curl ca-certificates \
     && curl -fsSL -o /usr/local/bin/cosign \
        https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-${TARGETARCH} \
+    && case "${TARGETARCH}" in \
+         amd64) expected="${COSIGN_SHA256_AMD64}" ;; \
+         arm64) expected="${COSIGN_SHA256_ARM64}" ;; \
+         *) echo "no pinned cosign checksum for ${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
+    && echo "${expected}  /usr/local/bin/cosign" | sha256sum -c - \
     && chmod +x /usr/local/bin/cosign \
     && apk del curl \
-    && pip install --no-cache-dir httpx pydantic-settings \
-    && rm -rf /var/cache/apk/*
+    && pip install --no-cache-dir -r /tmp/requirements-updater.txt \
+    && rm -rf /var/cache/apk/* /tmp/requirements-updater.txt
 
 # Same CA mount points as the agent image: the host's store at /host-ca, the manual drop-in at
 # /certs. updater.tlsconf merges whatever it finds here into one bundle and exports SSL_CERT_FILE,

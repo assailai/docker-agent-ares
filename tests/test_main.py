@@ -748,7 +748,10 @@ async def test_record_contact_bumps_liveness_and_writes_marker(
     # a successful contact advances the watchdog clock and refreshes the healthcheck marker file.
     monkeypatch.setattr(main.settings, "data_dir", tmp_path)
     main._liveness["last_contact"] = 0.0
-    main._liveness["last_marker_at"] = 0.0  # ensure the throttle allows this first write
+    # no previous write at all, whatever the machine's uptime. 0.0 was not that: time.monotonic()
+    # counts from boot on Linux, so on a CI runner booted under 30s before this ran, now - 0.0
+    # was still inside the throttle and the marker was never written.
+    main._liveness["last_marker_at"] = float("-inf")
 
     main._record_contact()
 
