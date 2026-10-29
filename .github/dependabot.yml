@@ -1,9 +1,8 @@
 version: 2
-# weekly, minor and patch grouped into one PR per ecosystem, and a 7-day cooldown before a release
-# is proposed (a guard against a malicious or broken one). Until this file existed nothing proposed
-# a bump here at all, which is how certifi kept trusting a compromised CA root (ARES-1993).
+# until this file existed nothing proposed a bump here at all, which is how certifi kept trusting
+# a compromised CA root (ARES-1993). The 7-day cooldown guards against a malicious or broken release.
 #
-# Not covered: cosign. Dockerfile.updater downloads it by ARG COSIGN_VERSION, which Dependabot does
+# not covered: cosign. Dockerfile.updater downloads it by ARG COSIGN_VERSION, which Dependabot does
 # not read; ares-v2's published-image-scan.yml rescans the published updater daily, cosign included,
 # and that is what flags a stale one.
 updates:
@@ -19,6 +18,8 @@ updates:
       python-minor-patch:
         update-types: [minor, patch]
 
+  # not grouped: both Dockerfiles use python:3.12-alpine, a tag with no patch number, so every
+  # proposal here is an interpreter upgrade (3.12 -> 3.13) and should arrive on its own
   - package-ecosystem: docker
     directory: "/"
     schedule: { interval: weekly }
@@ -26,12 +27,9 @@ updates:
     commit-message: { prefix: "chore(deps)" }
     cooldown: { default-days: 7 }
     ignore:
-      # our own images, which a release moves together with agent/__version__.py
-      # (test_every_install_path_pins_the_release_being_cut holds them to it)
+      # our own images (docker-compose.yml), which a release moves together with
+      # agent/__version__.py; test_every_install_path_pins_the_release_being_cut holds them to it
       - dependency-name: "*assailai/ares-*"
-    groups:
-      docker:
-        update-types: [minor, patch]
 
   - package-ecosystem: github-actions
     directory: "/"
