@@ -62,14 +62,15 @@ jobs:
           images: ${{ matrix.image }}
           tags: ${{ inputs.meta_tags }}
 
-      # Nothing is pushed, tagged or signed until the image passes this, on PR builds and release
+      # nothing is pushed, tagged or signed until the image passes this, on PR builds and release
       # builds alike. These images run inside customer networks, the updater next to the Docker
       # socket, so a known vulnerability with a fix available is a reason not to publish. In
-      # October 2026 an external assessment found the distrusted certifi roots in the agent and dozens
-      # of High/Critical findings in the updater's cosign, in images that had passed every check here.
+      # October 2026 an external assessment found the distrusted certifi roots in the agent and
+      # dozens of High/Critical findings in the updater's cosign, in images that had passed every
+      # check here.
       #
-      # Grype rather than Trivy because it classifies runtime binaries a package scan misses: the
-      # Go stdlib and modules compiled into cosign, a Node or Python interpreter. --only-fixed keeps
+      # Grype, because it classifies runtime binaries a package-only scan misses: the Go stdlib
+      # and modules compiled into cosign, a Node or Python interpreter. --only-fixed keeps
       # the gate to what we can act on, so a new advisory with no fix cannot block a release.
       # amd64 only: `load` cannot hold a multi-arch image, and both architectures install the same
       # pinned packages and the same cosign release.

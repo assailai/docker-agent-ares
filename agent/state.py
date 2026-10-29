@@ -18,6 +18,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 _lock = threading.Lock()
+# owner read/write only: the file holds the agent's bearer token
+_STATE_FILE_MODE = 0o600
 
 
 def fingerprint(registration_token: str) -> str:
@@ -117,12 +119,13 @@ def save_state(path: Path, state: AgentState) -> None:
     data = json.dumps(asdict(state), indent=2)
     with _lock:
         tmp = path.with_suffix(".tmp")
-        # Created 0600, never written and then narrowed: write_text followed by chmod left the
-        # bearer token readable under the process umask for as long as the write took. The mode
-        # O_CREAT takes only applies to a NEW file, so a temp file an older agent left behind is
-        # narrowed explicitly, after the truncate and before a byte of the token reaches it.
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # created private rather than written and then narrowed, which left the token readable
+        # under the umask for the length of the write. O_CREAT's mode only applies to a new file,
+        # so fchmod covers a stale temp file an older agent left behind.
+        fd = os.open(
+            path=tmp, flags=os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode=_STATE_FILE_MODE
+        )
         with os.fdopen(fd, "w") as f:
-            os.fchmod(f.fileno(), 0o600)
+            os.fchmod(f.fileno(), _STATE_FILE_MODE)
             f.write(data)
         tmp.replace(path)

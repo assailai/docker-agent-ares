@@ -91,20 +91,29 @@ def test_the_identity_file_is_not_world_readable(tmp_path: Path) -> None:
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
+def _skip_chmod(*_args: object, **_kwargs: object) -> None:
+    """Stands in for every chmod, so only the mode a file was created with can survive."""
+
+
 def test_the_identity_file_is_created_private_not_narrowed_afterwards(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Writing the token and THEN chmod-ing left it readable under the umask while it was written.
-    # With every later chmod disabled and the most permissive umask there is, only creating the
-    # file 0600 in the first place can still produce a 0600 file.
-    monkeypatch.setattr(Path, "chmod", lambda self, mode, **kw: None)
-    monkeypatch.setattr(os, "chmod", lambda *a, **kw: None)
-    monkeypatch.setattr(os, "fchmod", lambda *a, **kw: None)
+    # given every chmod disabled and the most permissive umask there is; when the state is saved;
+    # then the file is still 0600, which only creating it that way can produce. Writing the token
+    # and THEN chmod-ing (the old save) left it readable under the umask while it was written.
+    monkeypatch.setattr(target=Path, name="chmod", value=_skip_chmod)
+    monkeypatch.setattr(target=os, name="chmod", value=_skip_chmod)
+    monkeypatch.setattr(target=os, name="fchmod", value=_skip_chmod)
     path = tmp_path / "agent-state.json"
+    state = AgentState(
+        agent_id="a1",
+        agent_token="agtk-1",
+        registration_token_fingerprint=fingerprint("ares_agt_one"),
+    )
 
     previous = os.umask(0)
     try:
-        save_state(path, AgentState("a1", "agtk-1", fingerprint("ares_agt_one")))
+        save_state(path, state)
     finally:
         os.umask(previous)
 
@@ -114,14 +123,19 @@ def test_the_identity_file_is_created_private_not_narrowed_afterwards(
 def test_a_temp_file_left_world_readable_is_narrowed_before_the_token_is_written(
     tmp_path: Path,
 ) -> None:
-    # The case O_CREAT's mode cannot cover: it only applies to a file that does not exist yet, so
-    # a stale temp file from an interrupted save by an older agent keeps its mode unless narrowed.
+    # given a world-readable temp file, what an interrupted save by an older agent leaves behind;
+    # when the state is saved over it; then the result is 0600 and holds the new token
     path = tmp_path / "agent-state.json"
     stale = path.with_suffix(".tmp")
     stale.write_text("{}")
     stale.chmod(0o644)
+    state = AgentState(
+        agent_id="a1",
+        agent_token="agtk-1",
+        registration_token_fingerprint=fingerprint("ares_agt_one"),
+    )
 
-    save_state(path, AgentState("a1", "agtk-1", fingerprint("ares_agt_one")))
+    save_state(path, state)
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert load_state(path).agent_token == "agtk-1"

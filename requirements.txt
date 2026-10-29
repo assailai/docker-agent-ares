@@ -9,9 +9,10 @@ httpx[http2]==0.28.1
 # Public CA roots. Transitive via httpx, but agent.tlsconf imports it directly to union certifi's
 # roots with the host store, so it is pinned here in its own right. Unlike the other pins this one
 # ages badly (roots get added and distrusted), so move it forward when cutting a release.
-# 2026.10.18 removed the emSign roots whose intermediate keys were compromised (GHSA-6q48-6c7w-9gw2);
-# everything before it lets a certificate chained to them pass for ares.assailai.com. The updater
-# pins the same version in requirements-updater.txt, and tests/test_image_pins.py keeps them equal.
+# 2026.10.18 removed the emSign roots whose intermediate keys were compromised
+# (GHSA-6q48-6c7w-9gw2); everything before it lets a certificate chained to them pass for
+# ares.assailai.com. The updater pins the same version in requirements-updater.txt, and
+# tests/test_image_pins.py keeps them equal.
 certifi==2026.10.19
 # WebSocket client for the data-plane tunnel.
 websockets==14.1
