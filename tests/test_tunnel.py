@@ -15,9 +15,12 @@ from websockets.exceptions import InvalidStatus
 
 from agent.hostpins import HostPins
 from agent.tunnel import (
+    _CLOSE,
     _DATA,
     _HOSTS_REPORTED_MAX,
+    _OPEN,
     _OPEN_ERR,
+    _OPEN_OK,
     _PROBE_TIMEOUT,
     HostApproval,
     RefusalLog,
@@ -34,6 +37,27 @@ from agent.tunnel import (
     summarize_addresses,
     tunnel_url,
 )
+
+
+class _FakeReader:
+    """A stream reader that never produces data, so a relayed stream just idles in the test."""
+
+    async def read(self, _n: int) -> bytes:
+        await asyncio.sleep(3600)
+        return b""
+
+
+class _FakeWriter:
+    """A stream writer stub for an opened dial; nothing in these tests writes to the target."""
+
+    def write(self, _data: bytes) -> None:
+        return None
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
 
 
 class _RecordingWS:
@@ -92,40 +116,40 @@ def test_normalize_host_is_case_and_root_dot_insensitive() -> None:
 # ── IP literals: unchanged behaviour ──────────────────────────────────────────
 def test_ip_inside_registered_networks_is_dialed_as_is() -> None:
     client = _client()
-    assert asyncio.run(client._dial_address("10.0.0.5", 80)) == "10.0.0.5"
-    assert asyncio.run(client._dial_address("192.168.1.200", 443)) == "192.168.1.200"
+    assert asyncio.run(client._approved_addresses("10.0.0.5", 80)) == ["10.0.0.5"]
+    assert asyncio.run(client._approved_addresses("192.168.1.200", 443)) == ["192.168.1.200"]
 
 
 def test_ip_outside_registered_networks_is_refused() -> None:
     client = _client()
     with pytest.raises(Refused):
-        asyncio.run(client._dial_address("8.8.8.8", 53))
+        asyncio.run(client._approved_addresses("8.8.8.8", 53))
 
 
 # ── hostnames: resolved here, then authorized ─────────────────────────────────
 def test_name_resolving_into_registered_networks_is_allowed() -> None:
     client = _client()
     _stub_resolver(client, {"bank.internal": ["10.0.0.7"]})
-    assert asyncio.run(client._dial_address("bank.internal", 8000)) == "10.0.0.7"
+    assert asyncio.run(client._approved_addresses("bank.internal", 8000)) == ["10.0.0.7"]
 
 
 def test_name_resolving_outside_networks_is_refused_without_a_pushed_host() -> None:
     client = _client()
     _stub_resolver(client, {"staging.acme.com": ["203.0.113.10"]})
     with pytest.raises(Refused, match="not an approved target"):
-        asyncio.run(client._dial_address("staging.acme.com", 443))
+        asyncio.run(client._approved_addresses("staging.acme.com", 443))
 
 
 def test_pushed_host_allows_a_name_outside_the_networks() -> None:
     client = _client(allowed_hosts={"staging.acme.com"})
     _stub_resolver(client, {"staging.acme.com": ["203.0.113.10"]})
-    assert asyncio.run(client._dial_address("staging.acme.com", 443)) == "203.0.113.10"
+    assert asyncio.run(client._approved_addresses("staging.acme.com", 443)) == ["203.0.113.10"]
 
 
 def test_pushed_host_match_ignores_case_and_root_dot() -> None:
     client = _client(allowed_hosts={"staging.acme.com"})
     _stub_resolver(client, {"Staging.Acme.com.": ["203.0.113.10"]})
-    assert asyncio.run(client._dial_address("Staging.Acme.com.", 443)) == "203.0.113.10"
+    assert asyncio.run(client._approved_addresses("Staging.Acme.com.", 443)) == ["203.0.113.10"]
 
 
 def test_a_name_is_refused_once_its_host_leaves_the_pushed_set() -> None:
@@ -134,10 +158,10 @@ def test_a_name_is_refused_once_its_host_leaves_the_pushed_set() -> None:
     hosts = {"staging.acme.com"}
     client = _client(allowed_hosts=hosts)
     _stub_resolver(client, {"staging.acme.com": ["203.0.113.10"]})
-    assert asyncio.run(client._dial_address("staging.acme.com", 443)) == "203.0.113.10"
+    assert asyncio.run(client._approved_addresses("staging.acme.com", 443)) == ["203.0.113.10"]
     hosts.clear()
     with pytest.raises(Refused):
-        asyncio.run(client._dial_address("staging.acme.com", 443))
+        asyncio.run(client._approved_addresses("staging.acme.com", 443))
 
 
 def test_a_name_with_any_address_outside_the_networks_needs_the_pushed_set() -> None:
@@ -145,14 +169,14 @@ def test_a_name_with_any_address_outside_the_networks_needs_the_pushed_set() -> 
     client = _client()
     _stub_resolver(client, {"mixed.internal": ["10.0.0.7", "8.8.8.8"]})
     with pytest.raises(Refused):
-        asyncio.run(client._dial_address("mixed.internal", 80))
+        asyncio.run(client._approved_addresses("mixed.internal", 80))
 
 
 def test_unresolvable_name_is_refused() -> None:
     client = _client()
     _stub_resolver(client, {})
     with pytest.raises(Refused, match="did not resolve"):
-        asyncio.run(client._dial_address("nowhere.internal", 80))
+        asyncio.run(client._approved_addresses("nowhere.internal", 80))
 
 
 def test_resolve_deduplicates_and_preserves_order() -> None:
@@ -223,6 +247,102 @@ def test_open_dials_the_resolved_address_not_the_name(monkeypatch: pytest.Monkey
     asyncio.run(client._open(13, json.dumps({"host": "bank.internal", "port": 8000}).encode()))
     assert dialed == [("203.0.113.10", 8000)]
     assert _decode(ws.sent[0])[:2] == (_OPEN_ERR, 13)  # the dial failed, so the stream fails
+
+
+def test_open_err_carries_the_refusal_reason() -> None:
+    """The reason rides the OPEN_ERR payload so ares can log WHY, not a bare 'timed out'."""
+    client, ws = _client_with_ws()
+    asyncio.run(client._open(9, json.dumps({"host": "8.8.8.8", "port": 53}).encode()))
+    opcode, stream_id, payload = _decode(ws.sent[0])
+    assert (opcode, stream_id) == (_OPEN_ERR, 9)
+    assert "registered networks" in payload.decode("utf-8")
+
+
+def test_open_falls_back_to_the_second_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dead first record must not sink the name: the next resolved address is tried, and the
+    stream opens on it."""
+    client, ws = _client_with_ws({"bank.internal"})
+    _stub_resolver(client, {"bank.internal": ["203.0.113.10", "203.0.113.11"]})
+    dialed: list[str] = []
+
+    async def fake_open_connection(host: str, port: int):
+        dialed.append(host)
+        if host == "203.0.113.10":
+            raise OSError("connection refused")
+        return _FakeReader(), _FakeWriter()
+
+    monkeypatch.setattr(asyncio, "open_connection", fake_open_connection)
+    asyncio.run(client._open(21, json.dumps({"host": "bank.internal", "port": 8000}).encode()))
+    assert dialed == ["203.0.113.10", "203.0.113.11"]  # tried both, in order
+    assert _decode(ws.sent[0])[:2] == (_OPEN_OK, 21)  # opened on the one that answered
+
+
+def test_open_err_names_every_address_it_tried(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When all addresses fail, the reason names each one so an operator can see what was tried."""
+    client, ws = _client_with_ws({"bank.internal"})
+    _stub_resolver(client, {"bank.internal": ["203.0.113.10", "203.0.113.11"]})
+
+    async def fake_open_connection(host: str, port: int):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(asyncio, "open_connection", fake_open_connection)
+    asyncio.run(client._open(22, json.dumps({"host": "bank.internal", "port": 8000}).encode()))
+    opcode, stream_id, payload = _decode(ws.sent[0])
+    reason = payload.decode("utf-8")
+    assert (opcode, stream_id) == (_OPEN_ERR, 22)
+    assert "203.0.113.10" in reason and "203.0.113.11" in reason
+
+
+def test_a_close_cancels_a_still_opening_stream() -> None:
+    """A CLOSE for a stream whose dial is still in flight cancels it, so no late OPEN_OK/ERR is
+    sent for a stream ares has abandoned."""
+    client, ws = _client_with_ws({"bank.internal"})
+    _stub_resolver(client, {"bank.internal": ["203.0.113.10"]})
+
+    async def go() -> None:
+        async def hang(host: str, port: int):
+            await asyncio.sleep(3600)
+
+        import agent.tunnel as tunnel_mod
+
+        tunnel_mod.asyncio.open_connection = hang  # type: ignore[assignment]
+        await client._handle(_encode(_OPEN, 30, json.dumps({"host": "bank.internal", "port": 8000}).encode()))
+        assert 30 in client._opening
+        await client._handle(_encode(_CLOSE, 30))
+        await asyncio.sleep(0)  # let the cancellation settle
+        assert 30 not in client._opening
+        assert ws.sent == []  # nothing was ever sent for the abandoned stream
+
+    asyncio.run(go())
+
+
+def test_concurrent_opens_do_not_block_each_other(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One slow dial must not hold up a second OPEN behind it: the fast one answers first."""
+    client, ws = _client_with_ws({"slow.internal", "fast.internal"})
+    _stub_resolver(
+        client, {"slow.internal": ["203.0.113.10"], "fast.internal": ["203.0.113.11"]}
+    )
+
+    async def fake_open_connection(host: str, port: int):
+        if host == "203.0.113.10":
+            await asyncio.sleep(3600)  # the slow one never answers in the test
+        return _FakeReader(), _FakeWriter()
+
+    monkeypatch.setattr(asyncio, "open_connection", fake_open_connection)
+
+    async def go() -> None:
+        await client._handle(
+            _encode(_OPEN, 40, json.dumps({"host": "slow.internal", "port": 443}).encode())
+        )
+        await client._handle(
+            _encode(_OPEN, 41, json.dumps({"host": "fast.internal", "port": 443}).encode())
+        )
+        await asyncio.sleep(0.05)  # the fast dial completes while the slow one is still parked
+        opened = [_decode(f)[1] for f in ws.sent if _decode(f)[0] == _OPEN_OK]
+        assert opened == [41]  # the fast stream opened; the slow one is still in flight
+        assert 40 in client._opening
+
+    asyncio.run(go())
 
 
 # ── manager: the pushed set ───────────────────────────────────────────────────
@@ -451,13 +571,13 @@ def test_wildcard_does_not_widen_ip_literals() -> None:
     address-class tests below - this one deliberately only covers the literal."""
     client = _client(allowed_hosts={"*"})
     with pytest.raises(Refused, match="outside this agent's registered networks"):
-        asyncio.run(client._dial_address("203.0.113.10", 443))
+        asyncio.run(client._approved_addresses("203.0.113.10", 443))
 
 
 def test_wildcard_lets_an_unenumerated_login_host_through() -> None:
     client = _client(allowed_hosts={"*"})
     _stub_resolver(client, {"agtacc.allstate.com": ["167.127.118.229"]})
-    assert asyncio.run(client._dial_address("agtacc.allstate.com", 443)) == "167.127.118.229"
+    assert asyncio.run(client._approved_addresses("agtacc.allstate.com", 443)) == ["167.127.118.229"]
 
 
 # --- address classes: what a pattern-approved name is allowed to resolve to --------------------
@@ -510,7 +630,7 @@ def test_a_pattern_approved_name_cannot_reach_special_use_space(
     client = _client(networks=["10.0.0.0/24"], allowed_hosts=allowed)
     _stub_resolver(client, {host: [address]})
     with pytest.raises(Refused, match="not public address space"):
-        asyncio.run(client._dial_address(host, 443))
+        asyncio.run(client._approved_addresses(host, 443))
 
 
 def test_a_pattern_named_public_address_is_still_reachable() -> None:
@@ -518,7 +638,7 @@ def test_a_pattern_named_public_address_is_still_reachable() -> None:
     fix must not break that."""
     client = _client(networks=["10.0.0.0/24"], allowed_hosts={"*"})
     _stub_resolver(client, {"cdn.example.test": ["93.184.216.34"]})
-    assert asyncio.run(client._dial_address("cdn.example.test", 443)) == "93.184.216.34"
+    assert asyncio.run(client._approved_addresses("cdn.example.test", 443)) == ["93.184.216.34"]
 
 
 @pytest.mark.parametrize(
@@ -535,7 +655,7 @@ def test_one_bad_answer_refuses_the_whole_name(answers: list[str]) -> None:
     client = _client(networks=["10.0.0.0/24"], allowed_hosts={"*"})
     _stub_resolver(client, {"mixed.example.test": answers})
     with pytest.raises(Refused, match="not public address space"):
-        asyncio.run(client._dial_address("mixed.example.test", 443))
+        asyncio.run(client._approved_addresses("mixed.example.test", 443))
 
 
 def test_an_exact_runtime_target_may_be_a_private_host() -> None:
@@ -544,7 +664,7 @@ def test_an_exact_runtime_target_may_be_a_private_host() -> None:
     the hunt's own target."""
     client = _client(networks=["10.0.0.0/24"], allowed_hosts={"intranet.acme.local"})
     _stub_resolver(client, {"intranet.acme.local": ["10.5.0.7"]})
-    assert asyncio.run(client._dial_address("intranet.acme.local", 443)) == "10.5.0.7"
+    assert asyncio.run(client._approved_addresses("intranet.acme.local", 443)) == ["10.5.0.7"]
 
 
 def test_the_login_wildcard_does_not_downgrade_the_hunts_own_target() -> None:
@@ -552,7 +672,7 @@ def test_the_login_wildcard_does_not_downgrade_the_hunts_own_target() -> None:
     during an interactive login, and a first-match implementation refuses that target."""
     client = _client(networks=["10.0.0.0/24"], allowed_hosts={"*", "intranet.acme.local"})
     _stub_resolver(client, {"intranet.acme.local": ["10.5.0.7"]})
-    assert asyncio.run(client._dial_address("intranet.acme.local", 443)) == "10.5.0.7"
+    assert asyncio.run(client._approved_addresses("intranet.acme.local", 443)) == ["10.5.0.7"]
 
 
 def test_an_operator_scoped_host_reaches_any_address_class() -> None:
@@ -560,13 +680,13 @@ def test_an_operator_scoped_host_reaches_any_address_class() -> None:
     an operator can add a host this agent's own detection never reached."""
     client = _client(networks=["10.0.0.0/24"], scoped_hosts={"pinned.example.test"})
     _stub_resolver(client, {"pinned.example.test": ["169.254.169.254"]})
-    assert asyncio.run(client._dial_address("pinned.example.test", 443)) == "169.254.169.254"
+    assert asyncio.run(client._approved_addresses("pinned.example.test", 443)) == ["169.254.169.254"]
 
 
 def test_a_name_inside_the_registered_networks_needs_no_approval_at_all() -> None:
     client = _client(networks=["10.0.0.0/24"])
     _stub_resolver(client, {"db.acme.local": ["10.0.0.15"]})
-    assert asyncio.run(client._dial_address("db.acme.local", 443)) == "10.0.0.15"
+    assert asyncio.run(client._approved_addresses("db.acme.local", 443)) == ["10.0.0.15"]
 
 
 def test_an_unparseable_answer_is_never_globally_routable() -> None:
@@ -580,7 +700,7 @@ def test_the_checked_address_is_the_one_dialled() -> None:
     concrete address that passed the check is returned, never the name for a second lookup."""
     client = _client(networks=["10.0.0.0/24"], allowed_hosts={"*"})
     _stub_resolver(client, {"many.example.test": ["93.184.216.34", "93.184.216.35"]})
-    assert asyncio.run(client._dial_address("many.example.test", 443)) == "93.184.216.34"
+    assert asyncio.run(client._approved_addresses("many.example.test", 443)) == ["93.184.216.34", "93.184.216.35"]
 
 
 # --- static pins ----------------------------------------------------------------------------
@@ -599,14 +719,14 @@ def test_a_pin_short_circuits_dns_entirely(tmp_path) -> None:
         pins=HostPins(path=path),
     )
 
-    async def go() -> str:
+    async def go() -> list[str]:
         async def never_answers(*args, **kwargs):  # pragma: no cover - must not be reached
             raise AssertionError("DNS was consulted despite a pin")
 
         asyncio.get_running_loop().getaddrinfo = never_answers  # type: ignore[method-assign]
-        return await client._dial_address("agtacc.allstate.com", 443)
+        return await client._approved_addresses("agtacc.allstate.com", 443)
 
-    assert asyncio.run(go()) == "167.127.118.229"
+    assert asyncio.run(go()) == ["167.127.118.229"]
 
 
 def test_a_pin_supplies_an_address_never_authorization(tmp_path) -> None:
@@ -622,7 +742,7 @@ def test_a_pin_supplies_an_address_never_authorization(tmp_path) -> None:
         pins=HostPins(path=path),
     )
     with pytest.raises(Refused, match="not an approved target"):
-        asyncio.run(client._dial_address("rogue.example.com", 443))
+        asyncio.run(client._approved_addresses("rogue.example.com", 443))
 
 
 def test_a_resolver_timeout_says_what_happened() -> None:
@@ -667,10 +787,10 @@ def test_a_scoped_address_is_dialable_outside_the_registered_networks() -> None:
     """
     client = _client(networks=["10.0.0.0/24"], scoped_hosts={"10.20.1.50"})
 
-    async def go() -> str:
-        return await client._dial_address("10.20.1.50", 443)
+    async def go() -> list[str]:
+        return await client._approved_addresses("10.20.1.50", 443)
 
-    assert asyncio.run(go()) == "10.20.1.50"
+    assert asyncio.run(go()) == ["10.20.1.50"]
 
 
 def test_a_scoped_address_grants_that_address_and_nothing_beside_it() -> None:
@@ -678,8 +798,8 @@ def test_a_scoped_address_grants_that_address_and_nothing_beside_it() -> None:
     the machine's neighbours the way a network entry would."""
     client = _client(networks=["10.0.0.0/24"], scoped_hosts={"10.20.1.50"})
 
-    async def go() -> str:
-        return await client._dial_address("10.20.1.51", 443)
+    async def go() -> list[str]:
+        return await client._approved_addresses("10.20.1.51", 443)
 
     with pytest.raises(Refused):
         asyncio.run(go())
@@ -692,8 +812,8 @@ def test_a_scoped_name_never_matches_by_suffix() -> None:
     client = _client(networks=["10.0.0.0/24"], scoped_hosts={"payroll.corp.local"})
     _stub_resolver(client, {"evil.payroll.corp.local": ["203.0.113.9"]})
 
-    async def go() -> str:
-        return await client._dial_address("evil.payroll.corp.local", 443)
+    async def go() -> list[str]:
+        return await client._approved_addresses("evil.payroll.corp.local", 443)
 
     with pytest.raises(Refused):
         asyncio.run(go())

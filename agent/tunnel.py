@@ -55,7 +55,19 @@ _DATA = 4
 _CLOSE = 5
 _HEADER = struct.Struct(">BQ")
 _RELAY_CHUNK = 65536
+# How long ONE address may take to connect. A silently black-holed address consumes all of it
+# (the kernel never hears a refusal), so this is also the cost of trying a dead first record.
 _DIAL_TIMEOUT = 10.0
+# The whole-OPEN connect budget, across every resolved address. Bounds the "try the next record"
+# loop so a name with several dead addresses cannot spend ``_DIAL_TIMEOUT`` on each: the first gets
+# the full per-address timeout, the rest share what is left. ares waits longer than
+# ``_RESOLVE_TIMEOUT + _DIAL_BUDGET`` for the reply (``ares/infra/net/tunnel.py``), so the agent
+# always answers before ares gives up, which is what turns a dial failure from a bare "timed out"
+# into the real reason.
+_DIAL_BUDGET = 12.0
+# The longest OPEN_ERR reason the agent sends back. The reason is for an operator reading ares'
+# logs, not a payload, so it is bounded; a resolver error or an address summary is well under this.
+_MAX_ERR_REASON = 300
 # How long one destination lookup may take on this agent's resolver.
 #
 # 5.0 was too tight and cost a customer hours. glibc walks the nameservers in
@@ -376,6 +388,9 @@ class TunnelClient:
         self._scoped_hosts = scoped_hosts if scoped_hosts is not None else set()
         self._pins = pins if pins is not None else HostPins()
         self._writers: dict[int, asyncio.StreamWriter] = {}
+        # One in-flight OPEN per stream id, so a slow dial no longer blocks the frames behind it:
+        # each OPEN runs in its own task and a CLOSE arriving first cancels it (see ``_handle``).
+        self._opening: dict[int, asyncio.Task[None]] = {}
         self._ws: websockets.ClientConnection | None = None
         self._refusals = RefusalLog()
 
@@ -397,8 +412,9 @@ class TunnelClient:
         """
         return normalize_host(host) in self._scoped_hosts
 
-    async def _dial_address(self, host: str, port: int) -> str:
-        """The address to dial for ``host``, or raise :class:`Refused`.
+    async def _approved_addresses(self, host: str, port: int) -> list[str]:
+        """Every address that may be dialled for ``host``, in resolution order, or raise
+        :class:`Refused`.
 
         An IP literal must be inside the registered networks, or be one an operator put in this
         agent's scope by hand. That second clause exists because the two halves are decided in
@@ -426,23 +442,26 @@ class TunnelClient:
         answer controls its order, so approving a mixed reply and then taking the first record
         would be the same as not checking.
 
-        Returning a concrete address (not the name) is what keeps the check and the connect on the
-        same destination.
+        Returning concrete addresses (not the name) is what keeps the check and the connect on the
+        same destination. ALL of them are returned, in the resolver's order, so ``_open`` can try
+        the next when the first is dead: a name whose first A record is black-holed, or whose AAAA
+        record leads a v4-only agent nowhere, used to cost the whole dial on that one address and
+        then fail, while the record that would have answered sat untried right behind it.
         """
         if is_ip_literal(host):
             if not self._in_allowed_networks(host) and not self._in_operator_scope(host):
                 raise Refused(
                     f"{host} is outside this agent's registered networks and is not in its scope"
                 )
-            return host
+            return [host]
         addresses = await self._resolve(host, port)
         if all(self._in_allowed_networks(value) for value in addresses):
-            return addresses[0]
+            return addresses
         approval = host_approval(host, self._allowed_hosts)
         # a destination somebody named on purpose: an operator's standing scope entry, or the exact
         # target of this run. either may legitimately be an internal host on a private address.
         if self._in_operator_scope(host) or approval is HostApproval.EXACT:
-            return addresses[0]
+            return addresses
         if approval is HostApproval.NONE:
             raise Refused(
                 f"{host} resolves outside this agent's registered networks "
@@ -458,7 +477,7 @@ class TunnelClient:
                 "link-local, private or reserved destinations. Add the exact host to this "
                 "agent's scope if it is genuinely a target."
             )
-        return addresses[0]
+        return addresses
 
     async def _resolve(self, host: str, port: int) -> list[str]:
         """Addresses for ``host``: a static pin if one exists, else this agent's resolver.
@@ -512,6 +531,9 @@ class TunnelClient:
                         logger.warning("error handling tunnel frame: %s", exc)
             finally:
                 self._refusals.flush()  # so the last batch of repeats is never lost
+                for opening in list(self._opening.values()):
+                    opening.cancel()
+                self._opening.clear()
                 for writer in self._writers.values():
                     writer.close()
                 self._writers.clear()
@@ -519,44 +541,92 @@ class TunnelClient:
     async def _handle(self, frame: bytes) -> None:
         opcode, stream_id, payload = _decode(frame)
         if opcode == _OPEN:
-            await self._open(stream_id, payload)
+            # In its OWN task, so one slow dial (up to _RESOLVE_TIMEOUT + _DIAL_BUDGET) no longer
+            # holds up every DATA, CLOSE and other OPEN queued behind it on the single read loop.
+            task = asyncio.create_task(self._open(stream_id, payload))
+            self._opening[stream_id] = task
+            task.add_done_callback(lambda _t, sid=stream_id: self._opening.pop(sid, None))
         elif opcode == _DATA:
             writer = self._writers.get(stream_id)
             if writer is not None:
                 writer.write(payload)
                 await writer.drain()
         elif opcode == _CLOSE:
+            # A CLOSE for a stream still opening means ares gave up first: cancel the dial so the
+            # task does not later send an OPEN_OK/OPEN_ERR for a stream ares has abandoned.
+            opening = self._opening.pop(stream_id, None)
+            if opening is not None:
+                opening.cancel()
             writer = self._writers.pop(stream_id, None)
             if writer is not None:
                 writer.close()
 
     async def _open(self, stream_id: int, payload: bytes) -> None:
+        """Dial one OPEN and ALWAYS answer: OPEN_OK on success, else OPEN_ERR with the reason.
+
+        Every exit sends exactly one reply, the unexpected-exception case included, because a
+        silently dropped OPEN is what left ares waiting out its whole budget and then reporting a
+        bare "timed out" for what was really a refusal, a dead address or a resolver failure. The
+        reason rides the OPEN_ERR payload so ares can log WHY (``ares/infra/net/tunnel.py`` decodes
+        it); an older ares ignores the extra bytes, so this stays wire-compatible.
+        """
         try:
             target = json.loads(payload)
             host, port = str(target["host"]), int(target["port"])
         except (ValueError, KeyError, TypeError) as exc:
             logger.warning("ignoring malformed OPEN frame: %s", exc)
-            await self._send(_encode(_OPEN_ERR, stream_id))
+            await self._fail_open(stream_id, f"malformed OPEN frame: {exc}")
             return
         try:
-            address = await self._dial_address(host, port)
+            addresses = await self._approved_addresses(host, port)
         except Refused as exc:
             self._refusals.record(host, str(exc))
-            await self._send(_encode(_OPEN_ERR, stream_id))
+            await self._fail_open(stream_id, str(exc))
             return
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(address, port), timeout=_DIAL_TIMEOUT
-            )
-        except (OSError, asyncio.TimeoutError) as exc:
-            logger.info("tunnel dial to %s:%d failed: %s", address, port, exc)
-            await self._send(_encode(_OPEN_ERR, stream_id))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - resolution must never escape without a reply
+            logger.warning("tunnel could not resolve %s: %s", host, exc)
+            await self._fail_open(stream_id, f"{host} could not be resolved on this agent: {exc}")
             return
-        if address != host:
-            logger.info("tunnel dialed %s:%d for %s", address, port, host)
-        self._writers[stream_id] = writer
-        await self._send(_encode(_OPEN_OK, stream_id))
-        asyncio.create_task(self._relay_to_ares(stream_id, reader))
+        await self._dial_and_relay(stream_id, host, port, addresses)
+
+    async def _dial_and_relay(
+        self, stream_id: int, host: str, port: int, addresses: list[str]
+    ) -> None:
+        """Connect to the first address that answers within the shared budget, else OPEN_ERR."""
+        deadline = time.monotonic() + _DIAL_BUDGET
+        failures: list[str] = []
+        for address in addresses:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failures.append(f"{address}: out of connect budget")
+                break
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(address, port),
+                    timeout=min(_DIAL_TIMEOUT, remaining),
+                )
+            except asyncio.CancelledError:
+                raise
+            except (OSError, asyncio.TimeoutError) as exc:
+                reason = str(exc) or type(exc).__name__
+                logger.info("tunnel dial to %s:%d failed: %s", address, port, reason)
+                failures.append(f"{address}: {reason}")
+                continue
+            if address != host:
+                logger.info("tunnel dialed %s:%d for %s", address, port, host)
+            self._writers[stream_id] = writer
+            await self._send(_encode(_OPEN_OK, stream_id))
+            asyncio.create_task(self._relay_to_ares(stream_id, reader))
+            return
+        summary = "; ".join(failures) or "no address resolved"
+        await self._fail_open(stream_id, f"could not connect to {host}:{port} ({summary})")
+
+    async def _fail_open(self, stream_id: int, reason: str) -> None:
+        """Send one OPEN_ERR carrying ``reason`` (bounded, UTF-8) back to ares."""
+        payload = reason[:_MAX_ERR_REASON].encode("utf-8", "replace")
+        await self._send(_encode(_OPEN_ERR, stream_id, payload))
 
     async def _relay_to_ares(self, stream_id: int, reader: asyncio.StreamReader) -> None:
         try:
