@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -113,8 +114,15 @@ def load_state(path: Path) -> AgentState:
 
 def save_state(path: Path, state: AgentState) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(asdict(state), indent=2)
     with _lock:
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(asdict(state), indent=2))
-        tmp.chmod(0o600)
+        # Created 0600, never written and then narrowed: write_text followed by chmod left the
+        # bearer token readable under the process umask for as long as the write took. The mode
+        # O_CREAT takes only applies to a NEW file, so a temp file an older agent left behind is
+        # narrowed explicitly, after the truncate and before a byte of the token reaches it.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(data)
         tmp.replace(path)

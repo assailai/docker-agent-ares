@@ -10,8 +10,11 @@ host can never be re-enrolled, which is the bug the field was added for.
 from __future__ import annotations
 
 import json
+import os
 import stat
 from pathlib import Path
+
+import pytest
 
 from agent.state import AgentState, fingerprint, load_state, save_state
 
@@ -86,6 +89,42 @@ def test_the_identity_file_is_not_world_readable(tmp_path: Path) -> None:
     save_state(path, AgentState("a1", "agtk-1", fingerprint("ares_agt_one")))
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_the_identity_file_is_created_private_not_narrowed_afterwards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Writing the token and THEN chmod-ing left it readable under the umask while it was written.
+    # With every later chmod disabled and the most permissive umask there is, only creating the
+    # file 0600 in the first place can still produce a 0600 file.
+    monkeypatch.setattr(Path, "chmod", lambda self, mode, **kw: None)
+    monkeypatch.setattr(os, "chmod", lambda *a, **kw: None)
+    monkeypatch.setattr(os, "fchmod", lambda *a, **kw: None)
+    path = tmp_path / "agent-state.json"
+
+    previous = os.umask(0)
+    try:
+        save_state(path, AgentState("a1", "agtk-1", fingerprint("ares_agt_one")))
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_a_temp_file_left_world_readable_is_narrowed_before_the_token_is_written(
+    tmp_path: Path,
+) -> None:
+    # The case O_CREAT's mode cannot cover: it only applies to a file that does not exist yet, so
+    # a stale temp file from an interrupted save by an older agent keeps its mode unless narrowed.
+    path = tmp_path / "agent-state.json"
+    stale = path.with_suffix(".tmp")
+    stale.write_text("{}")
+    stale.chmod(0o644)
+
+    save_state(path, AgentState("a1", "agtk-1", fingerprint("ares_agt_one")))
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert load_state(path).agent_token == "agtk-1"
 
 
 def test_the_rescan_setting_and_the_last_detection_round_trip(tmp_path: Path) -> None:

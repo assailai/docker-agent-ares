@@ -1,0 +1,13 @@
+# =============================================================================
+# Ares Companion Updater - Python Dependencies
+# =============================================================================
+# Pinned, where the image used to `pip install httpx pydantic-settings` and take whatever PyPI served
+# on the day of the build: two builds of one release could ship different code, and a release could
+# carry a dependency nobody had reviewed. Every pin here matches requirements.txt, which is the set
+# the test suite runs the updater against; tests/test_image_pins.py fails the build if they drift.
+
+httpx==0.28.1
+certifi==2026.10.19
+pydantic==2.10.3
+pydantic-settings==2.6.1
+python-dotenv==1.0.1

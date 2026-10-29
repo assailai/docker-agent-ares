@@ -15,7 +15,7 @@
 
 services:
   ares-agent:
-    image: docker.io/assailai/ares-agent:3.13.0  # pin to a version (see Settings -> Agents); avoid :latest
+    image: docker.io/assailai/ares-agent:3.13.1  # pin to a version (see Settings -> Agents); avoid :latest
     container_name: ares-agent
     hostname: ares-agent
     volumes:
@@ -63,7 +63,7 @@ services:
     restart: unless-stopped
 
   ares-updater:
-    image: docker.io/assailai/ares-updater:3.13.0
+    image: docker.io/assailai/ares-updater:3.13.1
     container_name: ares-updater
     volumes:
       - ares-agent-data:/data:ro                  # reads the agent's update-target.json
