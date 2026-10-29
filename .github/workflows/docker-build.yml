@@ -85,9 +85,12 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.dockerfile }}
 
       - name: Refuse a fixable High or Critical vulnerability
+        env:
+          # by digest: a tag can be repointed, and the gate's own scanner must not move under it
+          GRYPE: anchore/grype:v0.120.1@sha256:e4a44ef45d285b829ce6efe2642980329661bd2d18eab5fc539138d4adaebbbe
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-            anchore/grype:v0.120.1 docker:scan-target:local --only-fixed --fail-on high
+            "$GRYPE" docker:scan-target:local --only-fixed --fail-on high
 
       - name: Build and push Docker image
         id: build

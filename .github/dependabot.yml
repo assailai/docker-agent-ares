@@ -1,0 +1,44 @@
+version: 2
+# weekly, minor and patch grouped into one PR per ecosystem, and a 7-day cooldown before a release
+# is proposed (a guard against a malicious or broken one). Until this file existed nothing proposed
+# a bump here at all, which is how certifi kept trusting a compromised CA root (ARES-1993).
+#
+# Not covered: cosign. Dockerfile.updater downloads it by ARG COSIGN_VERSION, which Dependabot does
+# not read; ares-v2's published-image-scan.yml rescans the published updater daily, cosign included,
+# and that is what flags a stale one.
+updates:
+  # requirements.txt and requirements-updater.txt share pins; tests/test_image_pins.py fails a bump
+  # that moves one and not the other
+  - package-ecosystem: pip
+    directory: "/"
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+    commit-message: { prefix: "chore(deps)" }
+    cooldown: { default-days: 7 }
+    groups:
+      python-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+    commit-message: { prefix: "chore(deps)" }
+    cooldown: { default-days: 7 }
+    ignore:
+      # our own images, which a release moves together with agent/__version__.py
+      # (test_every_install_path_pins_the_release_being_cut holds them to it)
+      - dependency-name: "*assailai/ares-*"
+    groups:
+      docker:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+    commit-message: { prefix: "ci(deps)" }
+    cooldown: { default-days: 7 }
+    groups:
+      github-actions:
+        update-types: [minor, patch]
