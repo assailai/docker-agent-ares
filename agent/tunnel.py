@@ -81,6 +81,11 @@ _MAX_ERR_REASON = 300
 # resolves normally still returns in milliseconds, and a name that is genuinely dead still fails
 # fast with NXDOMAIN rather than burning the budget.
 _RESOLVE_TIMEOUT = 15.0
+# How long ares waits for our OPEN reply (``_OPEN_TIMEOUT_DEFAULT`` in ares/infra/net/tunnel.py).
+# Our own worst case for one OPEN, ``_RESOLVE_TIMEOUT + _DIAL_BUDGET``, MUST stay under it, or a
+# slow-but-answered dial lands after ares has given up and reads as its timeout rather than our
+# reason. Named so ``test_open_budget_stays_under_ares_timeout`` pins it; the two repos move together.
+_ARES_OPEN_TIMEOUT_S = 30.0
 _RECONNECT_BACKOFF_MIN = 1.0
 _RECONNECT_BACKOFF_MAX = 30.0
 # Startup rehearsal of the data plane (see probe). Bounded so a network that blackholes the

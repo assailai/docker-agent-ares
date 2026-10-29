@@ -15,13 +15,16 @@ from websockets.exceptions import InvalidStatus
 
 from agent.hostpins import HostPins
 from agent.tunnel import (
+    _ARES_OPEN_TIMEOUT_S,
     _CLOSE,
     _DATA,
+    _DIAL_BUDGET,
     _HOSTS_REPORTED_MAX,
     _OPEN,
     _OPEN_ERR,
     _OPEN_OK,
     _PROBE_TIMEOUT,
+    _RESOLVE_TIMEOUT,
     HostApproval,
     RefusalLog,
     Refused,
@@ -106,6 +109,13 @@ def test_tunnel_url_maps_scheme_and_path() -> None:
 
 def test_frame_round_trips() -> None:
     assert _decode(_encode(_DATA, 7, b"hello")) == (_DATA, 7, b"hello")
+
+
+def test_open_budget_stays_under_ares_timeout() -> None:
+    # our worst case for one OPEN must land before ares gives up waiting, or a slow-but-answered
+    # dial reads as ares' timeout instead of our reason. Pins the cross-repo invariant so raising
+    # our budget past ares' wait fails loudly (ARES-1991).
+    assert _RESOLVE_TIMEOUT + _DIAL_BUDGET < _ARES_OPEN_TIMEOUT_S
 
 
 def test_normalize_host_is_case_and_root_dot_insensitive() -> None:
