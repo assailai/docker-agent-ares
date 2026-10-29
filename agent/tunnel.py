@@ -589,7 +589,7 @@ class TunnelClient:
             logger.warning("tunnel could not resolve %s: %s", host, exc)
             await self._fail_open(stream_id, f"{host} could not be resolved on this agent: {exc}")
             return
-        await self._dial_and_relay(stream_id, host, port, addresses)
+        await self._dial_and_relay(stream_id=stream_id, host=host, port=port, addresses=addresses)
 
     async def _dial_and_relay(
         self, stream_id: int, host: str, port: int, addresses: list[str]
