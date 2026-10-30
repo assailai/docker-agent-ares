@@ -30,7 +30,7 @@ jobs:
       created: ${{ steps.release.outputs.created }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0   # full history + existing tags for existence check / release notes
 
