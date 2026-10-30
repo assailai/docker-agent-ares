@@ -75,7 +75,7 @@ jobs:
       # amd64 only: `load` cannot hold a multi-arch image, and both architectures install the same
       # pinned packages and the same cosign release.
       - name: Build a local copy to scan
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -94,7 +94,7 @@ jobs:
 
       - name: Build and push Docker image
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ${{ matrix.dockerfile }}
