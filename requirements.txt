@@ -15,7 +15,7 @@ httpx[http2]==0.28.1
 # tests/test_image_pins.py keeps them equal.
 certifi==2026.10.19
 # WebSocket client for the data-plane tunnel.
-websockets==14.1
+websockets==17.3
 
 # Config + env loading.
 python-dotenv==1.0.1
