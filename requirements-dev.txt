@@ -1,7 +1,7 @@
 # Dev/test dependencies for the agent (not shipped in the image).
 -r requirements.txt
 pytest==8.3.4
-pytest-asyncio==0.25.2
+pytest-asyncio==1.4.0
 # Mints throwaway CAs for the trust-store tests, so they assert on a real certificate rather than
 # a fixture string that only has to parse.
 trustme==1.2.1
