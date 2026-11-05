@@ -13,11 +13,11 @@ httpx[http2]==0.28.1
 # (GHSA-6q48-6c7w-9gw2); everything before it lets a certificate chained to them pass for
 # ares.assailai.com. The updater pins the same version in requirements-updater.txt, and
 # tests/test_image_pins.py keeps them equal.
-certifi==2026.10.19
+certifi==2026.10.23
 # WebSocket client for the data-plane tunnel.
 websockets==14.1
 
 # Config + env loading.
-python-dotenv==1.0.1
-pydantic==2.10.3
-pydantic-settings==2.6.1
+python-dotenv==1.2.4
+pydantic==2.14.1
+pydantic-settings==2.16.2
