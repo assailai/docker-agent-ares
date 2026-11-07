@@ -450,9 +450,7 @@ _UPDATER = "docker.io/assailai/ares-updater"
 _MY_ID = "a1b2c3d4e5f6" + "0" * 52  # the engine sets a container's hostname to its first 12 chars
 
 
-def _updater_container(
-    *, instance: str = "", running: bool = True, container_id: str = _MY_ID
-) -> dict:
+def _updater_container(*, instance: str = "", container_id: str = _MY_ID) -> dict:
     """An updater container as the engine reports it: its env, its socket mount, its image."""
     env = ["ARES_UPDATE_CONTAINER=ares-agent", "PATH=/usr/bin"]
     if instance:
@@ -465,7 +463,7 @@ def _updater_container(
             "Binds": ["ares-agent-data:/data:ro", "/var/run/docker.sock:/var/run/docker.sock"],
             "RestartPolicy": {"Name": "always"},
         },
-        "State": {"Running": running},
+        "State": {"Running": True},
     }
 
 
@@ -480,7 +478,7 @@ class _FakeEngine:
         successor_restarting: bool = False,
         successor_restarts: int = 0,
         take_fails: bool = False,
-    ):
+    ) -> None:
         self.me = me
         self.successor = {
             "State": {"Running": successor_runs, "Restarting": successor_restarting},
@@ -569,7 +567,7 @@ def test_a_successor_owns_the_name_once_it_holds_it(monkeypatch: pytest.MonkeyPa
     # given the handoff finished: ares-updater now carries the successor's own stamp
     _FakeEngine(me=_updater_container(instance="abc")).install(monkeypatch)
 
-    # then the successor is the owner
+    # when the successor inspects it, then it is the owner
     assert DockerBackend().inspect_self(_settings(instance="abc")).role is Role.OWNER
 
 
@@ -577,7 +575,7 @@ def test_an_updater_run_under_another_name_is_unmanaged(monkeypatch: pytest.Monk
     # given nothing named ares-updater (e.g. a compose project that never set container_name)
     _FakeEngine(me=None).install(monkeypatch)
 
-    # then it cannot find itself, so it updates the agent and never itself
+    # when it inspects, then it cannot find itself: it updates the agent and never itself
     assert DockerBackend().inspect_self(_settings()).role is Role.UNMANAGED
 
 
@@ -601,8 +599,8 @@ def test_docker_hands_over_to_a_successor_then_removes_itself(
     assert len(stamps) == 1 and stamps != ["ARES_UPDATE_INSTANCE=old"]
     # and only once it stays up does this updater step aside, hand over the name, and go
     started = engine.index("POST", "/containers/new1/start")
-    aside = engine.index("POST", "/containers/ares-updater/rename", "ares-updater-old")
-    taken = engine.index("POST", "/containers/new1/rename", "ares-updater")
+    aside = engine.index("POST", "/containers/ares-updater/rename", name="ares-updater-old")
+    taken = engine.index("POST", "/containers/new1/rename", name="ares-updater")
     removed = engine.index("DELETE", "/containers/ares-updater-old")
     assert started < aside < taken < removed
     assert removed == len(engine.calls) - 1  # removing itself is the last thing it does
@@ -671,7 +669,7 @@ def test_docker_takes_its_name_back_when_the_successor_cannot_take_it(
         DockerBackend().apply(_settings(), UpdatePlan(updater=f"{_UPDATER}@sha256:new"))
 
     # ...after it took its own name back and removed the successor, rather than removing itself
-    back = engine.index("POST", "/containers/ares-updater-old/rename", "ares-updater")
+    back = engine.index("POST", "/containers/ares-updater-old/rename", name="ares-updater")
     assert engine.index("DELETE", "/containers/new1") > back
     assert ("DELETE", "/containers/ares-updater-old", "") not in engine.calls[back:]
 
@@ -687,7 +685,7 @@ def test_docker_moves_the_agent_before_the_updater(monkeypatch: pytest.MonkeyPat
 
     # then the agent's replacement is created and renamed in before the updater's successor exists
     assert [b["Image"] for b in engine.created] == [plan.agent, plan.updater]
-    agent_done = engine.index("POST", "/containers/new1/rename", "ares-agent")
+    agent_done = engine.index("POST", "/containers/new1/rename", name="ares-agent")
     assert agent_done < engine.index("POST", "/containers/new2/start")
 
 
@@ -709,11 +707,14 @@ def test_docker_leaves_the_updater_alone_when_the_agent_swap_fails(
 def test_docker_removes_a_predecessor_that_failed_to_remove_itself(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # given a successor that now holds the name
     engine = _FakeEngine(me=_updater_container())
     engine.install(monkeypatch)
 
+    # when it removes its predecessor
     DockerBackend().remove_predecessor(_settings())
 
+    # then that is the stepped-aside container, and nothing else
     assert engine.calls == [("DELETE", "/containers/ares-updater-old", "")]
 
 
@@ -755,10 +756,13 @@ def test_k8s_moves_the_agent_and_the_updater_in_one_rollout(
 def test_k8s_moves_only_the_updater_when_the_agent_is_current(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # given an agent already on the target
     patches = _k8s_deployment(monkeypatch, containers=[])
 
+    # when only the updater moves
     K8sBackend().apply(_settings(), UpdatePlan(updater=f"{_UPDATER}@sha256:u"))
 
+    # then the patch names the updater container alone
     (patch,) = patches
     assert patch["spec"]["template"]["spec"]["containers"] == [
         {"name": "ares-updater", "image": f"{_UPDATER}@sha256:u"}
@@ -858,8 +862,10 @@ def test_tick_moves_only_the_updater_once_the_agent_is_on_the_target(
     _verify_to_digest(monkeypatch)
     backend = _FakeBackend(running="docker.io/assailai/ares-agent:3.14.0", me=_owner())
 
+    # when it ticks
     main._tick(backend)
 
+    # then the updater catches up on its own
     assert backend.plan == UpdatePlan(updater=f"{_UPDATER}@sha256:3.14.0")
 
 
@@ -868,14 +874,19 @@ def test_tick_moves_only_the_updater_once_the_agent_is_on_the_target(
     [SelfInspection(role=Role.UNMANAGED), _owner(image=f"{_UPDATER}:3.14.0")],
     ids=["unmanaged", "already-on-target"],
 )
-def test_tick_leaves_the_updater_where_it_is(me: SelfInspection, monkeypatch: pytest.MonkeyPatch):
+def test_tick_leaves_the_updater_where_it_is(
+    me: SelfInspection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # given an agent behind, and an updater that cannot find itself or is already on the target
     monkeypatch.setattr(main, "settings", _settings())
     monkeypatch.setattr(main, "_read_target", lambda: "3.14.0")
     _verify_to_digest(monkeypatch)
     backend = _FakeBackend(running="docker.io/assailai/ares-agent:3.13.2", me=me)
 
+    # when it ticks
     main._tick(backend)
 
+    # then only the agent moves
     assert backend.plan == UpdatePlan(agent="docker.io/assailai/ares-agent@sha256:3.14.0")
 
 
@@ -934,15 +945,18 @@ def test_a_handoff_that_returns_waits_before_it_is_tried_again(
 
 
 def test_the_owner_removes_its_predecessor_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # given an updater that holds its name, with nothing to update
     monkeypatch.setattr(main, "settings", _settings())
     monkeypatch.setattr(main, "_read_target", lambda: "3.14.0")
     backend = _FakeBackend(
         running="docker.io/assailai/ares-agent:3.14.0", me=_owner(f"{_UPDATER}:3.14.0")
     )
 
+    # when it ticks twice
     main._tick(backend)
     main._tick(backend)
 
+    # then it looked for a predecessor once, not on every poll
     assert backend.predecessor_removals == 1
 
 

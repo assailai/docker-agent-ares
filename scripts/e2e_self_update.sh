@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# End-to-end check that the companion updater updates the agent AND itself (ARES-2049), on a real
+# end-to-end check that the companion updater updates the agent AND itself (ARES-2049), on a real
 # Docker engine, with the real updater image and a local registry.
 #
 #   1.0.0 -> 1.0.1   the updater moves the agent, then hands itself over to a 1.0.1 successor
@@ -9,14 +9,14 @@
 #                    in charge and leaves nothing behind
 #   self-update off  ARES_UPDATE_SELF_UPDATE=false moves the agent only
 #
-# Signature checks are off: these images are built here, unsigned. The cosign gate is the same
+# signature checks are off: these images are built here, unsigned. The cosign gate is the same
 # verify() path for the updater as for the agent, covered by tests/test_updater.py and exercised by
 # every production update.
 #
 # Usage:  bash scripts/e2e_self_update.sh
 #   E2E_UPDATER_IMAGE=<ref>  use a prebuilt updater image instead of building Dockerfile.updater
 #   E2E_REGISTRY_PORT=<port> local registry port (default 5000)
-# Needs Docker. Pulls registry:2 and alpine:3.20.
+# needs Docker; pulls registry:2 and alpine:3.20.
 # =============================================================================
 set -uo pipefail
 

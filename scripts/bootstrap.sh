@@ -225,7 +225,7 @@ reset_state() {
     # Both containers first: the updater mounts the same volume read-only, and the engine refuses
     # to remove a volume any container still references, however stopped it is.
     # ...and the updater's half-made replacement, if a failed swap left one: it mounts the volume too.
-    # So do the two an interrupted updater handoff can leave (its successor, and itself stepped aside).
+    # so do the two an interrupted updater handoff can leave (its successor, and itself stepped aside).
     "$RUNTIME" rm -f "$CONTAINER_NAME" "$UPDATER_CONTAINER_NAME" "${CONTAINER_NAME}-next" \
         "${UPDATER_CONTAINER_NAME}-next" "${UPDATER_CONTAINER_NAME}-old" >/dev/null 2>&1 || true
     if ! "$RUNTIME" volume inspect "$VOLUME_NAME" >/dev/null 2>&1; then

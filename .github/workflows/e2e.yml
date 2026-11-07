@@ -1,9 +1,9 @@
-# The updater's end-to-end checks on a real engine and a real cluster (ARES-2049): that it moves the
+# the updater's end-to-end checks on a real engine and a real cluster (ARES-2049): that it moves the
 # agent AND then itself, on Docker (a successor it starts takes over its name) and on Kubernetes (one
 # patch, one rollout). tests/test_updater.py covers the decisions; only a real engine shows that the
 # renames, the self-removal and the restart policy behave the way those tests assume.
 #
-# Path-filtered, because the updater image build (cosign from source) and the two agent builds the
+# path-filtered, because the updater image build (cosign from source) and the two agent builds the
 # Kubernetes check needs take several minutes.
 name: E2E auto-update
 

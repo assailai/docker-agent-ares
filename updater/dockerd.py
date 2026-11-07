@@ -77,6 +77,8 @@ class DockerBackend:
     def remove_predecessor(self, settings: UpdaterSettings) -> None:
         old_name = f"{settings.self_container_name}-old"
         with _client() as docker:
+            # not raise_for_status: 404 (nothing to remove) is the usual answer, and a 409 means the
+            # predecessor is already removing itself
             docker.delete(f"/containers/{old_name}", params={"force": "true"})
 
     def apply(self, settings: UpdaterSettings, plan: UpdatePlan) -> None:
@@ -153,7 +155,9 @@ class DockerBackend:
                 raise
             taken = docker.post(f"/containers/{cid}/rename", params={"name": name})
             if taken.is_error:
-                docker.post(f"/containers/{old_name}/rename", params={"name": name})
+                back = docker.post(f"/containers/{old_name}/rename", params={"name": name})
+                if back.is_error:
+                    logger.error("could not take its name back; it keeps running as %s", old_name)
                 docker.delete(f"/containers/{cid}", params={"force": "true"})
                 taken.raise_for_status()
 

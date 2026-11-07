@@ -59,8 +59,8 @@ def _read_target() -> str | None:
 # in-memory cache of target version -> the digest ref cosign verified for it. Lets a steady
 # state skip re-verifying every tick (an updater restart re-verifies once rather than
 # re-applying); the updater mounts the shared data dir read-only, so this stays in memory.
-_verified: dict[str, str] = {}
-_verified_self: dict[str, str] = {}
+_verified: dict[str, str] = {}  # for the agent's image
+_verified_self: dict[str, str] = {}  # for this updater's own
 # target version -> monotonic time before which moving the updater is not tried again. A failed
 # move (no such image in the repo it runs from, or a successor that crashes) would otherwise repeat
 # on every tick, every poll_seconds, for as long as the target stands.
@@ -91,7 +91,8 @@ def _resolve(*, running: str, target: str, repo: str, cache: dict[str, str]) -> 
 
 
 def _self_target(me: SelfInspection, target: str) -> str | None:
-    """The verified image this updater should move to, or None to stay where it is."""
+    """The verified image this updater should move to, or None to stay where it is. An image
+    cosign refuses starts the retry wait, so the next ticks do not ask again."""
     if not settings.self_update or me.role is not Role.OWNER or me.image is None:
         return None
     if time.monotonic() < _self_retry_after.get(target, 0.0):
@@ -104,14 +105,10 @@ def _self_target(me: SelfInspection, target: str) -> str | None:
     return mine.pinned
 
 
-def _tick(backend: Backend) -> None:
+def _settle_role(backend: Backend, me: SelfInspection) -> None:
+    """What a role asks for once per process: an owner removes a predecessor that handed over to it
+    and could not remove itself; an updater that cannot find its own container says so."""
     global _predecessor_removed, _said_unmanaged
-    target = _read_target()
-    if not target:
-        return
-    me = backend.inspect_self(settings)
-    if me.role is Role.STANDBY:
-        return  # another container holds this updater's name: a handoff to this one is in flight
     if me.role is Role.OWNER and not _predecessor_removed:
         backend.remove_predecessor(settings)
         _predecessor_removed = True
@@ -122,6 +119,16 @@ def _tick(backend: Backend) -> None:
             settings.self_container_name,
         )
         _said_unmanaged = True
+
+
+def _tick(backend: Backend) -> None:
+    target = _read_target()
+    if not target:
+        return
+    me = backend.inspect_self(settings)
+    if me.role is Role.STANDBY:
+        return  # another container holds this updater's name: a handoff to this one is in flight
+    _settle_role(backend, me)
     running = backend.running_image(settings)
     if running is None:
         return  # no agent yet
