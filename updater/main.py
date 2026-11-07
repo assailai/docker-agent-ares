@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
+from pathlib import Path
 
 from pydantic import BaseModel
 
@@ -68,6 +70,10 @@ _self_retry_after: dict[str, float] = {}
 _SELF_RETRY_SECONDS = 1800.0
 _predecessor_removed = False
 _said_unmanaged = False
+# the release this image was built as (Dockerfile.updater writes it); absent outside an image
+_RELEASE_FILE = Path(__file__).with_name("RELEASE")
+_RELEASE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
+_declined_downgrades: set[str] = set()
 
 
 class _Resolution(BaseModel):
@@ -90,10 +96,40 @@ def _resolve(*, running: str, target: str, repo: str, cache: dict[str, str]) -> 
     return _Resolution(current=False, pinned=pinned)
 
 
+def _release_key(version: str) -> tuple[int, int, int] | None:
+    """``3.14.0`` (or ``v3.14.0``, ``3.14.0-rc1``) -> ``(3, 14, 0)``; None when it is no release."""
+    match = _RELEASE.match(version)
+    return (int(match[1]), int(match[2]), int(match[3])) if match else None
+
+
+def _own_release() -> str | None:
+    try:
+        return _RELEASE_FILE.read_text().strip() or None
+    except OSError:
+        return None  # not an image build: a checkout, or the tests
+
+
+def _is_backwards(target: str) -> bool:
+    """True when ``target`` is older than this updater's own release, or is no release at all while
+    that one is known. The updater never moves itself backwards: marking an older release current
+    moves the agent back, but an updater taken below 3.14.0 could never update itself again."""
+    own = _release_key(_own_release() or "")
+    if own is None:
+        return False  # no release baked in, so nothing to compare against
+    wanted = _release_key(target)
+    return wanted is None or wanted < own
+
+
 def _self_target(me: SelfInspection, target: str) -> str | None:
     """The verified image this updater should move to, or None to stay where it is. An image
     cosign refuses starts the retry wait, so the next ticks do not ask again."""
     if not settings.self_update or me.role is not Role.OWNER or me.image is None:
+        return None
+    if _is_backwards(target):
+        if target not in _declined_downgrades:
+            own = _own_release()
+            logger.info("staying on release %s rather than moving back to %s", own, target)
+            _declined_downgrades.add(target)
         return None
     if time.monotonic() < _self_retry_after.get(target, 0.0):
         return None

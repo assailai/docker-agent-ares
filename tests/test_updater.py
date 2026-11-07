@@ -28,6 +28,7 @@ def _clear_verified_cache(monkeypatch: pytest.MonkeyPatch):
     main._verified.clear()
     main._verified_self.clear()
     main._self_retry_after.clear()
+    main._declined_downgrades.clear()
     monkeypatch.setattr(main, "_predecessor_removed", False)
     yield
 
@@ -942,6 +943,45 @@ def test_a_handoff_that_returns_waits_before_it_is_tried_again(
     backend.plan = None
     main._tick(backend)
     assert backend.plan is None
+
+
+@pytest.mark.parametrize(
+    "target", ["3.13.2", "nightly"], ids=["an-older-release", "no-release-at-all"]
+)
+def test_the_updater_never_moves_itself_backwards(
+    target: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # given an updater built as 3.14.0, and a target older than that (an operator rolling the agent
+    # back), or a target it cannot read as a release
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: target)
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(
+        running="docker.io/assailai/ares-agent:3.14.0", me=_owner(f"{_UPDATER}:3.14.0")
+    )
+
+    # when it ticks
+    main._tick(backend)
+
+    # then the agent follows the target and the updater stays: one taken below 3.14.0 could never
+    # update itself again
+    assert backend.plan == UpdatePlan(agent=f"docker.io/assailai/ares-agent@sha256:{target}")
+
+
+def test_the_updater_moves_forward_past_its_own_release(monkeypatch: pytest.MonkeyPatch) -> None:
+    # given an updater built as 3.14.0-rc1 (a suffix reads as its release) and a 3.15.0 target
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: "3.15.0")
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0-rc1")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(
+        running="docker.io/assailai/ares-agent:3.15.0", me=_owner(f"{_UPDATER}:3.14.0")
+    )
+
+    # when it ticks, then it moves itself forward as usual
+    main._tick(backend)
+    assert backend.plan == UpdatePlan(updater=f"{_UPDATER}@sha256:3.15.0")
 
 
 def test_the_owner_removes_its_predecessor_once(monkeypatch: pytest.MonkeyPatch) -> None:

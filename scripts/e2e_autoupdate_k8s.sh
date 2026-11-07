@@ -43,7 +43,10 @@ if [ -z "$BASE" ]; then
   BASE=ares-updater:e2e
 fi
 for v in 2.4.0 2.5.0; do
-  printf 'FROM %s\nLABEL e2e.version=%s\n' "$BASE" "$v" | docker build -q -t "ares-updater:$v" - >/dev/null || fail "updater $v"
+  # each knows its own release, as Dockerfile.updater's RELEASE file gives it, or the 2.4.0 updater
+  # would read itself as the repo's version and decline to "move back" to 2.5.0
+  printf 'FROM %s\nLABEL e2e.version=%s\nRUN echo %s > /app/updater/RELEASE\n' "$BASE" "$v" "$v" |
+    docker build -q -t "ares-updater:$v" - >/dev/null || fail "updater $v"
 done
 
 echo "==> Create kind cluster + load images (no registry needed)"

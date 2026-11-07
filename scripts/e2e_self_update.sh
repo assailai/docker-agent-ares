@@ -8,6 +8,7 @@
 #   1.0.2 -> 9.9.9   the 9.9.9 updater crashes on start: the agent moves, the 1.0.2 updater stays
 #                    in charge and leaves nothing behind
 #   self-update off  ARES_UPDATE_SELF_UPDATE=false moves the agent only
+#   1.0.1 -> 1.0.0   an older release moves the agent back and never the updater
 #
 # signature checks are off: these images are built here, unsigned. The cosign gate is the same
 # verify() path for the updater as for the agent, covered by tests/test_updater.py and exercised by
@@ -91,11 +92,12 @@ echo "==> Publish agent and updater versions 1.0.0, 1.0.1, 1.0.2 and 9.9.9"
 for v in 1.0.0 1.0.1 1.0.2 9.9.9; do
     printf 'FROM alpine:3.20\nLABEL e2e.version=%s\nCMD ["sleep", "infinity"]\n' "$v" |
         docker build -q -t "$REG/ares-agent:$v" - >/dev/null || exit 1
+    # each updater image knows its own release, as Dockerfile.updater's RELEASE file gives it
     if [ "$v" = 9.9.9 ]; then
         # an updater that dies as soon as it starts: the successor that must never take over
         printf 'FROM %s\nLABEL e2e.version=%s\nENTRYPOINT ["sh", "-c", "exit 1"]\n' "$BASE" "$v"
     else
-        printf 'FROM %s\nLABEL e2e.version=%s\n' "$BASE" "$v"
+        printf 'FROM %s\nLABEL e2e.version=%s\nRUN echo %s > /app/updater/RELEASE\n' "$BASE" "$v" "$v"
     fi | docker build -q -t "$REG/ares-updater:$v" - >/dev/null || exit 1
     docker push -q "$REG/ares-agent:$v" >/dev/null && docker push -q "$REG/ares-updater:$v" >/dev/null || exit 1
 done
@@ -159,6 +161,20 @@ if wait_for 120 "agent on 1.0.1" sh -c "[ \"\$(docker inspect -f '{{.Config.Imag
     sleep 6  # several poll intervals: long enough for a handoff it should not start
     [ "$(image_of "$UPDATER")" = "$REG/ares-updater:1.0.2" ] && [ -z "$(leftovers)" ] &&
         ok "the agent moved to 1.0.1 and the updater stayed on 1.0.2" ||
+        bad "updater=$(image_of "$UPDATER") leftovers=$(leftovers | tr '\n' ' ')"
+else
+    bad "agent=$(image_of "$AGENT")"
+    updater_logs
+fi
+
+echo "==> Test 5: an older release moves the agent back, and never the updater"
+start_updater 1.0.2
+target 1.0.0
+if wait_for 120 "agent on 1.0.0" sh -c "[ \"\$(docker inspect -f '{{.Config.Image}}' $AGENT)\" = '$REG/ares-agent:1.0.0' ]"; then
+    declined() { docker logs "$UPDATER" 2>&1 | grep -q "rather than moving back to 1.0.0"; }
+    wait_for 20 "the updater to decline moving back" declined &&
+        [ "$(image_of "$UPDATER")" = "$REG/ares-updater:1.0.2" ] && [ -z "$(leftovers)" ] &&
+        ok "the agent moved back to 1.0.0 and the updater stayed on 1.0.2" ||
         bad "updater=$(image_of "$UPDATER") leftovers=$(leftovers | tr '\n' ' ')"
 else
     bad "agent=$(image_of "$AGENT")"

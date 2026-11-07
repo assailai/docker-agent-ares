@@ -88,6 +88,13 @@ RUN mkdir -p /host-ca /certs && chmod 555 /host-ca /certs
 
 WORKDIR /app
 COPY updater/ ./updater/
+# the release this image is, which the updater reads so it never moves itself backwards
+# (main._is_backwards). Written from the one version source at build time; an ENV would not do,
+# since a successor carries its predecessor's environment and would inherit the older release.
+COPY agent/__version__.py /tmp/release.py
+RUN sed -n 's/^__version__ = "\(.*\)"$/\1/p' /tmp/release.py > updater/RELEASE \
+    && rm /tmp/release.py \
+    && test -s updater/RELEASE
 ENV PYTHONPATH=/app \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1

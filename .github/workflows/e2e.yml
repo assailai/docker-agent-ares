@@ -51,6 +51,15 @@ jobs:
       - name: Build the updater image once, for both checks
         run: docker build -q -f Dockerfile.updater -t ares-updater:e2e .
 
+      # the e2e images below write their own RELEASE per version, so only this step shows the real
+      # image carries the release it is built as, which keeps the updater from moving backwards
+      - name: The image knows its own release
+        run: |
+          want="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' agent/__version__.py)"
+          got="$(docker run --rm --entrypoint cat ares-updater:e2e /app/updater/RELEASE)"
+          echo "agent/__version__.py=$want image RELEASE=$got"
+          [ -n "$want" ] && [ "$got" = "$want" ]
+
       - name: Docker - the updater moves the agent, then itself
         env:
           E2E_UPDATER_IMAGE: ares-updater:e2e

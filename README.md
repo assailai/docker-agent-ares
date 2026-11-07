@@ -532,8 +532,8 @@ Notes:
   - **Installs older than 3.14.0 need one reinstall** to get an updater that can do this: re-run
     `scripts/bootstrap.sh`, `docker compose pull && docker compose up -d`, or re-apply the k8s
     manifest. After that it is automatic.
-  - It follows the release down as well as up: marking an older release current moves the
-    updater there too, and a release older than 3.14.0 cannot update itself again.
+  - It never moves itself backwards: marking an older release current moves the agent back and
+    leaves the updater on its own release, so it can never be taken below one that updates itself.
   - To keep the updater where it is (GitOps, change control), set `ARES_UPDATE_SELF_UPDATE=false`;
     the agent still updates.
   - It moves only a container it can prove is its own: the one named `ares-updater` (or
