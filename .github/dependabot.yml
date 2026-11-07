@@ -2,8 +2,8 @@ version: 2
 # until this file existed nothing proposed a bump here at all, which is how certifi kept trusting
 # a compromised CA root (ARES-1993). The 7-day cooldown guards against a malicious or broken release.
 #
-# not covered: cosign. Dockerfile.updater downloads it by ARG COSIGN_VERSION, which Dependabot does
-# not read; ares-v2's published-image-scan.yml rescans the published updater daily, cosign included,
+# not covered: cosign. Dockerfile.updater builds it from ARG COSIGN_COMMIT, which Dependabot does
+# not read (it does bump the golang builder image); ares-v2's published-image-scan.yml rescans the published updater daily, cosign included,
 # and that is what flags a stale one.
 updates:
   # requirements.txt and requirements-updater.txt share pins; tests/test_image_pins.py fails a bump

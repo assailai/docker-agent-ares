@@ -5,41 +5,46 @@
 # mode) and verifies the target image's cosign signature before applying. The agent stays
 # unprivileged; only this updater touches the runtime.
 # =============================================================================
-FROM python:3.12-alpine
 
-LABEL org.opencontainers.image.title="Ares Updater"
-LABEL org.opencontainers.image.source="https://github.com/assailai/ares-agent"
-LABEL org.opencontainers.image.vendor="Assail AI"
-
-# cosign verifies the target image's signature (the root of trust) before applying. It is a
-# static binary, so it runs on alpine, and is pinned to a release so builds are reproducible.
-# TARGETARCH is set by buildx per target platform (amd64 / arm64) and matches cosign's asset
-# naming, so one Dockerfile builds for both architectures.
+# cosign verifies the target image's signature (the root of trust) before applying, so every
+# auto-update trusts this binary's answer. It is built here, not downloaded: the v3.1.4 release
+# binary links github.com/klauspost/compress v1.20.1 (GO-2026-6865, High, fixed in v1.20.2) and
+# there is no newer cosign release yet.
 #
 # v3.1.4, not the last v2: scanned on 2026-10-29, v2.6.5 still carried 37 fixable High/Critical
 # findings in its Go dependencies and v3.1.4 none. Checked against verify.py before the move: the
 # same arguments verify the signatures CI produces, `--output json` keeps the shape
 # _verified_digest reads, and a wrong signer or an unsigned image is still refused.
 #
-# checked against the release's own cosign_checksums.txt before it is made executable: every
-# auto-update trusts this binary's answer, so it has to be the release we pinned and not just
-# whatever the URL served that day.
+# The source is fetched by the commit the v3.1.4 tag points at, not by the tag, so a moved tag
+# cannot change what we build; every Go module, the bumped one included, is checked against the
+# public checksum database (GOSUMDB) as it downloads. The stage runs on the build host and
+# cross-compiles for TARGETARCH (set by buildx per platform), so arm64 builds without emulation.
+#
+# COSIGN_DEP_BUMPS: module@version pairs raised over what cosign's go.mod pins. Empty it, or go
+# back to the release binary, once a cosign release ships klauspost/compress >= v1.20.2.
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS cosign-builder
 ARG TARGETARCH
-ARG COSIGN_VERSION=v3.1.4
-ARG COSIGN_SHA256_AMD64=424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa
-ARG COSIGN_SHA256_ARM64=ade83b7aac62e131cacfe96d958948b2150cc9efec46a570a2649b8e27dedad2
+# v3.1.4
+ARG COSIGN_COMMIT=0e48502cf5ef34e2e60bbd3617aa19945712f705
+ARG COSIGN_DEP_BUMPS="github.com/klauspost/compress@v1.20.2"
+RUN apk add --no-cache git \
+    && git init -q /src && cd /src \
+    && git fetch -q --depth 1 https://github.com/sigstore/cosign.git "${COSIGN_COMMIT}" \
+    && git checkout -q FETCH_HEAD \
+    && go get ${COSIGN_DEP_BUMPS} \
+    && CGO_ENABLED=0 GOOS=linux GOARCH="${TARGETARCH}" go build -trimpath -ldflags=-buildid= \
+       -o /out/cosign ./cmd/cosign
+
+FROM python:3.12-alpine
+
+LABEL org.opencontainers.image.title="Ares Updater"
+LABEL org.opencontainers.image.source="https://github.com/assailai/ares-agent"
+LABEL org.opencontainers.image.vendor="Assail AI"
+
+COPY --from=cosign-builder /out/cosign /usr/local/bin/cosign
 COPY requirements-updater.txt /tmp/requirements-updater.txt
-RUN apk add --no-cache curl ca-certificates \
-    && curl -fsSL -o /usr/local/bin/cosign \
-       https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-${TARGETARCH} \
-    && case "${TARGETARCH}" in \
-         amd64) expected="${COSIGN_SHA256_AMD64}" ;; \
-         arm64) expected="${COSIGN_SHA256_ARM64}" ;; \
-         *) echo "no pinned cosign checksum for ${TARGETARCH}" >&2; exit 1 ;; \
-       esac \
-    && echo "${expected}  /usr/local/bin/cosign" | sha256sum -c - \
-    && chmod +x /usr/local/bin/cosign \
-    && apk del curl \
+RUN apk add --no-cache ca-certificates \
     && pip install --no-cache-dir -r /tmp/requirements-updater.txt \
     && rm -rf /var/cache/apk/* /tmp/requirements-updater.txt
 

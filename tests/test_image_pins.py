@@ -1,7 +1,7 @@
-"""The updater image's pins and its cosign checksum.
+"""The updater image's pins and its cosign source pin.
 
-Neither breaks anything visible when it goes wrong: a drifted pin still installs, and a missing
-checksum still downloads. So these tests are the only place either fails.
+Neither breaks anything visible when it goes wrong: a drifted pin still installs, and an unpinned
+cosign source still builds. So these tests are the only place either fails.
 """
 
 from __future__ import annotations
@@ -48,22 +48,19 @@ def test_every_pip_install_in_the_updater_image_reads_the_pinned_file() -> None:
     assert not unpinned, f"pip install without the pinned file: {unpinned}"
 
 
-def test_cosign_is_checksum_verified_for_every_architecture_the_image_is_built_for() -> None:
-    # given the architectures docker-build.yml builds
+def test_cosign_is_built_from_a_pinned_commit_for_every_architecture() -> None:
+    # given the updater Dockerfile and the architectures docker-build.yml builds
     dockerfile = (ROOT / "Dockerfile.updater").read_text()
     workflow = (ROOT / ".github/workflows/docker-build.yml").read_text()
     built = set(re.findall(r"linux/(\w+)", workflow))
 
-    # when the Dockerfile is searched for a pinned checksum per architecture
-    missing = [
-        arch
-        for arch in sorted(built)
-        if not re.search(
-            pattern=rf"^ARG COSIGN_SHA256_{arch.upper()}={_SHA256}$", string=dockerfile, flags=re.M
-        )
-    ]
+    # when the cosign source pin and the build's target are read
+    commit = re.search(r"^ARG COSIGN_COMMIT=([0-9a-f]{40})$", dockerfile, flags=re.M)
 
-    # then each has one, and the build actually checks it
+    # then cosign comes from a full commit sha, never a movable tag, and is cross-compiled for
+    # whichever platform buildx is building, which covers every architecture in the workflow
     assert built, "could not read the build platforms from docker-build.yml"
-    assert not missing, f"no pinned sha256 for cosign-linux-{missing}"
-    assert "sha256sum -c -" in dockerfile
+    assert commit, "cosign source is not pinned to a 40-character commit sha"
+    assert 'git fetch -q --depth 1 https://github.com/sigstore/cosign.git "${COSIGN_COMMIT}"' in dockerfile
+    assert 'GOARCH="${TARGETARCH}"' in dockerfile
+    assert "COPY --from=cosign-builder /out/cosign /usr/local/bin/cosign" in dockerfile
