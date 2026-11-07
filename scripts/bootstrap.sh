@@ -32,11 +32,11 @@ set -euo pipefail
 # Fully qualified (docker.io/...): RHEL's Podman enforces short-name resolution, so a bare
 # assailai/ares-agent stops at an interactive "which registry?" prompt, and with no terminal to
 # answer it (Ansible, cloud-init, ssh with a command) the install simply fails. ARES-1725.
-IMAGE="${ARES_IMAGE:-docker.io/assailai/ares-agent:${ARES_VERSION:-3.13.2}}"
+IMAGE="${ARES_IMAGE:-docker.io/assailai/ares-agent:${ARES_VERSION:-3.14.0}}"
 # The companion updater keeps the agent on the release the dashboard marks current; it is the only
 # component that touches the Docker socket (the agent stays unprivileged). Set ARES_DISABLE_AUTOUPDATE
 # to opt out (change-control-sensitive hosts). Override the image with ARES_UPDATER_IMAGE=<full ref>.
-UPDATER_IMAGE="${ARES_UPDATER_IMAGE:-docker.io/assailai/ares-updater:${ARES_VERSION:-3.13.2}}"
+UPDATER_IMAGE="${ARES_UPDATER_IMAGE:-docker.io/assailai/ares-updater:${ARES_VERSION:-3.14.0}}"
 CONTAINER_NAME="ares-agent"
 UPDATER_CONTAINER_NAME="ares-updater"
 VOLUME_NAME="ares-agent-data"
@@ -225,7 +225,9 @@ reset_state() {
     # Both containers first: the updater mounts the same volume read-only, and the engine refuses
     # to remove a volume any container still references, however stopped it is.
     # ...and the updater's half-made replacement, if a failed swap left one: it mounts the volume too.
-    "$RUNTIME" rm -f "$CONTAINER_NAME" "$UPDATER_CONTAINER_NAME" "${CONTAINER_NAME}-next" >/dev/null 2>&1 || true
+    # So do the two an interrupted updater handoff can leave (its successor, and itself stepped aside).
+    "$RUNTIME" rm -f "$CONTAINER_NAME" "$UPDATER_CONTAINER_NAME" "${CONTAINER_NAME}-next" \
+        "${UPDATER_CONTAINER_NAME}-next" "${UPDATER_CONTAINER_NAME}-old" >/dev/null 2>&1 || true
     if ! "$RUNTIME" volume inspect "$VOLUME_NAME" >/dev/null 2>&1; then
         info "There was no '${VOLUME_NAME}' volume; this host enrolls from scratch anyway."
         return 0
@@ -335,6 +337,10 @@ start_updater() {
     fi
     step "Starting the auto-update companion"
     replace_existing "$UPDATER_CONTAINER_NAME"
+    # an updater moving itself runs a successor beside it for a few seconds (ares-updater-next, then
+    # the old one as ares-updater-old). An install that lands in that window must not leave either
+    # behind next to the updater it starts.
+    "$RUNTIME" rm -f "${UPDATER_CONTAINER_NAME}-next" "${UPDATER_CONTAINER_NAME}-old" >/dev/null 2>&1 || true
     # Only the updater touches the engine socket; it recreates the agent on a new, cosign-verified
     # image when the dashboard marks a release current (the signer identity is baked into the image).
     # ENGINE_SOCK is the Docker socket, or the Podman one (rootless: setup_persistence, rootful:

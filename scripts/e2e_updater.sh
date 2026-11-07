@@ -28,7 +28,9 @@ fresh_agent() {  # $1 = starting image
 }
 
 tick() {  # caller sets ARES_UPDATE_* in the environment; runs one updater tick
-  ( cd "$REPO_DIR" && uv run --no-project --with httpx --with pydantic-settings python -c "
+  # this ticks from the host, not from an updater container: never let it reach for an
+  # ares-updater container of the machine's own (scripts/e2e_self_update.sh covers self-update)
+  ( cd "$REPO_DIR" && ARES_UPDATE_SELF_UPDATE=false uv run --no-project --with httpx --with pydantic-settings python -c "
 from updater import main
 from updater.dockerd import DockerBackend
 try:

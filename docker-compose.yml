@@ -7,15 +7,16 @@
 #   docker compose logs -f            # watch it enroll and come online
 #
 # Outbound-only (HTTPS + WebSocket to ares); no published ports, no extra capabilities.
-# The ares-updater companion keeps the agent on the version the dashboard marks current
-# (a dashboard "Update" recreates the agent on the new, signed image). Only the updater
-# holds the Docker socket; the agent stays unprivileged. To opt out of auto-update, remove
-# the ares-updater service.
+# The ares-updater companion keeps the agent, and then itself, on the version the dashboard
+# marks current (a dashboard "Update" recreates the agent on the new, signed image). Only the
+# updater holds the Docker socket; the agent stays unprivileged. To opt out of auto-update, remove
+# the ares-updater service; to keep only the updater where it is, set ARES_UPDATE_SELF_UPDATE=false.
+# It finds itself by its container_name below, so keep that name.
 # =============================================================================
 
 services:
   ares-agent:
-    image: docker.io/assailai/ares-agent:3.13.2  # pin to a version (see Settings -> Agents); avoid :latest
+    image: docker.io/assailai/ares-agent:3.14.0  # pin to a version (see Settings -> Agents); avoid :latest
     container_name: ares-agent
     hostname: ares-agent
     volumes:
@@ -63,7 +64,7 @@ services:
     restart: unless-stopped
 
   ares-updater:
-    image: docker.io/assailai/ares-updater:3.13.2
+    image: docker.io/assailai/ares-updater:3.14.0
     container_name: ares-updater
     volumes:
       - ares-agent-data:/data:ro                  # reads the agent's update-target.json

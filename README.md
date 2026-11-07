@@ -482,9 +482,9 @@ second agent. The agent decides from the `ARES_TOKEN` it is handed:
 
 ### Auto-update (the companion updater)
 
-The deployment bundles a small `ares-updater` companion that keeps the agent on the version you
-mark current in the dashboard. The **agent stays unprivileged**; only the updater holds the
-platform access, verifies the target image's signature, and applies it:
+The deployment bundles a small `ares-updater` companion that keeps the agent, and itself, on the
+version you mark current in the dashboard. The **agent stays unprivileged**; only the updater holds
+the platform access, verifies the target image's signature, and applies it:
 
 - **Docker Compose** (`docker-compose.yml`): the `ares-updater` service holds the Docker socket
   and recreates the agent container on the new version, verify-then-swap (the replacement is
@@ -522,9 +522,25 @@ Notes:
 
   If this fails while the image is genuinely published, the expected signer identity has drifted from
   what CI signs with — the updater logs both sides of the comparison on failure.
-- The updater keeps the **agent** current; it does not update itself. Moving the updater to a new
-  version is an operator action: re-run `scripts/bootstrap.sh`, `docker compose pull && docker
-  compose up -d`, or re-apply the k8s manifest.
+- **The updater updates itself too, after the agent** (from 3.14.0). Once the agent is on the
+  release you marked current, the updater moves to the same release, verified against the same
+  signer. On Kubernetes one patch sets both images when both are behind, so the pod rolls once.
+  On Docker and Podman the updater cannot replace its own container directly. It starts a
+  successor (`ares-updater-next`) with its own settings and socket, and once that stays up, steps
+  aside (`ares-updater-old`), hands the successor its name, and removes itself. If the successor
+  never comes up, the updater removes it, keeps running, and tries again 30 minutes later.
+  - **Installs older than 3.14.0 need one reinstall** to get an updater that can do this: re-run
+    `scripts/bootstrap.sh`, `docker compose pull && docker compose up -d`, or re-apply the k8s
+    manifest. After that it is automatic.
+  - It follows the release down as well as up: marking an older release current moves the
+    updater there too, and a release older than 3.14.0 cannot update itself again.
+  - To keep the updater where it is (GitOps, change control), set `ARES_UPDATE_SELF_UPDATE=false`;
+    the agent still updates.
+  - It moves only a container it can prove is its own: the one named `ares-updater` (or
+    `ARES_UPDATE_SELF_CONTAINER_NAME`) whose id matches its hostname, which the engine sets to the
+    container id. Under another name (a Compose project without `container_name`), with an operator-
+    set hostname, or with host networking, it cannot, so it updates only the agent and says so in
+    its log once.
 - Only the updater touches the runtime (the Docker socket, or the scoped k8s RBAC); the agent has
   neither. To disable auto-update, remove the updater service/sidecar and update the image
   yourself (`docker compose pull && docker compose up -d`, or your GitOps pipeline).
@@ -584,9 +600,9 @@ Two things that are easy to get wrong:
 
 - **Don't push the `v<version>` tag by hand.** `auto-tag.yml` skips its image build when the tag
   already exists, so a hand-pushed tag leaves you with a tag and a release but **no images**.
-- **A release that changes `updater/` does not roll itself out.** The updater keeps the *agent*
-  current; nothing updates the updater. Every deployment has to recreate it before the change takes
-  effect — see [Auto-update](#auto-update-the-companion-updater).
+- **A release that changes `updater/` rolls out with the agent** on installs at 3.14.0 or later,
+  since the updater updates itself. Installs older than that have to recreate it once: see
+  [Auto-update](#auto-update-the-companion-updater).
 
 ## Support
 

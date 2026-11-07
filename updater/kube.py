@@ -1,8 +1,12 @@
-"""Kubernetes backend: read the agent Deployment's image and patch it to a target image.
+"""Kubernetes backend: read the agent Deployment's images and patch them to target images.
 
 Patching the Deployment triggers a native rolling update (and k8s owns the rollback via
 ``kubectl rollout undo``). The updater runs as a sidecar with a ServiceAccount scoped to
 get/patch only the agent Deployment.
+
+The updater is a container in that same Deployment, so it updates itself the same way: when both
+the agent and the updater are behind, one patch sets both images and the pod rolls once. Nothing
+like the Docker handoff is needed, because k8s replaces the whole pod.
 """
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ from pathlib import Path
 
 import httpx
 
+from updater.backend import Role, SelfInspection, UpdatePlan
 from updater.config import UpdaterSettings
 
 logger = logging.getLogger("ares.updater.k8s")
@@ -26,25 +31,31 @@ class K8sBackend:
         return bool(os.environ.get("KUBERNETES_SERVICE_HOST")) and (_SA / "token").exists()
 
     def running_image(self, settings: UpdaterSettings) -> str | None:
-        namespace = _namespace(settings)
-        with _client() as kube:
-            resp = kube.get(_deployment_path(namespace, settings.container_name))
-            if resp.status_code == 404:
-                return None
-            resp.raise_for_status()
-            containers = resp.json()["spec"]["template"]["spec"]["containers"]
-        return next((c["image"] for c in containers if c["name"] == settings.container_name), None)
+        return _image_of(settings, container=settings.container_name)
 
-    def apply(self, settings: UpdaterSettings, image_ref: str) -> None:
+    def inspect_self(self, settings: UpdaterSettings) -> SelfInspection:
+        image = _image_of(settings, container=settings.self_container_name)
+        if image is None:
+            return SelfInspection(role=Role.UNMANAGED)
+        return SelfInspection(role=Role.OWNER, image=image)
+
+    def remove_predecessor(self, settings: UpdaterSettings) -> None:
+        """Nothing to remove: a rollout replaces the whole pod."""
+
+    def apply(self, settings: UpdaterSettings, plan: UpdatePlan) -> None:
         namespace = _namespace(settings)
-        # strategic-merge patch: set only the agent container's image; k8s rolls the Deployment.
-        patch = {
-            "spec": {
-                "template": {
-                    "spec": {"containers": [{"name": settings.container_name, "image": image_ref}]}
-                }
-            }
-        }
+        containers = [
+            {"name": name, "image": image}
+            for name, image in (
+                (settings.container_name, plan.agent),
+                (settings.self_container_name, plan.updater),
+            )
+            if image
+        ]
+        if not containers:
+            return
+        # strategic-merge patch: set only these containers' images; k8s rolls the Deployment.
+        patch = {"spec": {"template": {"spec": {"containers": containers}}}}
         with _client() as kube:
             resp = kube.patch(
                 _deployment_path(namespace, settings.container_name),
@@ -53,11 +64,22 @@ class K8sBackend:
             )
             resp.raise_for_status()
         logger.info(
-            "patched Deployment %s/%s image to %s; kubernetes will roll it out",
+            "patched Deployment %s/%s (%s); kubernetes will roll it out",
             namespace,
             settings.container_name,
-            image_ref,
+            ", ".join(f"{c['name']}={c['image']}" for c in containers),
         )
+
+
+def _image_of(settings: UpdaterSettings, *, container: str) -> str | None:
+    """The image a container of the agent Deployment runs, or None if it is not there."""
+    with _client() as kube:
+        resp = kube.get(_deployment_path(_namespace(settings), settings.container_name))
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        containers = resp.json()["spec"]["template"]["spec"]["containers"]
+    return next((c["image"] for c in containers if c["name"] == container), None)
 
 
 def _namespace(settings: UpdaterSettings) -> str:

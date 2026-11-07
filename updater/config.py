@@ -24,6 +24,17 @@ class UpdaterSettings(BaseSettings):
     target_file: Path = Field(default=Path("/data/update-target.json"))
     poll_seconds: float = 30.0
 
+    # the updater's own container (docker) / its sidecar in the agent Deployment (k8s). Once the
+    # agent is on the target release, the updater moves itself there too (ARES-2049); every install
+    # path (scripts/bootstrap.sh, docker-compose.yml, deploy/k8s) gives it this name.
+    self_container_name: str = "ares-updater"
+    # off for a host whose updater is managed some other way (GitOps, change control): the agent
+    # still updates, the updater stays on what was installed.
+    self_update: bool = True
+    # never set by hand. An updater stamps it onto the successor it starts, so that while both run
+    # during a handoff each can tell which container is its own (dockerd.inspect_self).
+    instance: str = ""
+
     # fail-closed: refuse to apply an image whose signature we cannot verify. Turn this OFF
     # (ARES_UPDATE_REQUIRE_SIGNATURE=false) only for local/dev; CI signs published images.
     require_signature: bool = True
