@@ -78,7 +78,10 @@ LABEL org.opencontainers.image.vendor="Assail AI"
 
 COPY --from=cosign /out/cosign /usr/local/bin/cosign
 COPY requirements-updater.txt /tmp/requirements-updater.txt
-RUN apk add --no-cache ca-certificates \
+# `apk upgrade` first, for the reason the agent's Dockerfile gives: Alpine ships a fix (zlib 1.4-r0
+# on 2026-11-07) before the python image is rebuilt on it, and the publish gate refuses the wait.
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates \
     && pip install --no-cache-dir -r /tmp/requirements-updater.txt \
     && rm -rf /var/cache/apk/* /tmp/requirements-updater.txt
 

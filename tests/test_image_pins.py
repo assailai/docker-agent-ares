@@ -109,3 +109,25 @@ def test_the_image_runs_the_cosign_it_built() -> None:
     # then the binary on PATH is the builder stage's, and nothing downloads another
     assert "COPY --from=cosign /out/cosign /usr/local/bin/cosign" in dockerfile
     assert "releases/download" not in dockerfile
+
+
+def _runtime_stage(dockerfile: str) -> str:
+    """The stage the image ships: everything after the last FROM."""
+    return dockerfile[dockerfile.rindex("\nFROM ") :]
+
+
+def test_every_shipped_image_takes_alpines_current_packages() -> None:
+    # given both images' Dockerfiles, whose base python:3.12-alpine is rebuilt on its own schedule
+    for name in ("Dockerfile", "Dockerfile.updater"):
+        stage = _runtime_stage((ROOT / name).read_text())
+
+        # when the runtime stage's RUN instructions are read, continuation lines joined
+        runs = re.findall(r"^RUN ((?:.*\\\n)*.*)$", stage, flags=re.M)
+        upgrade = [run for run in runs if run.startswith("apk upgrade --no-cache")]
+
+        # then one upgrades the base packages before anything else, so a fix Alpine already ships
+        # reaches the image without waiting for a new base (zlib 1.4-r0, ARES-2046), and nothing
+        # after it swallows a failure: a bare `|| true` would let a failed upgrade publish
+        assert upgrade, f"{name}: the runtime stage does not run `apk upgrade --no-cache` first"
+        masked = re.search(pattern=r"\|\| true\s*$", string=upgrade[0])
+        assert not masked, f"{name}: the upgrade's failure is masked"
