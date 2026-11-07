@@ -1,13 +1,15 @@
-"""The updater image's pins and the anchors of its cosign build.
+"""The images' pins, and what the updater's cosign build is anchored to.
 
-None of them breaks anything visible when it goes wrong: a drifted pin still installs, a moved tag
-still clones, and a forgotten override still builds. So these tests are the only place any fails.
+Nothing visible breaks when one of these goes wrong (a drifted pin still installs, a forgotten
+override still builds), so these tests are the only place it fails.
 """
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 _PIN = re.compile(r"^([A-Za-z0-9_.-]+)(?:\[[^\]]*\])?==(\S+)")
@@ -21,6 +23,15 @@ def _pins(name: str) -> dict[str, str]:
     lines = (ROOT / name).read_text().splitlines()
     matches = [_PIN.match(line.strip()) for line in lines]
     return {m.group(1).lower().replace("_", "-"): m.group(2) for m in matches if m}
+
+
+def _updater_dockerfile() -> str:
+    return (ROOT / "Dockerfile.updater").read_text()
+
+
+def _runtime_stage(dockerfile: str) -> str:
+    """The stage the image ships: everything after the last FROM."""
+    return dockerfile[dockerfile.rindex("\nFROM ") :]
 
 
 def test_updater_pins_match_what_the_agent_tests_run_against() -> None:
@@ -49,85 +60,74 @@ def test_every_pip_install_in_the_updater_image_reads_the_pinned_file() -> None:
     assert not unpinned, f"pip install without the pinned file: {unpinned}"
 
 
-def _updater_dockerfile() -> str:
-    return (ROOT / "Dockerfile.updater").read_text()
-
-
 def test_cosign_is_built_from_the_commit_its_tag_pointed_at() -> None:
     # given the updater Dockerfile, which builds cosign from source (ARES-2046)
     dockerfile = _updater_dockerfile()
 
-    # when its source pin is read
+    # when the tag's commit pin is read
     commit = re.search(pattern=rf"^ARG COSIGN_COMMIT=({_GIT_SHA})$", string=dockerfile, flags=re.M)
 
-    # then the tag is pinned to a full commit id and the clone is refused unless it lands there,
-    # which is what stands in for the release checksum a download was checked against
+    # then it is a full commit id and the clone is refused anywhere else: this is what stands in
+    # for the release checksum the download used to be checked against
     assert commit, "no full commit id pinned for the cosign tag"
     assert re.search(r'actual="\$\(git -C /src rev-parse HEAD\)"', dockerfile)
     assert '"${actual}" != "${COSIGN_COMMIT}"' in dockerfile
 
 
 def test_the_cosign_toolchain_is_pinned_and_cannot_fetch_another() -> None:
-    # given the updater Dockerfile
+    # given the builder stage's base image
     dockerfile = _updater_dockerfile()
-
-    # when the builder stage's base image is read
     builder = re.search(
         pattern=r"^FROM --platform=\$BUILDPLATFORM (\S+) AS cosign$", string=dockerfile, flags=re.M
     )
 
-    # then it is pinned by digest, and go may not swap in a toolchain a go.mod asks for
+    # when it and the go environment are checked, then the image is pinned by digest and go may not
+    # download the newer toolchain a go.mod could ask for
     assert builder, "no cosign builder stage"
     assert re.search(rf"@sha256:{_SHA256}$", builder.group(1)), builder.group(1)
     assert "GOTOOLCHAIN=local" in dockerfile
 
 
 def test_the_compress_override_only_runs_while_upstream_ships_the_vulnerable_version() -> None:
-    # given the updater Dockerfile
+    # given the override's two versions and where the guard and the `go get` sit
     dockerfile = _updater_dockerfile()
-
-    # when the override and its guard are located
     upstream = re.search(
         pattern=rf"^ARG COSIGN_COMPRESS_UPSTREAM=({_SEMVER})$", string=dockerfile, flags=re.M
     )
-    raised = re.search(
-        pattern=rf"^ARG COMPRESS_VERSION=({_SEMVER})$", string=dockerfile, flags=re.M
+    override = re.search(
+        pattern=rf"^ARG COSIGN_COMPRESS_OVERRIDE=({_SEMVER})$", string=dockerfile, flags=re.M
     )
-    guard = dockerfile.find('"${upstream}" != "${COSIGN_COMPRESS_UPSTREAM}"')
-    override = dockerfile.find('go get "github.com/klauspost/compress@${COMPRESS_VERSION}"')
+    guard_at = dockerfile.find('"${upstream}" != "${COSIGN_COMPRESS_UPSTREAM}"')
+    override_at = dockerfile.find(
+        'go get "github.com/klauspost/compress@${COSIGN_COMPRESS_OVERRIDE}"'
+    )
 
-    # then the build checks upstream's version before raising it, so a cosign that already ships
-    # something else fails the build instead of keeping (or downgrading through) a stale override
-    assert upstream and raised, "the compress override's versions are not pinned"
-    assert 0 <= guard < override, "the compress override is not guarded, or the guard runs after it"
+    # then upstream's version is checked before it is raised: a cosign that already ships something
+    # else must fail the build, or a later COSIGN_VERSION bump keeps the override (and may
+    # downgrade compress)
+    assert upstream and override, "the compress override's versions are not pinned"
+    assert 0 <= guard_at < override_at, "the override is not guarded, or the guard runs after it"
 
 
 def test_the_image_runs_the_cosign_it_built() -> None:
     # given the updater Dockerfile
     dockerfile = _updater_dockerfile()
 
-    # then the binary on PATH is the builder stage's, and nothing downloads another
+    # then cosign comes from the builder stage, and no step downloads a release over it
     assert "COPY --from=cosign /out/cosign /usr/local/bin/cosign" in dockerfile
     assert "releases/download" not in dockerfile
 
 
-def _runtime_stage(dockerfile: str) -> str:
-    """The stage the image ships: everything after the last FROM."""
-    return dockerfile[dockerfile.rindex("\nFROM ") :]
+@pytest.mark.parametrize("name", ["Dockerfile", "Dockerfile.updater"])
+def test_every_shipped_image_takes_alpines_current_packages(name: str) -> None:
+    # given an image whose base, python:3.12-alpine, is rebuilt on its own schedule: on 2026-11-07
+    # Alpine had zlib 1.4-r0 (CVE-2026-4738) while the base still had 1.3.2-r1 (ARES-2046)
+    stage = _runtime_stage((ROOT / name).read_text())
 
+    # when the runtime stage's first RUN is read, continuation lines included
+    first = re.findall(pattern=r"^RUN ((?:.*\\\n)*.*)$", string=stage, flags=re.M)[0]
 
-def test_every_shipped_image_takes_alpines_current_packages() -> None:
-    # given both images' Dockerfiles, whose base python:3.12-alpine is rebuilt on its own schedule
-    for name in ("Dockerfile", "Dockerfile.updater"):
-        stage = _runtime_stage((ROOT / name).read_text())
-
-        # when the runtime stage's RUN instructions are read, continuation lines joined
-        runs = re.findall(r"^RUN ((?:.*\\\n)*.*)$", stage, flags=re.M)
-        upgrade = [run for run in runs if run.startswith("apk upgrade --no-cache")]
-
-        # then one upgrades the base packages before anything else, so a fix Alpine already ships
-        # reaches the image without waiting for a new base (zlib 1.4-r0, ARES-2046), and nothing
-        # after it swallows a failure: a bare `|| true` would let a failed upgrade publish
-        assert upgrade, f"{name}: the runtime stage does not run `apk upgrade --no-cache` first"
-        masked = re.search(pattern=r"\|\| true\s*$", string=upgrade[0])
-        assert not masked, f"{name}: the upgrade's failure is masked"
+    # then it upgrades Alpine's packages, and does not end in a bare `|| true` (the agent's install
+    # RUN used to, which hid a failed apk add)
+    assert first.startswith("apk upgrade --no-cache"), f"{name}: first RUN is not apk upgrade"
+    assert not re.search(pattern=r"\|\| true\s*$", string=first), f"{name}: a failure is masked"

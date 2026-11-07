@@ -39,7 +39,7 @@ LABEL org.opencontainers.image.vendor="Assail AI"
 # `apk upgrade` first: Alpine ships a fix before the python image is rebuilt on it, and the publish
 # gate refuses a fixable High/Critical. On 2026-11-07 Alpine 3.24 had zlib 1.4-r0 (CVE-2026-4738,
 # Critical) while python:3.12-alpine still carried 1.3.2-r1, which blocked every build (ARES-2046).
-# The `|| true` covers the cache sweep alone, so a failed upgrade or install fails the build.
+# the `|| true` covers the cache sweep alone, so a failed upgrade or install fails the build.
 RUN apk upgrade --no-cache \
     && apk add --no-cache iproute2 dash openssl ca-certificates \
     && rm -rf /var/cache/apk/* \

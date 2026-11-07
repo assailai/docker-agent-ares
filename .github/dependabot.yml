@@ -19,8 +19,9 @@ updates:
       python-minor-patch:
         update-types: [minor, patch]
 
-  # not grouped: both Dockerfiles use python:3.12-alpine, a tag with no patch number, so every
-  # proposal here is an interpreter upgrade (3.12 -> 3.13) and should arrive on its own
+  # not grouped: both Dockerfiles use python:3.12-alpine, a tag with no patch number, so its
+  # proposals are interpreter upgrades (3.12 -> 3.13) and should arrive on their own; the cosign
+  # builder's golang image is pinned to a patch and a digest, so its proposals are toolchain bumps
   - package-ecosystem: docker
     directory: "/"
     schedule: { interval: weekly }

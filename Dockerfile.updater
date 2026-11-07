@@ -14,31 +14,28 @@
 # same arguments verify the signatures CI produces, `--output json` keeps the shape
 # _verified_digest reads, and a wrong signer or an unsigned image is still refused.
 #
-# BUILT FROM SOURCE, not downloaded, and only for as long as upstream lags a fix (ARES-2046). The
-# v3.1.4 release compiles in github.com/klauspost/compress v1.20.1, which carries GO-2026-6865 (a
-# zstd panic, fixed in v1.20.2). No cosign release carried the fix on 2026-11-07, and the publish
-# gate in docker-build.yml refuses a fixable High finding, so the downloaded binary blocked every
-# release. This stage builds the same tag with that one module raised.
+# built from source for now (ARES-2046): the v3.1.4 release compiles in klauspost/compress
+# v1.20.1, which has GO-2026-6865 (a zstd panic, fixed in v1.20.2), and docker-build.yml refuses a
+# fixable High. On 2026-11-07 no cosign release had the fix yet.
 #
-# What replaces the release checksum: the clone must land on the commit the v3.1.4 tag pointed at
-# (a moved tag fails the build), the toolchain is the digest-pinned image below with no download
-# allowed, and the go.sum lines `go get` adds are checked against sum.golang.org.
+# instead of the release checksum we have the tag's commit (a moved tag fails the clone check), a
+# toolchain pinned by digest that cannot fetch another, and sum.golang.org checking the two go.sum
+# lines `go get` adds.
 #
-# The override retires itself. It runs only while upstream's go.mod still names
-# COSIGN_COMPRESS_UPSTREAM; a cosign that ships anything else fails the build here, so moving
-# COSIGN_VERSION forward cannot leave a stale override behind, nor quietly downgrade a newer
-# compress. When cosign ships compress >= v1.20.2, delete this stage and go back to downloading
-# the release and checking it against cosign_checksums.txt (git history before ARES-2046).
+# the go.mod check below fails the build once upstream ships anything but COSIGN_COMPRESS_UPSTREAM,
+# so bumping COSIGN_VERSION cannot keep a stale override, or downgrade a newer compress. When that
+# happens, drop this stage and download the release again, checked against cosign_checksums.txt
+# (see this file before ARES-2046).
 #
-# Cross-compiled on the build host ($BUILDPLATFORM), so the arm64 image costs no emulated Go
-# build. CGO is off: the binary is static and runs on the alpine image below.
+# built on $BUILDPLATFORM and cross-compiled with CGO off, so arm64 needs no emulated Go build and
+# the static binary runs on alpine.
 FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS cosign
 ARG TARGETOS
 ARG TARGETARCH
 ARG COSIGN_VERSION=v3.1.4
 ARG COSIGN_COMMIT=0e48502cf5ef34e2e60bbd3617aa19945712f705
 ARG COSIGN_COMPRESS_UPSTREAM=v1.20.1
-ARG COMPRESS_VERSION=v1.20.3
+ARG COSIGN_COMPRESS_OVERRIDE=v1.20.3
 ENV CGO_ENABLED=0 \
     GOTOOLCHAIN=local
 RUN apk add --no-cache git \
@@ -58,7 +55,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
               "checksum-verified release download (see the comment above)" >&2; \
          exit 1; \
        fi \
-    && go get "github.com/klauspost/compress@${COMPRESS_VERSION}"
+    && go get "github.com/klauspost/compress@${COSIGN_COMPRESS_OVERRIDE}"
 # the version flags are the ones cosign's own Makefile sets, so `cosign version` names the tag and
 # its commit; it reports v3.1.4+dirty, because go.mod is not upstream's
 RUN --mount=type=cache,target=/go/pkg/mod \
@@ -78,8 +75,7 @@ LABEL org.opencontainers.image.vendor="Assail AI"
 
 COPY --from=cosign /out/cosign /usr/local/bin/cosign
 COPY requirements-updater.txt /tmp/requirements-updater.txt
-# `apk upgrade` first, for the reason the agent's Dockerfile gives: Alpine ships a fix (zlib 1.4-r0
-# on 2026-11-07) before the python image is rebuilt on it, and the publish gate refuses the wait.
+# apk upgrade: see the agent's Dockerfile (zlib 1.4-r0 was in Alpine before the python image).
 RUN apk upgrade --no-cache \
     && apk add --no-cache ca-certificates \
     && pip install --no-cache-dir -r /tmp/requirements-updater.txt \
