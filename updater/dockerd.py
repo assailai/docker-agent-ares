@@ -142,8 +142,8 @@ class DockerBackend:
             }
             cid = _create_and_start(docker, name=next_name, body=body)
             if not _stays_up(docker, cid):
-                logger.error("the new updater did not stay up; this one keeps running")
                 docker.delete(f"/containers/{cid}", params={"force": "true"})
+                logger.error("the new updater did not stay up and was removed; this one carries on")
                 return
 
             # step aside first: the successor cannot take the name while this container holds it.

@@ -144,7 +144,8 @@ if wait_for 60 "the failed handoff to be logged" sh -c "docker logs $UPDATER 2>&
         ok "the 1.0.2 updater still holds its name" || bad "updater=$(image_of "$UPDATER")"
     [ "$(docker inspect -f '{{.State.Running}}' "$UPDATER")" = true ] && ok "and is still running" ||
         bad "the 1.0.2 updater stopped"
-    [ -z "$(leftovers)" ] && ok "the crashed successor was removed" ||
+    no_leftovers() { [ -z "$(leftovers)" ]; }
+    wait_for 20 "the crashed successor to be removed" no_leftovers && ok "the crashed successor was removed" ||
         bad "left behind: $(leftovers | tr '\n' ' ')"
 else
     bad "the updater never reported the failed handoff"
