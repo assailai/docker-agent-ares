@@ -2,9 +2,10 @@ version: 2
 # until this file existed nothing proposed a bump here at all, which is how certifi kept trusting
 # a compromised CA root (ARES-1993). The 7-day cooldown guards against a malicious or broken release.
 #
-# not covered: cosign. Dockerfile.updater downloads it by ARG COSIGN_VERSION, which Dependabot does
-# not read; ares-v2's published-image-scan.yml rescans the published updater daily, cosign included,
-# and that is what flags a stale one.
+# not covered: cosign itself. Dockerfile.updater builds it from the tag in ARG COSIGN_VERSION, which
+# Dependabot does not read; ares-v2's published-image-scan.yml rescans the published updater daily,
+# cosign included, and that is what flags a stale one. The golang image that builds it IS covered,
+# by the docker entry below, so the Go standard library compiled into cosign keeps moving.
 updates:
   # requirements.txt and requirements-updater.txt share pins; tests/test_image_pins.py fails a bump
   # that moves one and not the other
@@ -18,8 +19,9 @@ updates:
       python-minor-patch:
         update-types: [minor, patch]
 
-  # not grouped: both Dockerfiles use python:3.12-alpine, a tag with no patch number, so every
-  # proposal here is an interpreter upgrade (3.12 -> 3.13) and should arrive on its own
+  # not grouped: both Dockerfiles use python:3.12-alpine, a tag with no patch number, so its
+  # proposals are interpreter upgrades (3.12 -> 3.13) and should arrive on their own; the cosign
+  # builder's golang image is pinned to a patch and a digest, so its proposals are toolchain bumps
   - package-ecosystem: docker
     directory: "/"
     schedule: { interval: weekly }
