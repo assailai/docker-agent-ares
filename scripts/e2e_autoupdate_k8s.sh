@@ -124,12 +124,16 @@ for _ in $(seq 1 40); do
   sleep 3
 done
 [ -n "$OK" ] || { echo "--- updater logs ---"; $KCTL -n "$NS" logs -l app=ares-agent -c ares-updater --tail=30 2>/dev/null; fail "updater did not patch the deployment to 2.5.0 for both containers"; }
-# one patch for both: the Deployment rolled to a single new revision, not one per container
-REVISION="$($KCTL -n "$NS" get deploy ares-agent -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}')"
-[ "$REVISION" = "2" ] || fail "expected one rollout (revision 2), got revision $REVISION"
 
 echo "==> Confirm the rolled pod is Running on 2.5.0"
 $KCTL -n "$NS" rollout status deploy/ares-agent --timeout=120s >/dev/null 2>&1 || fail "post-swap rollout"
+# one patch for both: the controller numbers the rollout once it has made the new ReplicaSet, so this
+# is read after the rollout, and again after the new updater has polled a few times, to show it does
+# not start a second one (one patch per container would be revision 3)
+revision() { $KCTL -n "$NS" get deploy ares-agent -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}'; }
+[ "$(revision)" = "2" ] || fail "expected one rollout (revision 2), got revision $(revision)"
+sleep 15
+[ "$(revision)" = "2" ] || fail "the new updater rolled the Deployment again (revision $(revision))"
 RUNNING_IMG="$($KCTL -n "$NS" get pod -l app=ares-agent -o jsonpath='{.items[0].spec.containers[0].image}')"
 RUNNING_UPD="$($KCTL -n "$NS" get pod -l app=ares-agent -o jsonpath='{.items[0].spec.containers[1].image}')"
 PHASE="$($KCTL -n "$NS" get pod -l app=ares-agent -o jsonpath='{.items[0].status.phase}')"
