@@ -1,0 +1,71 @@
+# the updater's end-to-end checks on a real engine and a real cluster (ARES-2049): that it moves the
+# agent AND then itself, on Docker (a successor it starts takes over its name) and on Kubernetes (one
+# patch, one rollout). tests/test_updater.py covers the decisions; only a real engine shows that the
+# renames, the self-removal and the restart policy behave the way those tests assume.
+#
+# path-filtered, because the updater image build (cosign from source) and the two agent builds the
+# Kubernetes check needs take several minutes.
+name: E2E auto-update
+
+on:
+  pull_request:
+    paths:
+      - 'updater/**'
+      - 'Dockerfile.updater'
+      - 'requirements-updater.txt'
+      - 'scripts/e2e_self_update.sh'
+      - 'scripts/e2e_autoupdate_k8s.sh'
+      - '.github/workflows/e2e.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'updater/**'
+      - 'Dockerfile.updater'
+      - 'requirements-updater.txt'
+      - 'scripts/e2e_self_update.sh'
+      - 'scripts/e2e_autoupdate_k8s.sh'
+      - '.github/workflows/e2e.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  auto-update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install kind
+        uses: helm/kind-action@v1
+        with:
+          install_only: true
+
+      - name: Build the updater image once, for both checks
+        run: docker build -q -f Dockerfile.updater -t ares-updater:e2e .
+
+      # the e2e images below write their own RELEASE per version, so only this step shows the real
+      # image carries the release it is built as, which keeps the updater from moving backwards
+      - name: The image knows its own release
+        run: |
+          want="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' agent/__version__.py)"
+          got="$(docker run --rm --entrypoint cat ares-updater:e2e /app/updater/RELEASE)"
+          echo "agent/__version__.py=$want image RELEASE=$got"
+          [ -n "$want" ] && [ "$got" = "$want" ]
+
+      - name: Docker - the updater moves the agent, then itself
+        env:
+          E2E_UPDATER_IMAGE: ares-updater:e2e
+        run: bash scripts/e2e_self_update.sh
+
+      - name: Kubernetes - one patch moves the agent and the updater sidecar
+        env:
+          E2E_UPDATER_IMAGE: ares-updater:e2e
+        run: bash scripts/e2e_autoupdate_k8s.sh

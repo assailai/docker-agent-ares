@@ -272,7 +272,8 @@ def test_docker_and_rootless_podman_keep_the_socket_they_already_had(short_tmp: 
 class _UpdaterRun(NamedTuple):
     status: int
     output: str
-    calls: list[str]
+    calls: list[str]  # each engine call's subcommand
+    argv: list[str]  # and its whole argument list
 
 
 def _start_updater(
@@ -292,6 +293,8 @@ def _start_updater(
     operator, or the automation running the installer, would see."""
     calls = workdir / "engine-calls"
     calls.touch()
+    argv = workdir / "engine-argv"
+    argv.touch()
     script = f"""
 set -euo pipefail
 id() {{ echo {uid}; }}
@@ -304,6 +307,7 @@ replace_existing() {{ :; }}
 sleep() {{ :; }}
 engine() {{
     echo "$1" >> {shlex.quote(str(calls))}
+    echo "$*" >> {shlex.quote(str(argv))}
     case "$1" in
         run) printf '%s' "$RUN_OUT"; return "$RUN_RC" ;;
         inspect) printf '%s' "$INSPECT" ;;
@@ -347,6 +351,7 @@ echo "NOTHING TO REPORT"
         status=done.returncode,
         output=done.stdout + done.stderr,
         calls=calls.read_text().splitlines(),
+        argv=argv.read_text().splitlines(),
     )
 
 
@@ -363,7 +368,17 @@ def test_a_working_updater_is_reported_as_started(short_tmp: Path) -> None:
     assert run.status == 0
     assert "INFO Auto-update companion started." in run.output
     assert "NOTHING TO REPORT" in run.output
-    assert run.calls == ["run", "inspect", "exec"]
+    assert run.calls == ["rm", "run", "inspect", "exec"]
+
+
+def test_an_install_removes_what_an_interrupted_updater_handoff_left(short_tmp: Path) -> None:
+    # given an install that may land while an updater is handing itself over (ARES-2049), when the
+    # installer starts the updater
+    run = _start_updater(short_tmp)
+
+    # then before starting one it removes the successor and the stepped-aside updater a handoff
+    # runs, so neither is left idling beside the updater it starts
+    assert run.argv[0] == "rm -f ares-updater-next ares-updater-old"
 
 
 def test_a_failed_docker_run_reports_the_engine_error_not_the_help_line(short_tmp: Path) -> None:

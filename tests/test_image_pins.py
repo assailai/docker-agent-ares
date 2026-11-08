@@ -118,6 +118,19 @@ def test_the_image_runs_the_cosign_it_built() -> None:
     assert "releases/download" not in dockerfile
 
 
+def test_the_updater_image_knows_its_own_release_from_the_one_version_source() -> None:
+    # given the updater Dockerfile
+    dockerfile = _updater_dockerfile()
+
+    # then it writes updater/RELEASE from agent/__version__.py, which main._is_backwards reads to
+    # keep the updater from moving itself backwards; never from an ENV, which a successor would
+    # inherit from the older updater that started it
+    assert "COPY agent/__version__.py /tmp/release.py" in dockerfile
+    assert "> updater/RELEASE" in dockerfile
+    assert "test -s updater/RELEASE" in dockerfile
+    assert "ARES_UPDATE_RELEASE" not in dockerfile
+
+
 @pytest.mark.parametrize("name", ["Dockerfile", "Dockerfile.updater"])
 def test_every_shipped_image_takes_alpines_current_packages(name: str) -> None:
     # given an image whose base, python:3.12-alpine, is rebuilt on its own schedule: on 2026-11-07
