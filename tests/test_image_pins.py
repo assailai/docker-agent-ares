@@ -16,6 +16,9 @@ _PIN = re.compile(r"^([A-Za-z0-9_.-]+)(?:\[[^\]]*\])?==(\S+)")
 _SHA256 = "[0-9a-f]{64}"
 _GIT_SHA = "[0-9a-f]{40}"
 _SEMVER = r"v\d+\.\d+\.\d+"
+# Alpine's package index, ADDed in front of each runtime stage's `apk upgrade` so BuildKit cannot
+# serve that upgrade from a cache built before Alpine published the fix (ARES-2157)
+_APK_INDEX_URL = "https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/APKINDEX.tar.gz"
 
 
 def _pins(name: str) -> dict[str, str]:
@@ -144,3 +147,29 @@ def test_every_shipped_image_takes_alpines_current_packages(name: str) -> None:
     # RUN used to, which hid a failed apk add)
     assert first.startswith("apk upgrade --no-cache"), f"{name}: first RUN is not apk upgrade"
     assert not re.search(pattern=r"\|\| true\s*$", string=first), f"{name}: a failure is masked"
+
+
+@pytest.mark.parametrize("name", ["Dockerfile", "Dockerfile.updater"])
+def test_the_upgrade_reruns_when_alpine_publishes(name: str) -> None:
+    # given a runtime stage whose `apk upgrade` is cached by docker-build.yml (cache-from:
+    # type=gha). Its key is the base layer plus the command string, so on an unmoved
+    # python:3.12-alpine the upgrade is served from the cache and the image ships whatever Alpine
+    # held when the layer was FIRST built: on 2026-11-12 that was krb5-libs 1.22.2-r1 and nine High
+    # CVEs, two days after Alpine built 1.22.3-r0 (ARES-2157)
+    stage = _runtime_stage((ROOT / name).read_text())
+
+    # when the step before that first RUN is read
+    index_at = stage.find(f"ADD {_APK_INDEX_URL} ")
+    upgrade_at = stage.find("RUN apk upgrade --no-cache")
+
+    # then Alpine's package index is fetched immediately in front of it, so BuildKit refetches the
+    # URL, sees the new bytes and reruns the upgrade. `latest-stable`, never a pinned branch: the
+    # base rebases onto the next Alpine on its own schedule, and a pinned branch stops changing and
+    # freezes this layer again, which is the whole bug
+    assert index_at >= 0, f"{name}: the runtime stage does not ADD {_APK_INDEX_URL}"
+    assert index_at < upgrade_at, f"{name}: the index is fetched after the upgrade, so it is no key"
+    assert "/v3." not in _APK_INDEX_URL, "a pinned Alpine branch stops changing and freezes the layer"
+    between = stage[stage.index("\n", index_at) : upgrade_at]
+    assert not re.search(pattern=r"^(?:ADD|COPY|RUN|ARG|ENV)\b", string=between, flags=re.M), (
+        f"{name}: a step sits between the index and the upgrade, so the upgrade can still be cached"
+    )

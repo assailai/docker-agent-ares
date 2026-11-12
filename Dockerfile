@@ -40,6 +40,24 @@ LABEL org.opencontainers.image.vendor="Assail AI"
 # gate refuses a fixable High/Critical. On 2026-11-07 Alpine 3.24 had zlib 1.4-r0 (CVE-2026-4738,
 # Critical) while python:3.12-alpine still carried 1.3.2-r1, which blocked every build (ARES-2046).
 # the `|| true` covers the cache sweep alone, so a failed upgrade or install fails the build.
+#
+# the ADD is what makes that upgrade RERUN. Its cache key is the base layer plus the command
+# string, and neither moves when Alpine publishes: docker-build.yml passes `cache-from: type=gha`,
+# so a rebuild on an unmoved `python:3.12-alpine` serves whichever packages the layer was FIRST
+# built with. 2026-11-12 (ARES-2157) is the worked example: Alpine built krb5-libs 1.22.3-r0 on
+# 11-10, these images were built on 11-08, the base tag last moved on 11-06, and so a plain rebuild
+# would have shipped the nine High CVEs in 1.22.2-r1 again. krb5-libs is not installed here by
+# name, it arrives under `.python-rundeps` via libtirpc, which is exactly why only `apk upgrade`
+# ever moves it. ares-v2's surface harness keys its Debian chromium the same way (ARES-2047).
+#
+# BuildKit refetches the URL on every build and reruns what follows when the bytes change.
+# APKINDEX.tar.gz is rewritten whenever anything in the repository is published, and dl-cdn serves
+# it with an ETag. `latest-stable` rather than a pinned `v3.24`, because the base rebases onto the
+# next Alpine on its own schedule and a pinned branch would quietly stop changing and freeze this
+# layer again, which is the bug this line exists to prevent. x86_64's index stands for both
+# architectures: it is a cache KEY, not an artifact anything reads, and Alpine publishes a fix to
+# every arch from one sweep. The copy left in the image records the index this build upgraded from.
+ADD https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/APKINDEX.tar.gz /usr/share/ares/apkindex.tar.gz
 RUN apk upgrade --no-cache \
     && apk add --no-cache iproute2 dash openssl ca-certificates \
     && rm -rf /var/cache/apk/* \
