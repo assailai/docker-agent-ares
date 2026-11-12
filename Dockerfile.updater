@@ -75,7 +75,10 @@ LABEL org.opencontainers.image.vendor="Assail AI"
 
 COPY --from=cosign /out/cosign /usr/local/bin/cosign
 COPY requirements-updater.txt /tmp/requirements-updater.txt
-# apk upgrade: see the agent's Dockerfile (zlib 1.4-r0 was in Alpine before the python image).
+# apk upgrade, and the ADD that makes it rerun against a cache: see the agent's Dockerfile for
+# both (zlib 1.4-r0 was in Alpine before the python image; krb5-libs 1.22.3-r0 was in Alpine
+# before this layer's cache entry expired).
+ADD https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/APKINDEX.tar.gz /usr/share/ares/apkindex.tar.gz
 RUN apk upgrade --no-cache \
     && apk add --no-cache ca-certificates \
     && pip install --no-cache-dir -r /tmp/requirements-updater.txt \
