@@ -77,6 +77,27 @@ def _env(tmp_path, monkeypatch):
             "state": state, "mocks": mocks}
 
 
+def test_signed_budget_tighter_than_ceiling_is_honored() -> None:
+    timeout_s, max_bytes = main._effective_collect_budget(
+        {"budget": {"per_command_timeout_ms": 5000, "max_received_bytes": 1000}}
+    )
+    assert timeout_s == 5.0 and max_bytes == 1000
+
+
+def test_signed_budget_looser_than_ceiling_is_clamped() -> None:
+    # a forged-large budget can only ever tighten, never loosen, the agent's own bound.
+    timeout_s, max_bytes = main._effective_collect_budget(
+        {"budget": {"per_command_timeout_ms": 10_000_000, "max_received_bytes": 10**9}}
+    )
+    assert timeout_s == main._COLLECT_TIMEOUT_S and max_bytes == main._COLLECT_MAX_BYTES
+
+
+def test_missing_or_malformed_budget_falls_back_to_ceilings() -> None:
+    for job in ({}, {"budget": None}, {"budget": {"per_command_timeout_ms": "x"}}):
+        timeout_s, max_bytes = main._effective_collect_budget(job)
+        assert timeout_s == main._COLLECT_TIMEOUT_S and max_bytes == main._COLLECT_MAX_BYTES
+
+
 async def test_collect_reads_config_and_signs_control_facts(_env) -> None:
     task = {
         "id": "task-c",

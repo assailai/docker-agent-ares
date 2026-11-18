@@ -1080,10 +1080,32 @@ async def _run_assessment_discover(state: AgentState, token: str, task: dict) ->
         )
 
 
-# How long one credentialed collection may take on a device, and how much config to read. Bounded
-# so a slow or chatty device cannot hang the agent.
+# The agent's HARD local ceilings for one credentialed collection: however generous the signed job's
+# budget is, a read on this box never waits longer or buys more than this. The control plane signs a
+# budget too (CollectBudgetV1), and the effective limit is the SMALLER of the two: the signed budget
+# can only ever tighten, never loosen, the agent's own bound. So a slow or chatty device cannot hang
+# the agent, and a forged-large budget cannot make it read unbounded either.
 _COLLECT_TIMEOUT_S = 20.0
 _COLLECT_MAX_BYTES = 2_000_000
+
+
+def _effective_collect_budget(job: dict) -> tuple[float, int]:
+    """(timeout_s, max_bytes) for the device read: the signed budget clamped to the agent ceilings.
+
+    Reads ``per_command_timeout_ms`` / ``max_received_bytes`` from the verified job's budget and
+    takes the smaller of each against the agent's own ceiling. A missing or malformed budget falls
+    back to the ceilings, so an older control plane that signs no budget still gets a bounded read."""
+    budget = job.get("budget")
+    timeout_s = _COLLECT_TIMEOUT_S
+    max_bytes = _COLLECT_MAX_BYTES
+    if isinstance(budget, dict):
+        ms = budget.get("per_command_timeout_ms")
+        if isinstance(ms, int) and ms > 0:
+            timeout_s = min(_COLLECT_TIMEOUT_S, ms / 1000)
+        cap = budget.get("max_received_bytes")
+        if isinstance(cap, int) and cap > 0:
+            max_bytes = min(_COLLECT_MAX_BYTES, cap)
+    return timeout_s, max_bytes
 
 
 async def _collect_controls(
@@ -1101,9 +1123,10 @@ async def _collect_controls(
             )
             for cid in control_ids
         ]
+    timeout_s, max_bytes = _effective_collect_budget(job)
     try:
         config = await ssh_collect.collect_running_config(
-            target, credential, timeout=_COLLECT_TIMEOUT_S, max_bytes=_COLLECT_MAX_BYTES
+            target, credential, timeout=timeout_s, max_bytes=max_bytes
         )
     except Exception as exc:  # noqa: BLE001 - any connect/auth/read failure is honest UNAVAILABLE
         reason = f"collect_failed:{type(exc).__name__}"
