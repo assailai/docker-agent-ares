@@ -34,6 +34,13 @@ _DYNAMIC_MODE = re.compile(r"^switchport mode dynamic (auto|desirable)$")
 _SNMP_COMMUNITY = re.compile(r"^snmp-server community (\S+)")
 _DEFAULT_SNMP_COMMUNITIES = frozenset({"public", "private"})
 
+# A privileged enable secret and its storage encoding type: `enable (password|secret) <type> <hash>`.
+# EOS/IOS type 0 is cleartext and type 7 is the reversible Vigenere cipher, both recoverable from the
+# config; type 5 (MD5) and 8/9 (scrypt/pbkdf2) are one-way. A reversible secret in the config is a
+# credential anyone who can read the config can recover.
+_ENABLE_SECRET = re.compile(r"^enable (?:password|secret) (\d+) \S")
+_REVERSIBLE_SECRET_TYPES = frozenset({"0", "7"})
+
 
 def _indented(line: str) -> bool:
     return line.startswith((" ", "\t"))
@@ -111,6 +118,20 @@ def parse_default_snmp_community_present(running_config: str) -> bool:
     return False
 
 
+def parse_reversible_enable_secret(running_config: str) -> bool:
+    """True when the privileged enable secret is stored with a reversible encoding (type 0 or 7).
+
+    The running-config is complete evidence, so a device with no enable secret, or one stored with a
+    one-way encoding (type 5/8/9), is a definite False rather than an abstention. A reversible secret
+    is recoverable by anyone who can read the config, so its encoding type alone decides this.
+    """
+    for line in running_config.splitlines():
+        match = _ENABLE_SECRET.match(line.strip())
+        if match and match.group(1) in _REVERSIBLE_SECRET_TYPES:
+            return True
+    return False
+
+
 # Which control fields this parser can extract, and how. Each returns the field's typed value, or
 # raises to signal the config did not show it (the collector then abstains for that field).
 _FIELD_EXTRACTORS = {
@@ -118,6 +139,9 @@ _FIELD_EXTRACTORS = {
     ("net.port.dynamic_trunk", "dynamic_trunk_negotiation"): parse_dynamic_trunk_negotiation,
     ("net.snmp.default_community", "default_snmp_community_present"): (
         parse_default_snmp_community_present
+    ),
+    ("net.management.weak_enable_secret", "reversible_enable_secret"): (
+        parse_reversible_enable_secret
     ),
 }
 

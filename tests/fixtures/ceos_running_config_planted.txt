@@ -2,6 +2,8 @@
 !
 hostname core-switch
 !
+enable password 7 105A1D0D1C09
+!
 management ssh
    no shutdown
 !

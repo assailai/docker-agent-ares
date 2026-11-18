@@ -2,6 +2,8 @@
 !
 hostname edge-router
 !
+enable secret 5 $1$salt$3xampleOneWayHashValue0
+!
 management ssh
    no shutdown
 !

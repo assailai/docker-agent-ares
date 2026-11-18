@@ -80,6 +80,32 @@ def test_snmp_community_with_view_and_acl_still_reads_the_name() -> None:
     assert arista.parse_default_snmp_community_present(cfg) is True
 
 
+def test_planted_config_stores_a_reversible_enable_secret() -> None:
+    # core-switch keeps `enable password 7 ...` (the reversible Vigenere encoding).
+    cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
+    assert arista.parse_reversible_enable_secret(cfg) is True
+
+
+def test_clean_config_uses_a_one_way_enable_secret() -> None:
+    # edge-router stores `enable secret 5 ...` (MD5, not reversible).
+    cfg = (_FIX / "ceos_running_config_clean.txt").read_text()
+    assert arista.parse_reversible_enable_secret(cfg) is False
+
+
+def test_cleartext_enable_secret_is_reversible() -> None:
+    # type 0 is cleartext in the config, which is reversible by definition.
+    assert arista.parse_reversible_enable_secret("enable secret 0 letmein\n") is True
+
+
+def test_no_enable_secret_is_a_definite_false() -> None:
+    assert arista.parse_reversible_enable_secret("hostname x\n") is False
+
+
+def test_strong_enable_secret_without_a_type_digit_is_not_reversible() -> None:
+    # `enable secret sha512 $6$...` names an algorithm, not a reversible type number.
+    assert arista.parse_reversible_enable_secret("enable secret sha512 $6$abc$def\n") is False
+
+
 def test_collect_control_fields_for_telnet() -> None:
     cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
     fields = arista.collect_control_fields(cfg, "net.management.telnet")
@@ -96,6 +122,12 @@ def test_collect_control_fields_for_default_snmp_community() -> None:
     cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
     fields = arista.collect_control_fields(cfg, "net.snmp.default_community")
     assert fields == {"default_snmp_community_present": True}
+
+
+def test_collect_control_fields_for_weak_enable_secret() -> None:
+    cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
+    fields = arista.collect_control_fields(cfg, "net.management.weak_enable_secret")
+    assert fields == {"reversible_enable_secret": True}
 
 
 def test_collect_control_fields_for_unsupported_control_is_none() -> None:
