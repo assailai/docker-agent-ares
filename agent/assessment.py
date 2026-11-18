@@ -101,3 +101,32 @@ def public_key_b64_from_seed(seed_b64: str) -> str:
         encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
     )
     return base64.b64encode(raw).decode()
+
+
+def seal_result(
+    payload: dict,
+    *,
+    schema: str,
+    seed_b64: str,
+    domain: str,
+    signer_key_id: str,
+) -> dict:
+    """Seal a result payload into the control plane's ``SignedEnvelope`` wire shape, byte-for-byte.
+
+    The agent signs its OWN results with the private seed it generated at enrolment (the seed never
+    leaves the agent; only the matching public key was registered). The control plane verifies the
+    signature against that registered public key before admitting the result. The payload bytes are
+    the EXACT bytes the control plane's ``signing.canonical_json_bytes`` produces (sorted keys,
+    compact separators, no NaN), so a round trip through ``wire.open_sealed`` reads them unchanged.
+    """
+    payload_bytes = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+    private = Ed25519PrivateKey.from_private_bytes(base64.b64decode(seed_b64, validate=True))
+    signature = base64.b64encode(private.sign(_domain_separated(domain, payload_bytes))).decode()
+    return {
+        "schema_version": schema,
+        "payload": base64.b64encode(payload_bytes).decode(),
+        "signature": signature,
+        "signer_key_id": signer_key_id,
+    }
