@@ -21,3 +21,10 @@ websockets==14.1
 python-dotenv==1.0.1
 pydantic==2.10.3
 pydantic-settings==2.6.1
+
+# Ed25519 signature verification for Network Assessment jobs (agent/assessment.py): the agent
+# verifies the control plane's signature over a job before reading any target field, and signs its
+# own evidence back. Byte-compatible with ares/domain/assessment on the control plane. The builder
+# stage already has gcc + openssl-dev, so the wheel/build is available; floor matches the control
+# plane's CVE floor (ares-v2 pins cryptography>=50.0.0).
+cryptography==50.0.2
