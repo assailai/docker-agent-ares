@@ -1,0 +1,17 @@
+! device: core-switch (cEOS)
+!
+hostname core-switch
+!
+management ssh
+   no shutdown
+!
+management telnet
+   no shutdown
+!
+management api http-commands
+   no shutdown
+!
+line vty 0 31
+   transport input ssh telnet
+!
+end

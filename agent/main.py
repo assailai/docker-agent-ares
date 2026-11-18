@@ -32,7 +32,9 @@ from agent.hostpins import HostPins
 from agent.identify import IdentityProbe
 from agent.kubeinfo import KubeApi, KubeConfigError, KubernetesEvidence, safe_collect
 from agent.progress import ProgressReporter
-from agent import assessment, assessment_discover, protocols
+from agent import assessment, assessment_collect, assessment_discover, protocols
+from agent.collectors import arista, ssh_collect
+from agent.credential_vault import CredentialVault
 from agent.state import AgentState, fingerprint, load_state, save_state
 from agent.tunnel import (
     TunnelManager,
@@ -773,7 +775,9 @@ async def _hand_back(token: str, task_id: str) -> None:
 # any probe); the credentialed COLLECT type is still deliberately absent until its collectors land,
 # so the fleet refuses it rather than running it as a sweep (the agent-first invariant during
 # rollout). Dispatch of discover stays control-plane-gated (the module ships dark) regardless.
-_HANDLED_TASK_TYPES = frozenset({"local_network_scan", "network_assessment_discover_v1"})
+_HANDLED_TASK_TYPES = frozenset(
+    {"local_network_scan", "network_assessment_discover_v1", "network_assessment_collect_v1"}
+)
 
 
 async def _run_task(token: str, task: dict, *, state: AgentState | None = None) -> None:
@@ -793,15 +797,18 @@ async def _run_task(token: str, task: dict, *, state: AgentState | None = None) 
             settings, token, task_id, reason=f"unsupported task type: {task_type!r}"
         )
         return
-    if task_type == "network_assessment_discover_v1":
+    if task_type in ("network_assessment_discover_v1", "network_assessment_collect_v1"):
         if state is None:  # defensive: the poll loop always threads state in on this path
             await control_plane.task_failed(
                 settings, token, task_id, reason="internal: agent state unavailable"
             )
             return
         # The signed-job path: verify the control plane's signature BEFORE reading any target field
-        # (agent-first), then re-derive scope, probe and sign the result.
-        await _run_assessment_discover(state, token, task)
+        # (agent-first), then act. Discover probes; collect reads a device config with a local cred.
+        if task_type == "network_assessment_discover_v1":
+            await _run_assessment_discover(state, token, task)
+        else:
+            await _run_assessment_collect(state, token, task)
         return
     cidr = task.get("target_network")
     config = task.get("tool_config") or {}
@@ -1068,6 +1075,122 @@ async def _run_assessment_discover(state: AgentState, token: str, task: dict) ->
         raise
     except Exception as exc:  # noqa: BLE001 - report any failure rather than dropping the task
         logger.error("Assessment discover %s failed: %s", task_id, exc)
+        await control_plane.task_failed(
+            settings, token, task_id, reason=f"{type(exc).__name__}: {exc}"
+        )
+
+
+# How long one credentialed collection may take on a device, and how much config to read. Bounded
+# so a slow or chatty device cannot hang the agent.
+_COLLECT_TIMEOUT_S = 20.0
+_COLLECT_MAX_BYTES = 2_000_000
+
+
+async def _collect_controls(
+    job: dict, control_ids: list[str], credential
+) -> tuple[list[dict], list[dict]]:
+    """Read the device config ONCE and normalise it per control. Returns (controls, coverage).
+
+    No local credential, or a failed read, makes every requested control UNAVAILABLE (honest
+    coverage), never a guessed fact. A control this agent's parser does not support is UNSUPPORTED."""
+    target = job["target_address"]
+    if credential is None:
+        return [], [
+            assessment_collect.coverage_entry(
+                scope=f"{target}:{cid}", state="unavailable", reason_code="no_local_credential"
+            )
+            for cid in control_ids
+        ]
+    try:
+        config = await ssh_collect.collect_running_config(
+            target, credential, timeout=_COLLECT_TIMEOUT_S, max_bytes=_COLLECT_MAX_BYTES
+        )
+    except Exception as exc:  # noqa: BLE001 - any connect/auth/read failure is honest UNAVAILABLE
+        reason = f"collect_failed:{type(exc).__name__}"
+        return [], [
+            assessment_collect.coverage_entry(
+                scope=f"{target}:{cid}", state="unavailable", reason_code=reason
+            )
+            for cid in control_ids
+        ]
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    for control_id in control_ids:
+        fields = arista.collect_control_fields(config, control_id)
+        if fields is None:
+            coverage.append(
+                assessment_collect.coverage_entry(
+                    scope=f"{target}:{control_id}", state="unsupported", reason_code="no_parser"
+                )
+            )
+            continue
+        controls.append(
+            assessment_collect.control_facts(control_id, fields, collection_complete=True)
+        )
+    return controls, coverage
+
+
+async def _run_assessment_collect(state: AgentState, token: str, task: dict) -> None:
+    """Run one signed credentialed COLLECT job: verify, resolve the LOCAL credential, read the
+    device config read-only, normalise to facts, sign and submit.
+
+    Agent-first: the signed job is verified against the control plane's keys BEFORE any field is
+    read or any session opened. The credential is resolved from the agent's OWN vault (the secret
+    never leaves the box); a reference the vault does not hold yields an honest UNAVAILABLE rather
+    than a failure. The result is signed with the agent's enrolment key."""
+    task_id = task["id"]
+    envelope = (task.get("tool_config") or {}).get("envelope")
+    job = assessment.open_signed_job(
+        envelope,
+        public_keys=state.cp_assessment_public_keys or [],
+        domain=assessment_collect.JOB_DOMAIN,
+        expected_schema=assessment_collect.JOB_SCHEMA,
+    )
+    if job is None:
+        logger.warning("Refused collect job %s: signature/schema verification failed", task_id)
+        await control_plane.task_failed(
+            settings, token, task_id, reason="signed collect job failed verification"
+        )
+        return
+    if not state.signing_key_seed:
+        await control_plane.task_failed(
+            settings, token, task_id, reason="agent has no signing key to sign the result"
+        )
+        return
+    try:
+        control_ids = assessment_collect.require_fields(job)
+    except ValueError as exc:
+        logger.warning("Refused collect job %s: %s", task_id, exc)
+        await control_plane.task_failed(settings, token, task_id, reason=f"malformed job: {exc}")
+        return
+
+    credential = CredentialVault(settings.credential_vault_path).resolve(job["credential_ref"])
+    await control_plane.task_started(settings, token, task_id)
+    try:
+        controls, coverage = await _collect_controls(job, control_ids, credential)
+        completed_at = datetime.now(UTC).isoformat()
+        result = assessment_collect.build_collect_result(
+            job, controls=controls, coverage=coverage, completed_at=completed_at,
+            partial=not controls,
+        )
+        sealed = assessment.seal_result(
+            result,
+            schema=assessment_collect.RESULT_SCHEMA,
+            seed_b64=state.signing_key_seed,
+            domain=assessment_collect.RESULT_DOMAIN,
+            signer_key_id=assessment.public_key_b64_from_seed(state.signing_key_seed),
+        )
+        await control_plane.submit_assessment_result(
+            settings, token, task_id, sealed, completed_at=completed_at
+        )
+        logger.info(
+            "Assessment collect %s: %d control(s) collected, %d coverage gap(s) on %s",
+            task_id, len(controls), len(coverage), job["target_address"],
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - report any failure rather than dropping the task
+        logger.error("Assessment collect %s failed: %s", task_id, exc)
         await control_plane.task_failed(
             settings, token, task_id, reason=f"{type(exc).__name__}: {exc}"
         )

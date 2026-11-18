@@ -33,7 +33,7 @@ def _mock_control_plane_and_scan(monkeypatch: pytest.MonkeyPatch) -> dict[str, A
 
 @pytest.mark.parametrize(
     "task_type",
-    ["network_assessment_collect_v1", "something_new", None],
+    ["something_new", None],
 )
 async def test_unhandled_task_type_emits_zero_target_activity(
     task_type: str | None, _mock_control_plane_and_scan: dict[str, AsyncMock]
@@ -78,4 +78,4 @@ def test_handled_task_types() -> None:
     # collect type is deliberately not, until its collectors land.
     assert "local_network_scan" in main._HANDLED_TASK_TYPES
     assert "network_assessment_discover_v1" in main._HANDLED_TASK_TYPES
-    assert "network_assessment_collect_v1" not in main._HANDLED_TASK_TYPES
+    assert "network_assessment_collect_v1" in main._HANDLED_TASK_TYPES

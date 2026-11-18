@@ -1,0 +1,14 @@
+! device: edge-router (cEOS)
+!
+hostname edge-router
+!
+management ssh
+   no shutdown
+!
+management telnet
+   shutdown
+!
+line vty 0 31
+   transport input ssh
+!
+end
