@@ -79,7 +79,9 @@ def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-async def register(settings: Settings, *, networks: list[str], name: str) -> dict:
+async def register(
+    settings: Settings, *, networks: list[str], name: str, signing_public_key: str | None = None
+) -> dict:
     body = {
         "registration_token": settings.token.get_secret_value(),
         "internal_networks": networks,
@@ -87,6 +89,7 @@ async def register(settings: Settings, *, networks: list[str], name: str) -> dic
         "hostname": socket.gethostname(),
         "agent_version": settings.agent_version,
         "capabilities": capabilities(settings),
+        "signing_public_key": signing_public_key,
         "system_info": system_info(),
     }
     async with _client(settings) as client:

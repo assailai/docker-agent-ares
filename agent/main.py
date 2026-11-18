@@ -30,6 +30,7 @@ from agent.hostpins import HostPins
 from agent.identify import IdentityProbe
 from agent.kubeinfo import KubeApi, KubeConfigError, KubernetesEvidence, safe_collect
 from agent.progress import ProgressReporter
+from agent import assessment
 from agent.state import AgentState, fingerprint, load_state, save_state
 from agent.tunnel import (
     TunnelManager,
@@ -190,7 +191,17 @@ def _server_name(resp: dict) -> str | None:
 async def _register(state: AgentState, networks: list[str]) -> AgentState:
     logger.info("Registering with %s (networks=%s)", settings.base_url, networks or "none")
     presented = settings.token.get_secret_value()
-    resp = await control_plane.register(settings, networks=networks, name=settings.agent_name)
+    # Generate the agent's signing keypair once, on first enrolment, and register only its public
+    # half; the control plane verifies the agent's signed results against it. Persisted below via
+    # save_state, so a restart reuses the same key.
+    if not state.signing_key_seed:
+        state.signing_key_seed = assessment.generate_signing_seed()
+    resp = await control_plane.register(
+        settings,
+        networks=networks,
+        name=settings.agent_name,
+        signing_public_key=assessment.public_key_b64_from_seed(state.signing_key_seed),
+    )
     state.agent_id = resp["agent_id"]
     state.agent_token = resp["agent_token"]
     # Bind the identity to the token that minted it. This is the whole point of the field: on a

@@ -112,3 +112,21 @@ def test_malformed_envelope_is_refused(bad: object) -> None:
         )
         is None
     )
+
+
+def test_generated_keypair_signs_a_result_that_verifies() -> None:
+    # The agent generates a keypair once, registers the public half, and signs its results with the
+    # private half. A signature by the seed must verify under the derived public key.
+    seed = assessment.generate_signing_seed()
+    public = assessment.public_key_b64_from_seed(seed)
+    private = Ed25519PrivateKey.from_private_bytes(base64.b64decode(seed))
+    message = DOMAIN.encode("ascii") + b"\x00" + b"result-bytes"
+    signature = base64.b64encode(private.sign(message)).decode()
+    assert assessment.verify_signature(
+        signature=signature, domain=DOMAIN, payload=b"result-bytes", public_keys=[public]
+    )
+
+
+def test_public_key_is_stable_for_a_seed() -> None:
+    seed = assessment.generate_signing_seed()
+    assert assessment.public_key_b64_from_seed(seed) == assessment.public_key_b64_from_seed(seed)

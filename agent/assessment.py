@@ -22,7 +22,8 @@ import json
 from typing import Any
 
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 _PRINTABLE_ASCII_MIN = 0x21
 _PRINTABLE_ASCII_MAX = 0x7E
@@ -84,3 +85,19 @@ def open_signed_job(
     except (ValueError, TypeError):
         return None
     return decoded if isinstance(decoded, dict) else None
+
+
+def generate_signing_seed() -> str:
+    """A fresh base64 of a raw 32-byte Ed25519 PRIVATE seed. The agent generates this once at
+    enrolment, persists it locally (never sends it), and registers only the matching public key."""
+    return base64.b64encode(Ed25519PrivateKey.generate().private_bytes_raw()).decode()
+
+
+def public_key_b64_from_seed(seed_b64: str) -> str:
+    """The base64 of the raw 32-byte PUBLIC key matching a private seed produced by
+    :func:`generate_signing_seed`. This is what the agent registers and signs results under."""
+    private = Ed25519PrivateKey.from_private_bytes(base64.b64decode(seed_b64, validate=True))
+    raw = private.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
+    )
+    return base64.b64encode(raw).decode()

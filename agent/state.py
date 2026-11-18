@@ -36,6 +36,9 @@ def fingerprint(registration_token: str) -> str:
 class AgentState:
     agent_id: str | None = None
     agent_token: str | None = None  # bearer token presented on every control-plane call
+    # Base64 of the agent's raw Ed25519 PRIVATE seed, generated once at enrolment and NEVER sent.
+    # The agent signs its results/evidence with it; only the matching public key is registered.
+    signing_key_seed: str | None = None
     # Which ARES_TOKEN this identity is already accounted for by. Two cases share the field: the
     # registration token that minted the identity, or - when a *different* token was presented
     # and the control plane refused it as spent - that refused one, recorded so the agent does
