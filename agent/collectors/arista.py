@@ -41,6 +41,12 @@ _DEFAULT_SNMP_COMMUNITIES = frozenset({"public", "private"})
 _ENABLE_SECRET = re.compile(r"^enable (?:password|secret) (\d+) \S")
 _REVERSIBLE_SECRET_TYPES = frozenset({"0", "7"})
 
+# A management access line (vty) block header, and the source restriction that may be bound inside it.
+# EOS permits any source on a vty with no `ip access-class ... in`, so a vty block that binds none
+# leaves the management plane reachable from unrestricted source networks.
+_VTY_LINE = re.compile(r"^line vty\b")
+_ACCESS_CLASS_IN = re.compile(r"^ip access-class \S+ in$")
+
 
 def _indented(line: str) -> bool:
     return line.startswith((" ", "\t"))
@@ -132,6 +138,31 @@ def parse_reversible_enable_secret(running_config: str) -> bool:
     return False
 
 
+def parse_unrestricted_management_source(running_config: str) -> bool:
+    """True when a management access line (vty) binds no source access-class, leaving it reachable
+    from any source network.
+
+    EOS defaults a vty to permit-any, so a vty block with no `ip access-class ... in` is unrestricted.
+    The running-config is complete evidence: a device whose every vty binds a source access-class is a
+    definite False. A device with no vty block at all has no such line to flag, so it is also False.
+    """
+    lines = running_config.splitlines()
+    index = 0
+    while index < len(lines):
+        if _VTY_LINE.match(lines[index].strip()):
+            restricted = False
+            index += 1
+            while index < len(lines) and _indented(lines[index]):
+                if _ACCESS_CLASS_IN.match(lines[index].strip()):
+                    restricted = True
+                index += 1
+            if not restricted:
+                return True
+            continue
+        index += 1
+    return False
+
+
 # Which control fields this parser can extract, and how. Each returns the field's typed value, or
 # raises to signal the config did not show it (the collector then abstains for that field).
 _FIELD_EXTRACTORS = {
@@ -142,6 +173,9 @@ _FIELD_EXTRACTORS = {
     ),
     ("net.management.weak_enable_secret", "reversible_enable_secret"): (
         parse_reversible_enable_secret
+    ),
+    ("net.management.unrestricted_source", "unrestricted_management_source"): (
+        parse_unrestricted_management_source
     ),
 }
 

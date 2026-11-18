@@ -19,5 +19,6 @@ interface Ethernet1
 !
 line vty 0 31
    transport input ssh
+   ip access-class MGMT-IN in
 !
 end
