@@ -208,6 +208,9 @@ async def _register(state: AgentState, networks: list[str]) -> AgentState:
     # later start it separates an ordinary restart (same token, keep serving) from an operator
     # re-running the installer with the token for a *different* agent. See _enroll.
     state.registration_token_fingerprint = fingerprint(presented)
+    keys = resp.get("assessment_signing_public_keys")
+    if isinstance(keys, list) and all(isinstance(k, str) for k in keys):
+        state.cp_assessment_public_keys = keys
     _cadence["heartbeat"] = resp.get("heartbeat_interval_seconds", _cadence["heartbeat"])
     _cadence["poll"] = resp.get("poll_interval_seconds", _cadence["poll"])
     save_state(settings.state_path, state)
@@ -247,6 +250,7 @@ async def _preflight(state: AgentState, ssl_context: ssl.SSLContext) -> None:
         # registration token, and this is the first proof the long-lived agent token works.
         logger.info("Preflight: control plane OK (%s)", settings.base_url)
         _apply_auto_rescan(resp.get("auto_rescan"), state=state)
+        _apply_cp_assessment_keys(resp.get("assessment_signing_public_keys"), state=state)
     except (httpx.HTTPError, OSError) as exc:
         logger.error("Preflight: control plane FAILED: %s%s", _reason(exc), _tls_hint(exc))
 
@@ -472,6 +476,7 @@ async def _heartbeat_loop(state: AgentState, tunnel: TunnelManager) -> None:
             _record_contact()  # feed the watchdog + refresh the healthcheck marker
             _cadence["heartbeat"] = resp.get("heartbeat_interval_seconds", _cadence["heartbeat"])
             _apply_auto_rescan(resp.get("auto_rescan"), state=state)
+            _apply_cp_assessment_keys(resp.get("assessment_signing_public_keys"), state=state)
             tunnel.sync(
                 bool(resp.get("tunnel_required")),
                 _allowed_hosts(resp.get("tunnel_allowed_hosts")),
@@ -937,6 +942,22 @@ def _apply_auto_rescan(value: object, *, state: AgentState) -> None:
             "Automatic rescans turned off from the dashboard: keeping the networks already found "
             "and not probing again until they are turned back on."
         )
+
+
+def _apply_cp_assessment_keys(value: object, *, state: AgentState) -> None:
+    """Store the control plane's assessment signing public keys, as a register/heartbeat reported.
+
+    Only a list of strings counts. A response without the field (a control plane older than it)
+    changes nothing, so the agent keeps verifying against the last set it was told, and a key
+    rotation that reaches the fleet on the next beat replaces the set. Persisted with the identity
+    so a restart can verify a job before its first successful beat.
+    """
+    if not isinstance(value, list) or not all(isinstance(k, str) for k in value):
+        return
+    if value == state.cp_assessment_public_keys:
+        return
+    state.cp_assessment_public_keys = value
+    _persist(state)
 
 
 def _publish_reachable(networks: list[str], tunnel: TunnelManager | None) -> None:

@@ -39,6 +39,12 @@ class AgentState:
     # Base64 of the agent's raw Ed25519 PRIVATE seed, generated once at enrolment and NEVER sent.
     # The agent signs its results/evidence with it; only the matching public key is registered.
     signing_key_seed: str | None = None
+    # The control plane's assessment signing PUBLIC keys, as register/heartbeat last reported them
+    # (current first, then previous). The agent verifies every signed Network Assessment job against
+    # these BEFORE reading any target field. Persisted so a restart can still verify before its
+    # first beat; refreshed on every beat so a control-plane key rotation reaches the agent. None
+    # means never told (a control plane older than the field, or an agent not yet beaten).
+    cp_assessment_public_keys: list[str] | None = None
     # Which ARES_TOKEN this identity is already accounted for by. Two cases share the field: the
     # registration token that minted the identity, or - when a *different* token was presented
     # and the control plane refused it as spent - that refused one, recorded so the agent does
@@ -72,6 +78,11 @@ class AgentState:
             self.detected_networks = None
         if not isinstance(self.detected_scope, str):
             self.detected_scope = None
+        if not (
+            isinstance(self.cp_assessment_public_keys, list)
+            and all(isinstance(k, str) for k in self.cp_assessment_public_keys)
+        ):
+            self.cp_assessment_public_keys = None
         probed = self.reach_probed_at
         # bool is an int subclass, so a stray `true` would otherwise read as a probe at epoch 1
         if isinstance(probed, bool) or not isinstance(probed, (int, float)):
