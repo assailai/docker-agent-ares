@@ -11,6 +11,14 @@ management telnet
 management api http-commands
    no shutdown
 !
+interface Ethernet1
+   description access-user-port
+   switchport mode dynamic auto
+!
+interface Ethernet2
+   description uplink
+   switchport mode trunk
+!
 line vty 0 31
    transport input ssh telnet
 !

@@ -21,6 +21,12 @@ _MGMT_SERVICE = re.compile(r"^management (ssh|telnet)$")
 _TRANSPORT_INPUT = re.compile(r"^transport input (.+)$")
 _MANAGEMENT_PROTOCOL_WORDS = frozenset({"ssh", "telnet"})
 
+# An interface block header, and a `switchport mode dynamic ...` line inside it. EOS leaves an access
+# port with DTP enabled when the mode is `dynamic auto`/`dynamic desirable`, so a switched port left
+# in a dynamic mode is negotiating trunking rather than being pinned to access.
+_INTERFACE = re.compile(r"^interface (\S+)$")
+_DYNAMIC_MODE = re.compile(r"^switchport mode dynamic (auto|desirable)$")
+
 
 def _indented(line: str) -> bool:
     return line.startswith((" ", "\t"))
@@ -59,10 +65,35 @@ def parse_management_protocols(running_config: str) -> list[str]:
     return sorted(protocols)
 
 
+def parse_dynamic_trunk_negotiation(running_config: str) -> bool:
+    """True when any switched interface is left negotiating a trunk (DTP on a `dynamic` mode).
+
+    Device-level for v1: the control is "dynamic trunk negotiation on an approved access-role port",
+    and this returns whether ANY Ethernet interface is in `switchport mode dynamic auto|desirable`.
+    Binding the verdict to the port's approved role (so an uplink that is meant to trunk is excluded)
+    is the hardening the control's own limitation note names; here the role is not yet modelled, so a
+    True means at least one switched port is negotiating, which an access-role port must not.
+    """
+    lines = running_config.splitlines()
+    index = 0
+    while index < len(lines):
+        header = _INTERFACE.match(lines[index].strip())
+        if header and header.group(1).lower().startswith("ethernet"):
+            index += 1
+            while index < len(lines) and _indented(lines[index]):
+                if _DYNAMIC_MODE.match(lines[index].strip()):
+                    return True
+                index += 1
+            continue
+        index += 1
+    return False
+
+
 # Which control fields this parser can extract, and how. Each returns the field's typed value, or
 # raises to signal the config did not show it (the collector then abstains for that field).
 _FIELD_EXTRACTORS = {
     ("net.management.telnet", "management_protocols"): parse_management_protocols,
+    ("net.port.dynamic_trunk", "dynamic_trunk_negotiation"): parse_dynamic_trunk_negotiation,
 }
 
 

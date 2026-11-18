@@ -8,6 +8,11 @@ management ssh
 management telnet
    shutdown
 !
+interface Ethernet1
+   description access-user-port
+   switchport mode access
+   switchport nonegotiate
+!
 line vty 0 31
    transport input ssh
 !
