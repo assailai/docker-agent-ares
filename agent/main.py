@@ -748,8 +748,28 @@ async def _hand_back(token: str, task_id: str) -> None:
         logger.warning("Could not hand task %s back (%s); its lease will.", task_id, exc)
 
 
+# The task types THIS agent build knows how to run. A task type OUTSIDE this set (a new
+# network-assessment task dispatched to an un-upgraded agent, or a malformed one) must fail closed
+# BEFORE any target field is read, so it produces zero target activity. These mirror the control
+# plane's AgentTaskType values; the network-assessment discover/collect task types arrive with the
+# collectors and signed-job verification, and are deliberately absent until then so the fleet
+# refuses them rather than running them as a CIDR sweep (the agent-first invariant during rollout).
+_HANDLED_TASK_TYPES = frozenset({"local_network_scan"})
+
+
 async def _run_task(token: str, task: dict) -> None:
     task_id = task["id"]
+    task_type = task.get("task_type")
+    if task_type not in _HANDLED_TASK_TYPES:
+        # Agent-first gate: classify the task type before reading any target field, so an unhandled
+        # type yields zero target activity and a typed rejection, never a fall-through to the
+        # scanner. Refused before task_started, so a task the agent will not run is never reported
+        # as one it began.
+        logger.warning("Refused task %s: unhandled task_type %r", task_id, task_type)
+        await control_plane.task_failed(
+            settings, token, task_id, reason=f"unsupported task type: {task_type!r}"
+        )
+        return
     cidr = task.get("target_network")
     config = task.get("tool_config") or {}
     ports = config.get("ports") or list(scan.DEFAULT_PORTS)
