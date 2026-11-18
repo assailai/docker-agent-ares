@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import ipaddress
 import json
 import logging
@@ -31,7 +32,7 @@ from agent.hostpins import HostPins
 from agent.identify import IdentityProbe
 from agent.kubeinfo import KubeApi, KubeConfigError, KubernetesEvidence, safe_collect
 from agent.progress import ProgressReporter
-from agent import assessment, assessment_discover
+from agent import assessment, assessment_discover, protocols
 from agent.state import AgentState, fingerprint, load_state, save_state
 from agent.tunnel import (
     TunnelManager,
@@ -917,15 +918,42 @@ _DISCOVER_JOB_DOMAIN = "ares.network-assessment.signed-task.discover:v1"
 _DISCOVER_JOB_SCHEMA = "ares.network-assessment.signed-task.discover.v1"
 
 
+# How many opening bytes to read from an open service to identify its protocol. A banner is small;
+# this bounds a server that would otherwise dribble bytes forever, and only the head is classified.
+_BANNER_MAX_BYTES = 512
+
+
+async def _read_banner(ip: str, port: int, *, timeout: float) -> bytes:
+    """Read up to ``_BANNER_MAX_BYTES`` a service sends FIRST, within ``timeout``; ``b""`` on a
+    timeout, refusal or silence.
+
+    A passive read: no bytes are sent, so it cannot drive a server-side action, and a service that
+    waits for the client to speak (HTTP) simply yields nothing and stays unidentified. Separated out
+    so the discover handler's probing stays testable by monkeypatching this one function."""
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=timeout)
+    except (OSError, asyncio.TimeoutError, TimeoutError):
+        return b""
+    try:
+        return await asyncio.wait_for(reader.read(_BANNER_MAX_BYTES), timeout=timeout) or b""
+    except (OSError, asyncio.TimeoutError, TimeoutError):
+        return b""
+    finally:
+        with contextlib.suppress(OSError):
+            writer.close()
+            await writer.wait_closed()
+
+
 async def _probe_discover_scope(scope: assessment_discover.DiscoverScope) -> list[dict] | None:
     """Probe every in-scope network over the scope's ports, returning OPEN service observations, or
     None if a pause landed first (the caller then hands the task back).
 
-    v1 reports what ANSWERED (an OPEN TCP connect), honestly and no more: protocol identification
-    from a banner read (telnet negotiation, SSH id string) lands with the protocol specialists, so
-    nothing here infers a product from a port. Every host is gated by ``scope.in_scope`` before it
-    is counted, so an address outside the frozen scope is never reported even if the scanner, handed
-    a wider range, happened to reach it."""
+    For each OPEN service a bounded, passive banner read identifies the protocol from what the
+    service EMITS (a telnet IAC negotiation, an SSH id string, an SMTP/FTP greeting), never from the
+    port: a service that answers with nothing distinctive stays ``protocol_id = None`` rather than
+    being guessed from the port it sits on. Every host is gated by ``scope.in_scope`` before it is
+    probed or counted, so an address outside the frozen scope is never reached even if the scanner,
+    handed a wider range, happened to see it."""
     observations: list[dict] = []
     for network in scope.networks:
         hits = await _unless_paused(
@@ -947,9 +975,17 @@ async def _probe_discover_scope(scope: assessment_discover.DiscoverScope) -> lis
             ip, port = hit.get("ip"), hit.get("port")
             if ip is None or port is None or not scope.in_scope(str(ip)):
                 continue
+            banner = await _read_banner(str(ip), int(port), timeout=settings.scan_connect_timeout)
+            protocol_id = protocols.identify_protocol(banner)
+            banner_sha256 = hashlib.sha256(banner).hexdigest() if banner else None
             observations.append(
                 assessment_discover.service_observation(
-                    address=str(ip), port=int(port), transport="tcp", outcome="open"
+                    address=str(ip),
+                    port=int(port),
+                    transport="tcp",
+                    outcome="open",
+                    protocol_id=protocol_id,
+                    banner_sha256=banner_sha256,
                 )
             )
     return observations

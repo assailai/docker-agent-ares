@@ -38,6 +38,9 @@ def _signed_job(cp_seed: str) -> dict:
     )
 
 
+_BANNERS = {23: b"\xff\xfd\x18\xff\xfd\x20", 22: b"SSH-2.0-OpenSSH_9.6\r\n"}
+
+
 @pytest.fixture
 def _mocks(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]:
     mocks = {
@@ -56,6 +59,11 @@ def _mocks(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]:
     monkeypatch.setattr(main.control_plane, "task_failed", mocks["task_failed"])
     monkeypatch.setattr(main.control_plane, "submit_assessment_result", mocks["submit"])
     monkeypatch.setattr(main.scan, "scan_cidr", mocks["scan_cidr"])
+
+    async def _banner(_ip: str, port: int, *, timeout: float) -> bytes:
+        return _BANNERS.get(port, b"")
+
+    monkeypatch.setattr(main, "_read_banner", _banner)
     return mocks
 
 
@@ -96,9 +104,13 @@ async def test_valid_job_is_verified_probed_and_a_signed_result_submitted(
     assert result["snapshot_id"] == "33333333-3333-3333-3333-333333333333"
     assert result["job_id"] == "55555555-5555-5555-5555-555555555555"
     # two in-scope OPEN services; the 10.9.9.9 hit was dropped by scope.in_scope
-    ports = sorted(s["port"] for s in result["services"])
-    assert ports == [22, 23]
-    assert all(s["outcome"] == "open" and s["protocol_id"] is None for s in result["services"])
+    by_port = {s["port"]: s for s in result["services"]}
+    assert sorted(by_port) == [22, 23]
+    assert all(s["outcome"] == "open" for s in result["services"])
+    # the protocol is identified from the banner the service emitted, never from the port
+    assert by_port[23]["protocol_id"] == "telnet"
+    assert by_port[22]["protocol_id"] == "ssh"
+    assert by_port[23]["banner_sha256"] is not None  # the banner's hash commits to the evidence
 
 
 async def test_wrong_cp_key_refuses_before_any_probe(_mocks: dict[str, AsyncMock]) -> None:
