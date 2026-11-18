@@ -52,6 +52,34 @@ def test_trunk_uplink_is_not_dynamic_negotiation() -> None:
     assert arista.parse_dynamic_trunk_negotiation(cfg) is False
 
 
+def test_planted_config_has_a_default_snmp_community() -> None:
+    # core-switch is left with `snmp-server community public ro` (a factory-default community).
+    cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
+    assert arista.parse_default_snmp_community_present(cfg) is True
+
+
+def test_clean_config_uses_a_non_default_snmp_community() -> None:
+    # edge-router configures a custom community, so no default is present.
+    cfg = (_FIX / "ceos_running_config_clean.txt").read_text()
+    assert arista.parse_default_snmp_community_present(cfg) is False
+
+
+def test_no_snmp_community_configured_is_a_definite_false() -> None:
+    # The running-config is complete evidence: no community line means no default community, not an
+    # abstention.
+    assert arista.parse_default_snmp_community_present("hostname x\n") is False
+
+
+def test_default_snmp_community_is_matched_case_insensitively() -> None:
+    # `Private` is as guessable as `private`, even though SNMP treats them as distinct strings.
+    assert arista.parse_default_snmp_community_present("snmp-server community Private rw\n") is True
+
+
+def test_snmp_community_with_view_and_acl_still_reads_the_name() -> None:
+    cfg = "snmp-server community public view everything ro MGMT-ACL\n"
+    assert arista.parse_default_snmp_community_present(cfg) is True
+
+
 def test_collect_control_fields_for_telnet() -> None:
     cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
     fields = arista.collect_control_fields(cfg, "net.management.telnet")
@@ -62,6 +90,12 @@ def test_collect_control_fields_for_dynamic_trunk() -> None:
     cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
     fields = arista.collect_control_fields(cfg, "net.port.dynamic_trunk")
     assert fields == {"dynamic_trunk_negotiation": True}
+
+
+def test_collect_control_fields_for_default_snmp_community() -> None:
+    cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
+    fields = arista.collect_control_fields(cfg, "net.snmp.default_community")
+    assert fields == {"default_snmp_community_present": True}
 
 
 def test_collect_control_fields_for_unsupported_control_is_none() -> None:

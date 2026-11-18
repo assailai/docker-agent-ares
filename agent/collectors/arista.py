@@ -27,6 +27,13 @@ _MANAGEMENT_PROTOCOL_WORDS = frozenset({"ssh", "telnet"})
 _INTERFACE = re.compile(r"^interface (\S+)$")
 _DYNAMIC_MODE = re.compile(r"^switchport mode dynamic (auto|desirable)$")
 
+# An SNMP community declaration: `snmp-server community <name> [view <v>] [ro|rw] [<acl>]`. The
+# community string is the first token after the keyword. The well-known factory defaults below are
+# guessable from off the device, so a community that matches one is a default-credential weakness
+# regardless of its read/write scope.
+_SNMP_COMMUNITY = re.compile(r"^snmp-server community (\S+)")
+_DEFAULT_SNMP_COMMUNITIES = frozenset({"public", "private"})
+
 
 def _indented(line: str) -> bool:
     return line.startswith((" ", "\t"))
@@ -89,11 +96,29 @@ def parse_dynamic_trunk_negotiation(running_config: str) -> bool:
     return False
 
 
+def parse_default_snmp_community_present(running_config: str) -> bool:
+    """True when the EOS config configures a well-known default SNMP community (public/private).
+
+    The running-config is complete evidence for this, so a device with no matching community line is
+    a definite False (not an abstention): either no SNMP community is configured, or only
+    non-default names are. The name is matched case-insensitively, since `Public` is just as
+    guessable as `public`, even though SNMP treats the two as distinct strings.
+    """
+    for line in running_config.splitlines():
+        match = _SNMP_COMMUNITY.match(line.strip())
+        if match and match.group(1).lower() in _DEFAULT_SNMP_COMMUNITIES:
+            return True
+    return False
+
+
 # Which control fields this parser can extract, and how. Each returns the field's typed value, or
 # raises to signal the config did not show it (the collector then abstains for that field).
 _FIELD_EXTRACTORS = {
     ("net.management.telnet", "management_protocols"): parse_management_protocols,
     ("net.port.dynamic_trunk", "dynamic_trunk_negotiation"): parse_dynamic_trunk_negotiation,
+    ("net.snmp.default_community", "default_snmp_community_present"): (
+        parse_default_snmp_community_present
+    ),
 }
 
 

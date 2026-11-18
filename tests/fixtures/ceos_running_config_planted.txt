@@ -11,6 +11,8 @@ management telnet
 management api http-commands
    no shutdown
 !
+snmp-server community public ro
+!
 interface Ethernet1
    description access-user-port
    switchport mode dynamic auto

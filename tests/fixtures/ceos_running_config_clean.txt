@@ -8,6 +8,8 @@ management ssh
 management telnet
    shutdown
 !
+snmp-server community s3cr3t-r0nly ro
+!
 interface Ethernet1
    description access-user-port
    switchport mode access
