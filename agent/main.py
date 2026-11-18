@@ -19,6 +19,7 @@ import resource
 import ssl
 import sys
 import time
+from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 import httpx
@@ -30,7 +31,7 @@ from agent.hostpins import HostPins
 from agent.identify import IdentityProbe
 from agent.kubeinfo import KubeApi, KubeConfigError, KubernetesEvidence, safe_collect
 from agent.progress import ProgressReporter
-from agent import assessment
+from agent import assessment, assessment_discover
 from agent.state import AgentState, fingerprint, load_state, save_state
 from agent.tunnel import (
     TunnelManager,
@@ -767,13 +768,18 @@ async def _hand_back(token: str, task_id: str) -> None:
 # The task types THIS agent build knows how to run. A task type OUTSIDE this set (a new
 # network-assessment task dispatched to an un-upgraded agent, or a malformed one) must fail closed
 # BEFORE any target field is read, so it produces zero target activity. These mirror the control
-# plane's AgentTaskType values; the network-assessment discover/collect task types arrive with the
-# collectors and signed-job verification, and are deliberately absent until then so the fleet
-# refuses them rather than running them as a CIDR sweep (the agent-first invariant during rollout).
-_HANDLED_TASK_TYPES = frozenset({"local_network_scan"})
+# plane's AgentTaskType values. The discover type is handled now (it verifies the signed job before
+# any probe); the credentialed COLLECT type is still deliberately absent until its collectors land,
+# so the fleet refuses it rather than running it as a sweep (the agent-first invariant during
+# rollout). Dispatch of discover stays control-plane-gated (the module ships dark) regardless.
+_HANDLED_TASK_TYPES = frozenset({"local_network_scan", "network_assessment_discover_v1"})
 
 
-async def _run_task(token: str, task: dict) -> None:
+async def _run_task(token: str, task: dict, *, state: AgentState | None = None) -> None:
+    # ``state`` is keyword-only and optional: the sweep path (``local_network_scan``) never needs it,
+    # so the existing callers that pass only (token, task) keep working. The signed discover path
+    # DOES need it (the control-plane keys to verify the job, the agent's own key to sign the
+    # result) and is only ever reached through _work_through, which threads the live state in.
     task_id = task["id"]
     task_type = task.get("task_type")
     if task_type not in _HANDLED_TASK_TYPES:
@@ -785,6 +791,16 @@ async def _run_task(token: str, task: dict) -> None:
         await control_plane.task_failed(
             settings, token, task_id, reason=f"unsupported task type: {task_type!r}"
         )
+        return
+    if task_type == "network_assessment_discover_v1":
+        if state is None:  # defensive: the poll loop always threads state in on this path
+            await control_plane.task_failed(
+                settings, token, task_id, reason="internal: agent state unavailable"
+            )
+            return
+        # The signed-job path: verify the control plane's signature BEFORE reading any target field
+        # (agent-first), then re-derive scope, probe and sign the result.
+        await _run_assessment_discover(state, token, task)
         return
     cidr = task.get("target_network")
     config = task.get("tool_config") or {}
@@ -892,6 +908,133 @@ async def _run_task(token: str, task: dict) -> None:
         # nor a percentage still waiting to be sent: the report that settled the task set its
         # progress, and the server ignores a progress post for a task that is no longer running
         await percentages.close()
+
+
+# The signature domain and envelope schema a discover JOB is sealed under by the control plane
+# (ares.infra.agent_runtime.network_assessment_dispatch.SIGN_DOMAIN_DISCOVER and
+# tasks.SCHEMA_DISCOVER_V1). The agent verifies against exactly these; a mismatch fails closed.
+_DISCOVER_JOB_DOMAIN = "ares.network-assessment.signed-task.discover:v1"
+_DISCOVER_JOB_SCHEMA = "ares.network-assessment.signed-task.discover.v1"
+
+
+async def _probe_discover_scope(scope: assessment_discover.DiscoverScope) -> list[dict] | None:
+    """Probe every in-scope network over the scope's ports, returning OPEN service observations, or
+    None if a pause landed first (the caller then hands the task back).
+
+    v1 reports what ANSWERED (an OPEN TCP connect), honestly and no more: protocol identification
+    from a banner read (telnet negotiation, SSH id string) lands with the protocol specialists, so
+    nothing here infers a product from a port. Every host is gated by ``scope.in_scope`` before it
+    is counted, so an address outside the frozen scope is never reported even if the scanner, handed
+    a wider range, happened to reach it."""
+    observations: list[dict] = []
+    for network in scope.networks:
+        hits = await _unless_paused(
+            asyncio.create_task(
+                scan.scan_cidr(
+                    str(network),
+                    list(scope.ports),
+                    timeout=settings.scan_connect_timeout,
+                    discovery_timeout=settings.scan_discovery_timeout,
+                    concurrency=_scan_limits["concurrency"],
+                    max_hosts=settings.scan_max_hosts,
+                    chunk_prefix=settings.scan_chunk_prefix,
+                )
+            )
+        )
+        if hits is None:
+            return None
+        for hit in hits:
+            ip, port = hit.get("ip"), hit.get("port")
+            if ip is None or port is None or not scope.in_scope(str(ip)):
+                continue
+            observations.append(
+                assessment_discover.service_observation(
+                    address=str(ip), port=int(port), transport="tcp", outcome="open"
+                )
+            )
+    return observations
+
+
+async def _run_assessment_discover(state: AgentState, token: str, task: dict) -> None:
+    """Run one signed Network Assessment discover job: verify, re-derive scope, probe, sign, submit.
+
+    Agent-first: the signed job is verified against the control plane's registered public keys
+    BEFORE any target field is read or any socket opened, so a forged, tampered or wrong-schema job
+    produces zero target activity and a typed rejection. The scope is then re-derived from the
+    VERIFIED job (never ambient config), every destination gated by ``scope.in_scope``, and the
+    result is signed with the agent's OWN enrolment key; the control plane verifies that signature
+    and binds the result to the frozen snapshot before persisting."""
+    task_id = task["id"]
+    envelope = (task.get("tool_config") or {}).get("envelope")
+    job = assessment.open_signed_job(
+        envelope,
+        public_keys=state.cp_assessment_public_keys or [],
+        domain=_DISCOVER_JOB_DOMAIN,
+        expected_schema=_DISCOVER_JOB_SCHEMA,
+    )
+    if job is None:
+        # Verified BEFORE task_started and BEFORE any probe: a job the agent cannot trust is refused
+        # with zero target activity. An empty key list (an agent that has not yet been told the
+        # control plane's keys) fails closed here too.
+        logger.warning("Refused assessment job %s: signature/schema verification failed", task_id)
+        await control_plane.task_failed(
+            settings, token, task_id, reason="signed assessment job failed verification"
+        )
+        return
+    if not state.signing_key_seed:
+        await control_plane.task_failed(
+            settings, token, task_id, reason="agent has no signing key to sign the result"
+        )
+        return
+    try:
+        scope = assessment_discover.derive_scope(job)
+    except ValueError as exc:
+        logger.warning("Refused assessment job %s: %s", task_id, exc)
+        await control_plane.task_failed(settings, token, task_id, reason=f"scope refused: {exc}")
+        return
+
+    await control_plane.task_started(settings, token, task_id)
+    try:
+        observations = await _probe_discover_scope(scope)
+        if observations is None:
+            logger.warning("Paused mid-discover; handing assessment task %s back.", task_id)
+            await _hand_back(token, task_id)
+            return
+        coverage = [
+            assessment_discover.coverage_entry(scope=str(network), state="assessed")
+            for network in scope.networks
+        ]
+        completed_at = datetime.now(UTC).isoformat()
+        result = assessment_discover.build_discover_result(
+            job,
+            services=observations,
+            coverage=coverage,
+            completed_at=completed_at,
+            partial=False,
+        )
+        sealed = assessment.seal_result(
+            result,
+            schema=assessment_discover.RESULT_SCHEMA,
+            seed_b64=state.signing_key_seed,
+            domain=assessment_discover.RESULT_DOMAIN,
+            signer_key_id=assessment.public_key_b64_from_seed(state.signing_key_seed),
+        )
+        await control_plane.submit_assessment_result(
+            settings, token, task_id, sealed, completed_at=completed_at
+        )
+        logger.info(
+            "Assessment discover %s: reported %d service(s) across %d network(s)",
+            task_id,
+            len(observations),
+            len(scope.networks),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - report any failure rather than dropping the task
+        logger.error("Assessment discover %s failed: %s", task_id, exc)
+        await control_plane.task_failed(
+            settings, token, task_id, reason=f"{type(exc).__name__}: {exc}"
+        )
 
 
 def _detection_scope() -> str:
@@ -1059,14 +1202,14 @@ async def _redetect_loop(state: AgentState, tunnel: TunnelManager | None = None)
         await asyncio.sleep(tick if delay is None else min(delay, tick))
 
 
-async def _work_through(token: str, tasks: list[dict]) -> None:
+async def _work_through(state: AgentState, token: str, tasks: list[dict]) -> None:
     """Run a polled batch in order. A poll claims several tasks at once, so a pause can land with
     some not yet started: those go straight back rather than sitting out their lease."""
     for task in tasks:
         if _paused.is_set():
             await _hand_back(token, task["id"])
             continue
-        await _run_task(token, task)
+        await _run_task(token, task, state=state)
 
 
 async def _poll_loop(state: AgentState) -> None:
@@ -1080,7 +1223,7 @@ async def _poll_loop(state: AgentState) -> None:
                     logger.info("Task polling recovered after %d failed attempt(s).", failures)
                     failures = 0
                 _record_contact()  # a successful poll is also live contact with Ares
-                await _work_through(state.agent_token or "", tasks)
+                await _work_through(state, state.agent_token or "", tasks)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - keep polling through any transient error
