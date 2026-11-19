@@ -164,6 +164,28 @@ def test_per_port_bpduguard_enable_protects_that_access_port() -> None:
     assert arista.parse_access_port_without_bpduguard(cfg) is False
 
 
+def test_planted_config_has_an_access_port_without_port_security() -> None:
+    # Ethernet3 is `switchport mode access` with no `switchport port-security` line.
+    cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
+    assert arista.parse_access_port_without_port_security(cfg) is True
+
+
+def test_clean_config_secures_its_access_port_mac_table() -> None:
+    # edge-router's access port carries `switchport port-security`.
+    cfg = (_FIX / "ceos_running_config_clean.txt").read_text()
+    assert arista.parse_access_port_without_port_security(cfg) is False
+
+
+def test_port_security_with_a_maximum_still_counts_as_secured() -> None:
+    cfg = "interface Ethernet9\n   switchport mode access\n   switchport port-security maximum 2\n"
+    assert arista.parse_access_port_without_port_security(cfg) is False
+
+
+def test_a_routed_or_trunk_only_device_has_no_access_port_for_port_security() -> None:
+    cfg = "interface Ethernet1\n   switchport mode trunk\ninterface Ethernet2\n   no switchport\n"
+    assert arista.parse_access_port_without_port_security(cfg) is False
+
+
 def test_collect_control_fields_for_telnet() -> None:
     cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
     fields = arista.collect_control_fields(cfg, "net.management.telnet")
@@ -198,6 +220,12 @@ def test_collect_control_fields_for_bpduguard_missing() -> None:
     cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
     fields = arista.collect_control_fields(cfg, "net.l2.bpduguard_missing")
     assert fields == {"access_port_without_bpduguard": True}
+
+
+def test_collect_control_fields_for_port_security_missing() -> None:
+    cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
+    fields = arista.collect_control_fields(cfg, "net.l2.port_security_missing")
+    assert fields == {"access_port_without_port_security": True}
 
 
 def test_collect_control_fields_for_unsupported_control_is_none() -> None:

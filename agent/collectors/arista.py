@@ -55,6 +55,11 @@ _BPDUGUARD_DEFAULT = re.compile(r"^spanning-tree .*bpduguard default$")
 _SWITCHPORT_ACCESS = re.compile(r"^switchport mode access$")
 _BPDUGUARD_ENABLE = re.compile(r"^spanning-tree bpduguard enable$")
 
+# EOS secures an access port's MAC table with `switchport port-security` (optionally with a
+# `maximum`, a violation action, or sticky learning). An access-mode port with no port-security
+# line learns any MAC, so the user edge is open to MAC flooding and rogue hosts.
+_PORT_SECURITY = re.compile(r"^switchport port-security")
+
 
 def _indented(line: str) -> bool:
     return line.startswith((" ", "\t"))
@@ -204,6 +209,36 @@ def parse_access_port_without_bpduguard(running_config: str) -> bool:
     return False
 
 
+def parse_access_port_without_port_security(running_config: str) -> bool:
+    """True when an access-mode Ethernet port enables no MAC port security.
+
+    Each `switchport mode access` Ethernet port must carry a `switchport port-security` line; one
+    that does not learns any MAC on the user edge. The running-config is complete evidence, so a
+    device with no access-mode port (a pure routed or trunk device) has nothing to flag and is a
+    definite False.
+    """
+    lines = running_config.splitlines()
+    index = 0
+    while index < len(lines):
+        header = _INTERFACE.match(lines[index].strip())
+        if header and header.group(1).lower().startswith("ethernet"):
+            is_access = False
+            secured = False
+            index += 1
+            while index < len(lines) and _indented(lines[index]):
+                stripped = lines[index].strip()
+                if _SWITCHPORT_ACCESS.match(stripped):
+                    is_access = True
+                elif _PORT_SECURITY.match(stripped):
+                    secured = True
+                index += 1
+            if is_access and not secured:
+                return True
+            continue
+        index += 1
+    return False
+
+
 # Which control fields this parser can extract, and how. Each returns the field's typed value, or
 # raises to signal the config did not show it (the collector then abstains for that field).
 _FIELD_EXTRACTORS = {
@@ -220,6 +255,9 @@ _FIELD_EXTRACTORS = {
     ),
     ("net.l2.bpduguard_missing", "access_port_without_bpduguard"): (
         parse_access_port_without_bpduguard
+    ),
+    ("net.l2.port_security_missing", "access_port_without_port_security"): (
+        parse_access_port_without_port_security
     ),
 }
 
