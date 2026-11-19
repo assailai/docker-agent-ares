@@ -1108,21 +1108,47 @@ def _effective_collect_budget(job: dict) -> tuple[float, int]:
     return timeout_s, max_bytes
 
 
+async def _collect_neighbours(job: dict, credential, config: str, timeout_s: float, max_bytes: int):
+    """The device's LLDP neighbours, for the control plane's topology edges. Collected only for a
+    grammar that exposes LLDP (Arista); an FRR device has no LLDP daemon, so it reports none, which
+    the control plane records as an honest topology gap. A failed LLDP read is also no neighbours,
+    never a guess. Reported faithfully (management interfaces included); the control plane classifies
+    data-plane links apart from the shared management segment."""
+    if not vendor.has_lldp(config):
+        return []
+    try:
+        lldp_output = await ssh_collect.collect_lldp_output(
+            job["target_address"], credential, timeout=timeout_s, max_bytes=max_bytes
+        )
+    except Exception:  # noqa: BLE001 - a failed LLDP read is an honest topology gap, not a failure
+        return []
+    return [
+        assessment_collect.neighbour_entry(**neighbour)
+        for neighbour in vendor.collect_neighbours(config, lldp_output)
+    ]
+
+
 async def _collect_controls(
     job: dict, control_ids: list[str], credential
-) -> tuple[list[dict], list[dict]]:
-    """Read the device config ONCE and normalise it per control. Returns (controls, coverage).
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Read the device config ONCE, normalise it per control, and read its LLDP neighbours. Returns
+    (controls, coverage, neighbours).
 
     No local credential, or a failed read, makes every requested control UNAVAILABLE (honest
-    coverage), never a guessed fact. A control this agent's parser does not support is UNSUPPORTED."""
+    coverage), never a guessed fact, and yields no neighbours. A control this agent's parser does not
+    support is UNSUPPORTED."""
     target = job["target_address"]
     if credential is None:
-        return [], [
-            assessment_collect.coverage_entry(
-                scope=f"{target}:{cid}", state="unavailable", reason_code="no_local_credential"
-            )
-            for cid in control_ids
-        ]
+        return (
+            [],
+            [
+                assessment_collect.coverage_entry(
+                    scope=f"{target}:{cid}", state="unavailable", reason_code="no_local_credential"
+                )
+                for cid in control_ids
+            ],
+            [],
+        )
     timeout_s, max_bytes = _effective_collect_budget(job)
     try:
         config = await ssh_collect.collect_running_config(
@@ -1130,12 +1156,16 @@ async def _collect_controls(
         )
     except Exception as exc:  # noqa: BLE001 - any connect/auth/read failure is honest UNAVAILABLE
         reason = f"collect_failed:{type(exc).__name__}"
-        return [], [
-            assessment_collect.coverage_entry(
-                scope=f"{target}:{cid}", state="unavailable", reason_code=reason
-            )
-            for cid in control_ids
-        ]
+        return (
+            [],
+            [
+                assessment_collect.coverage_entry(
+                    scope=f"{target}:{cid}", state="unavailable", reason_code=reason
+                )
+                for cid in control_ids
+            ],
+            [],
+        )
     controls: list[dict] = []
     coverage: list[dict] = []
     for control_id in control_ids:
@@ -1150,7 +1180,8 @@ async def _collect_controls(
         controls.append(
             assessment_collect.control_facts(control_id, fields, collection_complete=True)
         )
-    return controls, coverage
+    neighbours = await _collect_neighbours(job, credential, config, timeout_s, max_bytes)
+    return controls, coverage, neighbours
 
 
 async def _run_assessment_collect(state: AgentState, token: str, task: dict) -> None:
@@ -1190,11 +1221,11 @@ async def _run_assessment_collect(state: AgentState, token: str, task: dict) -> 
     credential = CredentialVault(settings.credential_vault_path).resolve(job["credential_ref"])
     await control_plane.task_started(settings, token, task_id)
     try:
-        controls, coverage = await _collect_controls(job, control_ids, credential)
+        controls, coverage, neighbours = await _collect_controls(job, control_ids, credential)
         completed_at = datetime.now(UTC).isoformat()
         result = assessment_collect.build_collect_result(
-            job, controls=controls, coverage=coverage, completed_at=completed_at,
-            partial=not controls,
+            job, controls=controls, coverage=coverage, neighbours=neighbours,
+            completed_at=completed_at, partial=not controls,
         )
         sealed = assessment.seal_result(
             result,
@@ -1207,8 +1238,8 @@ async def _run_assessment_collect(state: AgentState, token: str, task: dict) -> 
             settings, token, task_id, sealed, completed_at=completed_at
         )
         logger.info(
-            "Assessment collect %s: %d control(s) collected, %d coverage gap(s) on %s",
-            task_id, len(controls), len(coverage), job["target_address"],
+            "Assessment collect %s: %d control(s), %d coverage gap(s), %d neighbour(s) on %s",
+            task_id, len(controls), len(coverage), len(neighbours), job["target_address"],
         )
     except asyncio.CancelledError:
         raise

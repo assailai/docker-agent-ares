@@ -253,3 +253,21 @@ def test_collect_control_fields_for_login_banner() -> None:
 
 def test_collect_control_fields_for_unsupported_control_is_none() -> None:
     assert arista.collect_control_fields("hostname x\n", "server.ssh.password") is None
+
+
+def test_lldp_detail_parses_data_plane_links_and_reports_mgmt_neighbours() -> None:
+    # grounded in a live capture of `show lldp neighbors detail` from the two-vendor lab core-switch
+    out = (_FIX / "ceos_lldp_neighbors_detail.txt").read_text()
+    neighbours = arista.parse_lldp_neighbours(out)
+    by_key = {(n["local_interface"], n["neighbour_address"]): n for n in neighbours}
+    # the two real data-plane links, with the peer's system name, port and management address
+    assert by_key[("Ethernet1", "172.20.20.4")]["neighbour_id"] == "access-switch"
+    assert by_key[("Ethernet1", "172.20.20.4")]["neighbour_interface"] == "Ethernet1"
+    assert by_key[("Ethernet2", "172.20.20.6")]["neighbour_id"] == "edge-router"
+    # management-interface neighbours ARE reported faithfully; the control plane classifies them out
+    assert any(n["local_interface"] == "Management0" for n in neighbours)
+
+
+def test_lldp_empty_or_unknown_output_is_no_neighbours() -> None:
+    assert arista.parse_lldp_neighbours("") == []
+    assert arista.parse_lldp_neighbours("% Unknown command: show lldp neighbors") == []

@@ -28,3 +28,13 @@ def test_frr_grammar_is_not_parsed_as_arista() -> None:
     # A telnet (Arista) control is UNSUPPORTED on an FRR config: the FRR parser does not claim it.
     cfg = (_FIX / "frr_running_config_planted.txt").read_text()
     assert vendor.collect_control_fields(cfg, "net.management.telnet") is None
+
+
+def test_neighbours_route_by_grammar() -> None:
+    lldp = (_FIX / "ceos_lldp_neighbors_detail.txt").read_text()
+    eos = (_FIX / "ceos_running_config_planted.txt").read_text()
+    frr_cfg = (_FIX / "frr_running_config_planted.txt").read_text()
+    # Arista exposes LLDP and parses its neighbours; FRR has no LLDP daemon, so it reports none.
+    assert vendor.has_lldp(eos) and not vendor.has_lldp(frr_cfg)
+    assert len(vendor.collect_neighbours(eos, lldp)) >= 2
+    assert vendor.collect_neighbours(frr_cfg, lldp) == []

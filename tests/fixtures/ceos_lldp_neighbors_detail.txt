@@ -1,0 +1,99 @@
+Interface Ethernet1 detected 1 LLDP neighbors:
+
+  Neighbor 001c.7352.d0ba/"Ethernet1", age 25 seconds
+  Discovered 8:59:28 ago; Last changed 8:59:28 ago
+  - Chassis ID type: MAC address (4)
+    Chassis ID     : 001c.7352.d0ba
+  - Port ID type: Interface name (5)
+    Port ID     : "Ethernet1"
+  - Time To Live: 120 seconds
+  - Port Description: "access-user-port"
+  - System Name: "access-switch"
+  - System Description: "Arista Networks EOS version 4.37.0F-51574443.4370F (engineering build) running on an Arista cEOSLab"
+  - System Capabilities : Bridge, Router
+    Enabled Capabilities: Bridge
+  - Management Address Subtype: ('IPv4 ',)
+    Management Address        : 172.20.20.4
+    Interface Number Subtype  : ifIndex (2)
+    Interface Number          : 999000
+    OID String                : 
+  - IEEE802.1 Port VLAN ID: 1
+  - IEEE802.3 Link Aggregation
+    Link Aggregation Status: Capable, Disabled (0x01)
+    Port ID                : 0
+  - IEEE802.3 Maximum Frame Size: 9236 bytes
+  - LLDP-MED Inventory Serial Number TLV: "464B7DD0397C714660BF26A6B224629D"
+
+Interface Ethernet2 detected 1 LLDP neighbors:
+
+  Neighbor 001c.7354.8673/"Ethernet1", age 25 seconds
+  Discovered 8:59:29 ago; Last changed 8:59:29 ago
+  - Chassis ID type: MAC address (4)
+    Chassis ID     : 001c.7354.8673
+  - Port ID type: Interface name (5)
+    Port ID     : "Ethernet1"
+  - Time To Live: 120 seconds
+  - Port Description: "to core-switch"
+  - System Name: "edge-router"
+  - System Description: "Arista Networks EOS version 4.37.0F-51574443.4370F (engineering build) running on an Arista cEOSLab"
+  - System Capabilities : Bridge, Router
+    Enabled Capabilities: Bridge
+  - Management Address Subtype: ('IPv4 ',)
+    Management Address        : 172.20.20.6
+    Interface Number Subtype  : ifIndex (2)
+    Interface Number          : 999000
+    OID String                : 
+  - IEEE802.1 Port VLAN ID: 0
+  - IEEE802.3 Link Aggregation
+    Link Aggregation Status: Capable, Disabled (0x01)
+    Port ID                : 0
+  - IEEE802.3 Maximum Frame Size: 9236 bytes
+  - LLDP-MED Inventory Serial Number TLV: "312DC1776E7E85533715F63205CC6741"
+
+Interface Management0 detected 2 LLDP neighbors:
+
+  Neighbor 001c.7354.8673/"Management0", age 25 seconds
+  Discovered 8:59:29 ago; Last changed 8:59:29 ago
+  - Chassis ID type: MAC address (4)
+    Chassis ID     : 001c.7354.8673
+  - Port ID type: Interface name (5)
+    Port ID     : "Management0"
+  - Time To Live: 120 seconds
+  - System Name: "edge-router"
+  - System Description: "Arista Networks EOS version 4.37.0F-51574443.4370F (engineering build) running on an Arista cEOSLab"
+  - System Capabilities : Bridge, Router
+    Enabled Capabilities: Bridge
+  - Management Address Subtype: ('IPv4 ',)
+    Management Address        : 172.20.20.6
+    Interface Number Subtype  : ifIndex (2)
+    Interface Number          : 999000
+    OID String                : 
+  - IEEE802.1 Port VLAN ID: 0
+  - IEEE802.3 Link Aggregation
+    Link Aggregation Status: Not Capable (0x00)
+    Port ID                : 0
+  - IEEE802.3 Maximum Frame Size: 9232 bytes
+  - LLDP-MED Inventory Serial Number TLV: "312DC1776E7E85533715F63205CC6741"
+
+  Neighbor 001c.7352.d0ba/"Management0", age 25 seconds
+  Discovered 8:59:28 ago; Last changed 8:59:28 ago
+  - Chassis ID type: MAC address (4)
+    Chassis ID     : 001c.7352.d0ba
+  - Port ID type: Interface name (5)
+    Port ID     : "Management0"
+  - Time To Live: 120 seconds
+  - System Name: "access-switch"
+  - System Description: "Arista Networks EOS version 4.37.0F-51574443.4370F (engineering build) running on an Arista cEOSLab"
+  - System Capabilities : Bridge, Router
+    Enabled Capabilities: Bridge
+  - Management Address Subtype: ('IPv4 ',)
+    Management Address        : 172.20.20.4
+    Interface Number Subtype  : ifIndex (2)
+    Interface Number          : 999000
+    OID String                : 
+  - IEEE802.1 Port VLAN ID: 0
+  - IEEE802.3 Link Aggregation
+    Link Aggregation Status: Not Capable (0x00)
+    Port ID                : 0
+  - IEEE802.3 Maximum Frame Size: 9232 bytes
+  - LLDP-MED Inventory Serial Number TLV: "464B7DD0397C714660BF26A6B224629D"

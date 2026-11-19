@@ -19,3 +19,20 @@ def collect_control_fields(running_config: str, control_id: str) -> dict[str, ob
     if _FRR_MARKER in running_config:
         return frr.collect_control_fields(running_config, control_id)
     return arista.collect_control_fields(running_config, control_id)
+
+
+def has_lldp(running_config: str) -> bool:
+    """Whether this device's grammar exposes LLDP over the credentialed session, so the agent only
+    runs the LLDP show command where it will answer. Arista EOS runs LLDP by default; FRR has no
+    LLDP daemon, so an FRR device reports no neighbours (an honest topology gap at the control
+    plane)."""
+    return _FRR_MARKER not in running_config
+
+
+def collect_neighbours(running_config: str, lldp_output: str) -> list[dict[str, object]]:
+    """The device's link-layer neighbours, parsed by the matching grammar: Arista parses its
+    ``show lldp neighbors detail``; an FRR device has none. Routed by the config's own grammar, like
+    the control-field dispatch, so a mislabelled device is never parsed by the wrong grammar."""
+    if _FRR_MARKER in running_config:
+        return []
+    return arista.parse_lldp_neighbours(lldp_output)

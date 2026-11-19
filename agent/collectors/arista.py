@@ -276,3 +276,73 @@ def collect_control_fields(running_config: str, control_id: str) -> dict[str, ob
         if ctrl == control_id:
             fields[field] = extractor(running_config)
     return fields or None
+
+
+# --- LLDP neighbours (a second show command: `show lldp neighbors detail`) ------------------------
+# Not a control field: topology evidence the control plane turns into adjacency edges. EOS prints one
+# block per local interface, then one or more neighbours, each advertising a System Name, the peer's
+# Port ID and (usually) a Management Address. The control plane keys an edge on that management
+# address and excludes management-interface neighbours, so this parser reports every neighbour
+# faithfully, the local interface included, and leaves the classification to the control plane.
+_LLDP_INTERFACE = re.compile(r"^Interface (\S+) detected \d+ LLDP neighbor")
+_LLDP_NEIGHBOR = re.compile(r"^Neighbor\b")
+_LLDP_SYSTEM_NAME = re.compile(r'^System Name:\s*"?([^"]*?)"?\s*$')
+_LLDP_PORT_ID = re.compile(r'^Port ID\s*:\s*"?([^"]*?)"?\s*$')
+_LLDP_MGMT_ADDRESS = re.compile(r"^Management Address\s+:\s*(\S+)")
+
+
+def parse_lldp_neighbours(lldp_output: str) -> list[dict[str, object]]:
+    """The device's LLDP neighbours, one dict per neighbour: the local interface it was seen on and
+    the peer's ``neighbour_id`` (system name), ``neighbour_interface`` (port id) and
+    ``neighbour_address`` (management address, None when the peer advertised none).
+
+    Parses ``show lldp neighbors detail``. A neighbour with no system name is skipped rather than
+    reported as a nameless ghost. Management-vs-data-plane classification is the control plane's, so
+    every interface's neighbours are reported here, the management interface included."""
+    neighbours: list[dict[str, object]] = []
+    local_interface: str | None = None
+    current: dict[str, object] | None = None
+
+    def flush() -> None:
+        nonlocal current
+        if current is not None and current.get("neighbour_id"):
+            neighbours.append(current)
+        current = None
+
+    for raw in lldp_output.splitlines():
+        line = raw.strip()
+        if line.startswith("- "):  # a TLV marker line; drop the bullet so the key matches
+            line = line[2:].strip()
+        interface = _LLDP_INTERFACE.match(line)
+        if interface:
+            flush()
+            local_interface = interface.group(1)
+            continue
+        if _LLDP_NEIGHBOR.match(line):
+            flush()
+            current = (
+                {
+                    "local_interface": local_interface,
+                    "neighbour_id": "",
+                    "neighbour_interface": None,
+                    "neighbour_address": None,
+                }
+                if local_interface is not None
+                else None
+            )
+            continue
+        if current is None:
+            continue
+        name = _LLDP_SYSTEM_NAME.match(line)
+        if name:
+            current["neighbour_id"] = name.group(1)
+            continue
+        port = _LLDP_PORT_ID.match(line)
+        if port and current["neighbour_interface"] is None:
+            current["neighbour_interface"] = port.group(1)
+            continue
+        address = _LLDP_MGMT_ADDRESS.match(line)
+        if address:
+            current["neighbour_address"] = address.group(1)
+    flush()
+    return neighbours

@@ -81,12 +81,32 @@ def coverage_entry(*, scope: str, state: str, reason_code: str | None = None) ->
     return {"scope": scope, "state": state, "reason_code": reason_code}
 
 
+def neighbour_entry(
+    *,
+    local_interface: str,
+    neighbour_id: str,
+    neighbour_interface: str | None = None,
+    neighbour_address: str | None = None,
+) -> dict:
+    """One link-layer neighbour the device reported, shaped to match the control plane's
+    ``CollectedNeighbour`` exactly (``extra="forbid"``). The control plane classifies a
+    management-interface neighbour out and keys an edge on ``neighbour_address``, so the agent
+    reports every neighbour faithfully, the local interface included."""
+    return {
+        "local_interface": str(local_interface),
+        "neighbour_id": str(neighbour_id),
+        "neighbour_interface": neighbour_interface,
+        "neighbour_address": neighbour_address,
+    }
+
+
 def build_collect_result(
     job: dict,
     *,
     controls: list[dict],
     coverage: list[dict],
     completed_at: str,
+    neighbours: list[dict] | None = None,
     partial: bool = False,
 ) -> dict:
     """Assemble a ``CollectResultV1``-shaped payload bound back to the verified job."""
@@ -102,5 +122,6 @@ def build_collect_result(
         "target_address": job["target_address"],
         "controls": list(controls),
         "coverage": list(coverage),
+        "neighbours": list(neighbours or []),
         "partial": partial,
     }

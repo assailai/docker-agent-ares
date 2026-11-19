@@ -62,11 +62,15 @@ def _env(tmp_path, monkeypatch):
         "task_failed": AsyncMock(),
         "submit": AsyncMock(),
         "collect": AsyncMock(return_value=(_FIX / "ceos_running_config_planted.txt").read_text()),
+        "collect_lldp": AsyncMock(
+            return_value=(_FIX / "ceos_lldp_neighbors_detail.txt").read_text()
+        ),
     }
     monkeypatch.setattr(main.control_plane, "task_started", mocks["task_started"])
     monkeypatch.setattr(main.control_plane, "task_failed", mocks["task_failed"])
     monkeypatch.setattr(main.control_plane, "submit_assessment_result", mocks["submit"])
     monkeypatch.setattr(main.ssh_collect, "collect_running_config", mocks["collect"])
+    monkeypatch.setattr(main.ssh_collect, "collect_lldp_output", mocks["collect_lldp"])
     state = AgentState(
         agent_id="a",
         agent_token="t",
@@ -125,6 +129,16 @@ async def test_collect_reads_config_and_signs_control_facts(_env) -> None:
     assert control["facts"]["management_protocols"]["value"] == ["ssh", "telnet"]
     assert control["facts"]["applicable"]["status"] == "OBSERVED"
     assert control["facts"]["collection_complete"]["value"] is True
+
+    # the device's LLDP neighbours ride the result as topology evidence. The agent reports them
+    # faithfully (data-plane and management alike); the control plane classifies out the mgmt ones.
+    _env["mocks"]["collect_lldp"].assert_awaited_once()
+    addresses = {n["neighbour_address"] for n in result["neighbours"]}
+    assert "172.20.20.4" in addresses and "172.20.20.6" in addresses
+    assert all(
+        set(n) == {"local_interface", "neighbour_id", "neighbour_interface", "neighbour_address"}
+        for n in result["neighbours"]
+    )
 
 
 async def test_missing_credential_yields_unavailable_coverage(_env) -> None:
