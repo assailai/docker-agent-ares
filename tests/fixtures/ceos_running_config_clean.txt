@@ -1,6 +1,8 @@
 ! device: edge-router (cEOS)
 !
 hostname edge-router
+logging host 10.10.0.99
+ntp server 10.10.0.99
 !
 enable secret 5 $1$salt$3xampleOneWayHashValue0
 !

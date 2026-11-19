@@ -205,6 +205,30 @@ def test_a_community_named_with_rw_is_not_a_write_community() -> None:
     assert arista.parse_snmp_write_community_present("snmp-server community brworks ro\n") is False
 
 
+def test_planted_config_has_no_remote_syslog() -> None:
+    cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
+    assert arista.parse_remote_syslog_absent(cfg) is True
+
+
+def test_clean_config_has_remote_syslog() -> None:
+    cfg = (_FIX / "ceos_running_config_clean.txt").read_text()
+    assert arista.parse_remote_syslog_absent(cfg) is False
+
+
+def test_logging_host_in_a_vrf_counts_as_configured() -> None:
+    assert arista.parse_remote_syslog_absent("logging vrf MGMT host 10.0.0.1\n") is False
+
+
+def test_planted_config_has_no_ntp() -> None:
+    cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
+    assert arista.parse_ntp_unconfigured(cfg) is True
+
+
+def test_clean_config_has_ntp() -> None:
+    cfg = (_FIX / "ceos_running_config_clean.txt").read_text()
+    assert arista.parse_ntp_unconfigured(cfg) is False
+
+
 def test_collect_control_fields_for_telnet() -> None:
     cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
     fields = arista.collect_control_fields(cfg, "net.management.telnet")
@@ -251,6 +275,18 @@ def test_collect_control_fields_for_snmp_write_community() -> None:
     cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
     fields = arista.collect_control_fields(cfg, "net.snmp.write_community")
     assert fields == {"snmp_write_community_present": True}
+
+
+def test_collect_control_fields_for_remote_syslog() -> None:
+    cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
+    assert arista.collect_control_fields(cfg, "net.logging.no_remote_syslog") == {
+        "remote_syslog_absent": True
+    }
+
+
+def test_collect_control_fields_for_ntp() -> None:
+    cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
+    assert arista.collect_control_fields(cfg, "net.ntp.no_ntp") == {"ntp_unconfigured": True}
 
 
 def test_collect_control_fields_for_unsupported_control_is_none() -> None:

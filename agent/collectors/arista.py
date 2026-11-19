@@ -66,6 +66,13 @@ _SWITCHPORT_NONACCESS = re.compile(r"^switchport mode (?!access\b)")
 # line learns any MAC, so the user edge is open to MAC flooding and rogue hosts.
 _PORT_SECURITY = re.compile(r"^switchport port-security")
 
+# Remote syslog and NTP: a `logging host` / `logging vrf ... host` line ships logs off-box, and
+# an `ntp server` line gives the device a time source. The absence of either is a posture gap:
+# logs that never leave the device are lost on compromise or reboot, and an unsynchronized clock
+# undermines log correlation and certificate checks.
+_LOGGING_HOST = re.compile(r"^logging (?:vrf \S+ )?host \S")
+_NTP_SERVER = re.compile(r"^ntp server ")
+
 
 def _indented(line: str) -> bool:
     return line.startswith((" ", "\t"))
@@ -156,6 +163,24 @@ def parse_snmp_write_community_present(running_config: str) -> bool:
         if stripped.startswith("snmp-server community ") and "rw" in stripped.split()[3:]:
             return True
     return False
+
+
+def parse_remote_syslog_absent(running_config: str) -> bool:
+    """True when no remote syslog host is configured, so logs never leave the device.
+
+    The running-config is complete evidence: a device that binds any `logging host` (optionally in a
+    vrf) is a definite False.
+    """
+    return not any(_LOGGING_HOST.match(line.strip()) for line in running_config.splitlines())
+
+
+def parse_ntp_unconfigured(running_config: str) -> bool:
+    """True when no NTP time source is configured, so the device clock is unsynchronized.
+
+    The running-config is complete evidence: a device that configures any `ntp server` is a definite
+    False.
+    """
+    return not any(_NTP_SERVER.match(line.strip()) for line in running_config.splitlines())
 
 
 def parse_reversible_enable_secret(running_config: str) -> bool:
@@ -265,6 +290,8 @@ _FIELD_EXTRACTORS = {
     ("net.snmp.write_community", "snmp_write_community_present"): (
         parse_snmp_write_community_present
     ),
+    ("net.logging.no_remote_syslog", "remote_syslog_absent"): parse_remote_syslog_absent,
+    ("net.ntp.no_ntp", "ntp_unconfigured"): parse_ntp_unconfigured,
     ("net.management.weak_enable_secret", "reversible_enable_secret"): (
         parse_reversible_enable_secret
     ),
