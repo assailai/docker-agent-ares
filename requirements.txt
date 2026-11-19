@@ -29,5 +29,8 @@ pydantic-settings==2.6.1
 # plane's CVE floor (ares-v2 pins cryptography>=50.0.0).
 cryptography==50.0.2
 
-# SSH client for credentialed read-only config collection (Network Assessment COLLECT).
-asyncssh==2.21.0
+# SSH client for credentialed read-only config collection (Network Assessment COLLECT). Pinned at
+# the latest to clear the image scan: asyncssh < 2.23.1 trips grype --fail-on high
+# (GHSA-2wxc-x7rj-hg8f), and 2.24.x also clears GHSA-rw4j-r22c-9gc3. API used (connect,
+# import_private_key, run) is stable across these minors.
+asyncssh==2.24.1
