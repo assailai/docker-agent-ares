@@ -14,6 +14,7 @@ field extractor here plus its evaluator entry (already present) on the control p
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 
 # EOS enables SSH management by default and leaves Telnet off until explicitly configured, so a
 # `management telnet` block that is not shut down is a configured Telnet management transport.
@@ -52,8 +53,13 @@ _ACCESS_CLASS_IN = re.compile(r"^ip access-class \S+ in$")
 # global `spanning-tree ... bpduguard default`. An access-mode port covered by neither is left
 # unprotected against an L2 topology attack from the user edge.
 _BPDUGUARD_DEFAULT = re.compile(r"^spanning-tree .*bpduguard default$")
-_SWITCHPORT_ACCESS = re.compile(r"^switchport mode access$")
 _BPDUGUARD_ENABLE = re.compile(r"^spanning-tree bpduguard enable$")
+
+# EOS does not render the default `switchport mode access`, so an access-mode port is identified
+# by the ABSENCE of a routed (`no switchport`) or non-access mode (trunk / dynamic / dot1q-tunnel)
+# marker in its block, not by a positive access line.
+_NO_SWITCHPORT = re.compile(r"^no switchport$")
+_SWITCHPORT_NONACCESS = re.compile(r"^switchport mode (?!access\b)")
 
 # EOS secures an access port's MAC table with `switchport port-security` (optionally with a
 # `maximum`, a violation action, or sticky learning). An access-mode port with no port-security
@@ -176,68 +182,62 @@ def parse_unrestricted_management_source(running_config: str) -> bool:
     return False
 
 
+def _ethernet_blocks(running_config: str) -> Iterator[list[str]]:
+    """Yield the stripped body lines of each `interface EthernetN` block."""
+    lines = running_config.splitlines()
+    index = 0
+    while index < len(lines):
+        header = _INTERFACE.match(lines[index].strip())
+        if header and header.group(1).lower().startswith("ethernet"):
+            index += 1
+            block: list[str] = []
+            while index < len(lines) and _indented(lines[index]):
+                block.append(lines[index].strip())
+                index += 1
+            yield block
+            continue
+        index += 1
+
+
+def _is_access_port(block: list[str]) -> bool:
+    """True when an Ethernet block is a switched access port.
+
+    EOS omits the default `switchport mode access`, so a port is access unless it is routed
+    (`no switchport`) or set to a non-access switchport mode (trunk / dynamic / dot1q-tunnel).
+    """
+    return not any(_NO_SWITCHPORT.match(line) or _SWITCHPORT_NONACCESS.match(line) for line in block)
+
+
 def parse_access_port_without_bpduguard(running_config: str) -> bool:
-    """True when an access-mode Ethernet port is covered by no BPDU guard.
+    """True when a switched access port is covered by no BPDU guard.
 
     A global `spanning-tree ... bpduguard default` protects every edge port, so its presence makes
-    this a definite False. Otherwise each access-mode (`switchport mode access`) Ethernet port must
-    carry its own `spanning-tree bpduguard enable`; one that does not is unprotected. The
-    running-config is complete evidence, so a device with no access-mode port (a pure routed or
-    trunk device) has nothing to flag and is also a definite False.
+    this a definite False. Otherwise each access-mode Ethernet port must carry its own
+    `spanning-tree bpduguard enable`; one that does not is unprotected. Access mode is EOS's default
+    and is not rendered, so an access port is any switched Ethernet port (see `_is_access_port`). A
+    device whose Ethernet ports are all routed or trunks has nothing to flag and is a definite False.
     """
     lines = running_config.splitlines()
     if any(_BPDUGUARD_DEFAULT.match(line.strip()) for line in lines):
         return False
-    index = 0
-    while index < len(lines):
-        header = _INTERFACE.match(lines[index].strip())
-        if header and header.group(1).lower().startswith("ethernet"):
-            is_access = False
-            protected = False
-            index += 1
-            while index < len(lines) and _indented(lines[index]):
-                stripped = lines[index].strip()
-                if _SWITCHPORT_ACCESS.match(stripped):
-                    is_access = True
-                elif _BPDUGUARD_ENABLE.match(stripped):
-                    protected = True
-                index += 1
-            if is_access and not protected:
-                return True
-            continue
-        index += 1
+    for block in _ethernet_blocks(running_config):
+        if _is_access_port(block) and not any(_BPDUGUARD_ENABLE.match(line) for line in block):
+            return True
     return False
 
 
 def parse_access_port_without_port_security(running_config: str) -> bool:
-    """True when an access-mode Ethernet port enables no MAC port security.
+    """True when a switched access port enables no MAC port security.
 
-    Each `switchport mode access` Ethernet port must carry a `switchport port-security` line; one
-    that does not learns any MAC on the user edge. The running-config is complete evidence, so a
-    device with no access-mode port (a pure routed or trunk device) has nothing to flag and is a
-    definite False.
+    Each access-mode Ethernet port must carry a `switchport port-security` line; one that does not
+    learns any MAC on the user edge. Access mode is EOS's default and is not rendered, so an access
+    port is any switched Ethernet port (see `_is_access_port`). A device whose Ethernet ports are all
+    routed or trunks has nothing to flag and is a definite False.
     """
-    lines = running_config.splitlines()
-    index = 0
-    while index < len(lines):
-        header = _INTERFACE.match(lines[index].strip())
-        if header and header.group(1).lower().startswith("ethernet"):
-            is_access = False
-            secured = False
-            index += 1
-            while index < len(lines) and _indented(lines[index]):
-                stripped = lines[index].strip()
-                if _SWITCHPORT_ACCESS.match(stripped):
-                    is_access = True
-                elif _PORT_SECURITY.match(stripped):
-                    secured = True
-                index += 1
-            if is_access and not secured:
-                return True
-            continue
-        index += 1
+    for block in _ethernet_blocks(running_config):
+        if _is_access_port(block) and not any(_PORT_SECURITY.match(line) for line in block):
+            return True
     return False
-
 
 # Which control fields this parser can extract, and how. Each returns the field's typed value, or
 # raises to signal the config did not show it (the collector then abstains for that field).
