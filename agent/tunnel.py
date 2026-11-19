@@ -14,15 +14,21 @@ Two kinds of destination are authorized, and the agent is the one that decides:
   the wrong answer). The dial then goes to the address we checked, never back through the
   resolver, so a second lookup cannot swap the destination out from under the check.
 
-Approval alone is not enough: how a name was approved bounds where it may
+Every address a name resolves to passes :mod:`agent.dial_guard` first, however the name was
+approved: loopback, link-local, cloud metadata, unspecified, multicast and broadcast addresses
+are dropped before anything else looks at the answer, and the connect itself re-checks the
+literal it is given. ares approves a name, not the answer the name gives later, so without this
+a name whose DNS moved after approval (a rebinding answer, or split-horizon) could point an
+approved login host at this host's cloud metadata endpoint (ARES-2308).
+
+Approval alone is not enough either: how a name was approved bounds where it may
 point (see :class:`HostApproval` and :func:`globally_routable`). A name somebody
 actually chose - an address in this agent's scope, or the named target of a running
-hunt - may resolve anywhere, private space included, since that is a deliberate
-statement about one destination. A pattern (``*``, or a domain suffix) matches names
-nobody enumerated, so it carries no such intent and the address it resolves to has to
-earn the dial by being publicly routable. Otherwise an approved login domain becomes
-a route to loopback, link-local metadata, or a private segment this agent never
-registered for.
+hunt - may resolve into private space, since that is a deliberate statement about one
+destination. A pattern (``*``, or a domain suffix) matches names nobody enumerated, so
+it carries no such intent and the address it resolves to has to earn the dial by being
+publicly routable. Otherwise an approved login domain becomes a route into a private
+segment this agent never registered for.
 
 The frame format mirrors ``ares/infra/net/tunnel.py`` byte for byte; the two repos must
 change it together.
@@ -34,7 +40,6 @@ import asyncio
 import ipaddress
 import json
 import logging
-import socket
 import ssl
 import struct
 import time
@@ -44,6 +49,8 @@ from enum import Enum
 
 import websockets
 
+from agent import dial_guard
+from agent.dial_guard import Forbidden, Refused, summarize_addresses
 from agent.hostpins import HostPins
 
 logger = logging.getLogger("ares.agent.tunnel")
@@ -91,7 +98,6 @@ _RECONNECT_BACKOFF_MAX = 30.0
 # Startup rehearsal of the data plane (see probe). Bounded so a network that blackholes the
 # upgrade costs one slow startup rather than hanging the agent before it comes online.
 _PROBE_TIMEOUT = 15.0
-_ADDRESSES_NAMED = 3  # resolved addresses a refusal names before it counts the rest
 _ROLLUP_INTERVAL = 60.0  # seconds between rollups of the repeats that were not logged in full
 # Distinct hosts explained in full before the log falls back to counting. The page under test decides
 # what the browser dials, so a page referencing a thousand third parties would otherwise still cost a
@@ -269,22 +275,6 @@ def host_approval(host: str, allowed_hosts: Iterable[str]) -> HostApproval:
     return HostApproval.NONE
 
 
-def _normalized_address(address: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
-    """The address to judge, or None if it will not parse.
-
-    An IPv4-mapped IPv6 answer is reduced to the IPv4 address it really is, because
-    ``::ffff:169.254.169.254`` is link-local reached by a second spelling: judged as a v6 address it
-    looks globally routable, and the guard below would wave it through.
-    """
-    try:
-        parsed = ipaddress.ip_address(address)
-    except ValueError:
-        return None
-    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
-        return parsed.ipv4_mapped
-    return parsed
-
-
 def globally_routable(address: str) -> bool:
     """Whether a *pattern*-approved name is allowed to resolve here: the public internet only.
 
@@ -297,26 +287,12 @@ def globally_routable(address: str) -> bool:
     (``224.0.0.1``, ``ff02::1``). A tunnel has no business dialling a group address, and
     ``is_global`` alone would have left that open.
     """
-    parsed = _normalized_address(address)
+    # canonical_address reduces an IPv4-mapped answer to the IPv4 address it is, because
+    # ``::ffff:169.254.169.254`` judged as IPv6 looks globally routable.
+    parsed = dial_guard.canonical_address(address)
     if parsed is None:
         return False
     return parsed.is_global and not parsed.is_multicast
-
-
-class Refused(Exception):
-    """The destination is not authorized for this agent; the message is the log reason."""
-
-
-def summarize_addresses(addresses: list[str]) -> str:
-    """Name the first few addresses and count the rest, so one refusal stays one readable line.
-
-    A name behind a large CDN or anycast pool resolves to a dozen-plus A/AAAA records; printing all
-    of them turns every refusal into an unreadable wall.
-    """
-    if len(addresses) <= _ADDRESSES_NAMED:
-        return ", ".join(addresses)
-    named = ", ".join(addresses[:_ADDRESSES_NAMED])
-    return f"{named}, +{len(addresses) - _ADDRESSES_NAMED} more"
 
 
 class RefusalLog:
@@ -417,9 +393,28 @@ class TunnelClient:
         """
         return normalize_host(host) in self._scoped_hosts
 
+    def _loopback_permitted(self, host: str) -> bool:
+        """Whether ``host`` may be dialled although the dial guard calls it loopback.
+
+        Only as an IP literal inside this agent's own registered networks.
+        ``ARES_SCAN_SCOPE=host-all`` puts 127.0.0.1/32 there so a host-networked agent can assess
+        services bound to the host's localhost, and an explicit ``ARES_NETWORKS`` is the operator's
+        word too: both are settings on this box rather than anything ares pushed, and a literal has
+        no DNS answer to rebind. Reachability discovery never adds loopback, so nothing else can.
+
+        A NAME never reaches loopback however it resolves, and neither does an address that is only
+        in the scope ares pushed.
+        """
+        return is_ip_literal(host) and self._in_allowed_networks(host)
+
     async def _approved_addresses(self, host: str, port: int) -> list[str]:
         """Every address that may be dialled for ``host``, in resolution order, or raise
         :class:`Refused`.
+
+        The dial guard (:mod:`agent.dial_guard`) goes first and holds whatever comes after it: no
+        destination reaches loopback, link-local, cloud metadata, unspecified, multicast or
+        broadcast space, however it was approved. The one exception is loopback as an IP literal
+        inside the registered networks (see :meth:`_loopback_permitted`).
 
         An IP literal must be inside the registered networks, or be one an operator put in this
         agent's scope by hand. That second clause exists because the two halves are decided in
@@ -429,23 +424,30 @@ class TunnelClient:
         dial it, which reads as a machine that exists and cannot be assessed. It widens by exact
         address only (see :meth:`_in_operator_scope`), so it can never open a network.
 
-        A hostname is resolved here, and then the authority for dialling it decides how far that
-        authority reaches. Strongest first:
+        A hostname is resolved here, ONCE, and the guard drops every address it forbids before the
+        authority for dialling the name is weighed against what is left. Strongest first:
 
         * every address inside the registered networks - allowed, as it always has been;
-        * an exact host an operator put in this agent's scope - allowed wherever it resolves,
-          because that is a person naming one destination on purpose;
-        * an exact name ares pushed for a running hunt - likewise allowed wherever it resolves: the
-          assessment names its target, and that target is routinely an internal name that
-          split-horizon DNS answers with a private address;
+        * an exact host an operator put in this agent's scope - allowed wherever the guard lets it
+          resolve, private space included, because that is a person naming one destination on
+          purpose;
+        * an exact name ares pushed for a running hunt - likewise: the assessment names its target,
+          and that target is routinely an internal name that split-horizon DNS answers with a
+          private address;
         * a pattern ares pushed - ``*`` or a domain suffix - allowed only if every address it
           resolved to is globally routable. A pattern matches names nobody enumerated, so it is no
-          evidence that a particular destination was intended, and it must not become a route to
-          loopback, cloud metadata, or a private segment this agent never registered for.
+          evidence that a particular destination was intended, and it must not become a route into
+          a private segment this agent never registered for.
 
-        Every address has to pass, not only the one that gets dialled: whoever controls the DNS
-        answer controls its order, so approving a mixed reply and then taking the first record
-        would be the same as not checking.
+        The guard runs before the exact-name rule on purpose. ares approves a NAME, not the answer
+        that name will give at dial time, so an exact approval says nothing about where the name
+        points by the time it is dialled: a login host whose DNS was moved after approval would
+        otherwise be dialled at 169.254.169.254 on the strength of having been named (ARES-2308).
+
+        Every remaining address has to pass the pattern rule, not only the one that gets dialled:
+        whoever controls the DNS answer controls its order, so approving a mixed reply and then
+        taking the first record would be the same as not checking. The guard can filter a mixed
+        answer instead of refusing it only because nothing it drops is ever dialled.
 
         Returning concrete addresses (not the name) is what keeps the check and the connect on the
         same destination. ALL of them are returned, in the resolver's order, so ``_open`` can try
@@ -454,12 +456,29 @@ class TunnelClient:
         then fail, while the record that would have answered sat untried right behind it.
         """
         if is_ip_literal(host):
+            forbidden = dial_guard.forbidden_class(host)
+            if forbidden is Forbidden.LOOPBACK and self._loopback_permitted(host):
+                forbidden = None
+            if forbidden is not None:
+                raise Refused(dial_guard.literal_refusal(host, forbidden))
             if not self._in_allowed_networks(host) and not self._in_operator_scope(host):
                 raise Refused(
                     f"{host} is outside this agent's registered networks and is not in its scope"
                 )
-            return [host]
-        addresses = await self._resolve(host, port)
+            return [str(dial_guard.canonical_address(host))]
+        vetted = dial_guard.vet(host, await self._resolve(host, port))
+        addresses = self._authorize_resolved(host, list(vetted.addresses))
+        if vetted.dropped:
+            # reported only once the name is otherwise allowed, so a refusal that follows is never
+            # swallowed by the collapsing log as a repeat of this host.
+            self._refusals.record(host, vetted.drop_note(host))
+        return addresses
+
+    def _authorize_resolved(self, host: str, addresses: list[str]) -> list[str]:
+        """``addresses`` if the way ``host`` was approved covers all of them, else :class:`Refused`.
+
+        Takes what the dial guard left, never a raw answer (see :meth:`_approved_addresses`).
+        """
         if all(self._in_allowed_networks(value) for value in addresses):
             return addresses
         approval = host_approval(host, self._allowed_hosts)
@@ -485,33 +504,13 @@ class TunnelClient:
         return addresses
 
     async def _resolve(self, host: str, port: int) -> list[str]:
-        """Addresses for ``host``: a static pin if one exists, else this agent's resolver.
+        """Addresses for ``host`` from one resolution: a static pin if one exists, else this agent's
+        resolver (see :func:`agent.dial_guard.lookup`). Raw, so the caller must vet them.
 
-        Deduplicated, order preserved. A pin short-circuits DNS entirely, which is the point: it is
-        what an operator reaches for when the resolver will not answer a name at all.
+        Reads ``_RESOLVE_TIMEOUT`` at call time, so the cross-repo budget stays defined here, beside
+        the ares timeout it has to stay under.
         """
-        if pinned := self._pins.lookup(host):
-            return pinned
-        try:
-            infos = await asyncio.wait_for(
-                asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM),
-                _RESOLVE_TIMEOUT,
-            )
-        except asyncio.TimeoutError as exc:
-            # str(TimeoutError()) is EMPTY, so interpolating the exception the way the OSError arm
-            # does produced "... did not resolve on this agent: " and left the reader staring at a
-            # sentence that stopped at the colon. Say what actually happened instead.
-            raise Refused(
-                f"{host} did not resolve on this agent within {_RESOLVE_TIMEOUT:.0f}s "
-                "(the resolver did not answer; pin it in the host's /etc/hosts or "
-                "ARES_HOST_ALIASES if it never will)"
-            ) from exc
-        except OSError as exc:
-            raise Refused(f"{host} did not resolve on this agent: {exc}") from exc
-        addresses = list(dict.fromkeys(str(info[4][0]) for info in infos))
-        if not addresses:
-            raise Refused(f"{host} resolved to no address on this agent")
-        return addresses
+        return await dial_guard.lookup(host, port, timeout=_RESOLVE_TIMEOUT, pins=self._pins)
 
     async def run(self) -> None:
         # The same context the control plane verifies with (agent.tlsconf), so the two halves of
@@ -594,12 +593,28 @@ class TunnelClient:
             logger.warning("tunnel could not resolve %s: %s", host, exc)
             await self._fail_open(stream_id, f"{host} could not be resolved on this agent: {exc}")
             return
-        await self._dial_and_relay(stream_id=stream_id, host=host, port=port, addresses=addresses)
+        await self._dial_and_relay(
+            stream_id=stream_id,
+            host=host,
+            port=port,
+            addresses=addresses,
+            loopback_ok=self._loopback_permitted(host),
+        )
 
     async def _dial_and_relay(
-        self, stream_id: int, host: str, port: int, addresses: list[str]
+        self,
+        stream_id: int,
+        host: str,
+        port: int,
+        addresses: list[str],
+        *,
+        loopback_ok: bool = False,
     ) -> None:
-        """Connect to the first address that answers within the shared budget, else OPEN_ERR."""
+        """Connect to the first address that answers within the shared budget, else OPEN_ERR.
+
+        Every connect goes through :func:`agent.dial_guard.open_vetted`, which takes an IP literal
+        only and re-checks it, so the address dialled is always one the guard has judged.
+        """
         deadline = time.monotonic() + _DIAL_BUDGET
         failures: list[str] = []
         for address in addresses:
@@ -608,12 +623,20 @@ class TunnelClient:
                 failures.append(f"{address}: out of connect budget")
                 break
             try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(address, port),
+                reader, writer = await dial_guard.open_vetted(
+                    address,
+                    port,
                     timeout=min(_DIAL_TIMEOUT, remaining),
+                    loopback_ok=loopback_ok,
                 )
             except asyncio.CancelledError:
                 raise
+            except Refused as exc:
+                # unreachable through _approved_addresses, which already vetted every address; kept
+                # so a future caller that skips it is refused at the socket rather than dialled.
+                logger.warning("tunnel refused to dial %s:%d for %s: %s", address, port, host, exc)
+                failures.append(f"{address}: {exc}")
+                continue
             except (OSError, asyncio.TimeoutError) as exc:
                 reason = str(exc) or type(exc).__name__
                 logger.info("tunnel dial to %s:%d failed: %s", address, port, reason)
