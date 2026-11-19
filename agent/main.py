@@ -33,7 +33,7 @@ from agent.identify import IdentityProbe
 from agent.kubeinfo import KubeApi, KubeConfigError, KubernetesEvidence, safe_collect
 from agent.progress import ProgressReporter
 from agent import assessment, assessment_collect, assessment_discover, protocols
-from agent.collectors import arista, ssh_collect
+from agent.collectors import ssh_collect, vendor
 from agent.credential_vault import CredentialVault
 from agent.state import AgentState, fingerprint, load_state, save_state
 from agent.tunnel import (
@@ -1139,7 +1139,7 @@ async def _collect_controls(
     controls: list[dict] = []
     coverage: list[dict] = []
     for control_id in control_ids:
-        fields = arista.collect_control_fields(config, control_id)
+        fields = vendor.collect_control_fields(config, control_id)
         if fields is None:
             coverage.append(
                 assessment_collect.coverage_entry(
