@@ -181,6 +181,20 @@ def test_shutdown_http_api_is_not_enabled() -> None:
     assert arista.parse_unencrypted_api_enabled(cfg) is False
 
 
+def test_planted_config_has_no_login_banner() -> None:
+    cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
+    assert arista.parse_login_banner_absent(cfg) is True
+
+
+def test_clean_config_has_a_login_banner() -> None:
+    cfg = (_FIX / "ceos_running_config_clean.txt").read_text()
+    assert arista.parse_login_banner_absent(cfg) is False
+
+
+def test_a_configured_banner_is_detected() -> None:
+    assert arista.parse_login_banner_absent("banner login\nAuthorized only.\nEOF\n") is False
+
+
 def test_collect_control_fields_for_telnet() -> None:
     cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
     fields = arista.collect_control_fields(cfg, "net.management.telnet")
@@ -227,6 +241,13 @@ def test_collect_control_fields_for_unencrypted_api() -> None:
     cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
     assert arista.collect_control_fields(cfg, "net.management.http_api_unencrypted") == {
         "unencrypted_api_enabled": True
+    }
+
+
+def test_collect_control_fields_for_login_banner() -> None:
+    cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
+    assert arista.collect_control_fields(cfg, "net.management.no_login_banner") == {
+        "login_banner_absent": True
     }
 
 

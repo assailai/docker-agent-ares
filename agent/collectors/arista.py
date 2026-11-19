@@ -58,6 +58,9 @@ _PORT_SECURITY = re.compile(r"^switchport port-security")
 # undermines log correlation and certificate checks.
 _LOGGING_HOST = re.compile(r"^logging (?:vrf \S+ )?host \S")
 _NTP_SERVER = re.compile(r"^ntp server ")
+# A login banner: EOS renders a configured one as a `banner login` header line (its text
+# follows, ending at an `EOF` terminator). Its absence is a posture/compliance gap.
+_LOGIN_BANNER = re.compile(r"^banner login$")
 
 
 def _indented(line: str) -> bool:
@@ -174,6 +177,15 @@ def parse_unencrypted_api_enabled(running_config: str) -> bool:
     return False
 
 
+def parse_login_banner_absent(running_config: str) -> bool:
+    """True when no login banner is configured.
+
+    EOS renders a configured banner as a `banner login` header line. The running-config is complete
+    evidence, so a device with a `banner login` line is a definite False.
+    """
+    return not any(_LOGIN_BANNER.match(line.strip()) for line in running_config.splitlines())
+
+
 def _ethernet_blocks(running_config: str) -> Iterator[list[str]]:
     """Yield the stripped body lines of each `interface EthernetN` block."""
     lines = running_config.splitlines()
@@ -246,6 +258,7 @@ _FIELD_EXTRACTORS = {
     ("net.management.http_api_unencrypted", "unencrypted_api_enabled"): (
         parse_unencrypted_api_enabled
     ),
+    ("net.management.no_login_banner", "login_banner_absent"): parse_login_banner_absent,
     ("net.l2.bpduguard_missing", "access_port_without_bpduguard"): (
         parse_access_port_without_bpduguard
     ),
