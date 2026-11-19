@@ -143,6 +143,21 @@ def parse_default_snmp_community_present(running_config: str) -> bool:
     return False
 
 
+def parse_snmp_write_community_present(running_config: str) -> bool:
+    """True when any SNMPv1/v2c community grants read-write (rw) access.
+
+    EOS renders `snmp-server community <name> [view <v>] [ro|rw] [<acl>]`; the access mode is a
+    standalone token after the community name. A community with `rw` can change the device over SNMP,
+    independent of how guessable its name is. The running-config is complete evidence, so a device
+    with only read-only communities, or none, is a definite False.
+    """
+    for line in running_config.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("snmp-server community ") and "rw" in stripped.split()[3:]:
+            return True
+    return False
+
+
 def parse_reversible_enable_secret(running_config: str) -> bool:
     """True when the privileged enable secret is stored with a reversible encoding (type 0 or 7).
 
@@ -246,6 +261,9 @@ _FIELD_EXTRACTORS = {
     ("net.port.dynamic_trunk", "dynamic_trunk_negotiation"): parse_dynamic_trunk_negotiation,
     ("net.snmp.default_community", "default_snmp_community_present"): (
         parse_default_snmp_community_present
+    ),
+    ("net.snmp.write_community", "snmp_write_community_present"): (
+        parse_snmp_write_community_present
     ),
     ("net.management.weak_enable_secret", "reversible_enable_secret"): (
         parse_reversible_enable_secret

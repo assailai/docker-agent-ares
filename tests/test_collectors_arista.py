@@ -186,6 +186,25 @@ def test_a_routed_or_trunk_only_device_has_no_access_port_for_port_security() ->
     assert arista.parse_access_port_without_port_security(cfg) is False
 
 
+def test_planted_config_has_a_write_community() -> None:
+    cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
+    assert arista.parse_snmp_write_community_present(cfg) is True
+
+
+def test_clean_config_has_no_write_community() -> None:
+    cfg = (_FIX / "ceos_running_config_clean.txt").read_text()
+    assert arista.parse_snmp_write_community_present(cfg) is False
+
+
+def test_read_only_community_is_not_a_write_community() -> None:
+    assert arista.parse_snmp_write_community_present("snmp-server community public ro\n") is False
+
+
+def test_a_community_named_with_rw_is_not_a_write_community() -> None:
+    # the access mode is a standalone token; a name containing 'rw' must not false-positive.
+    assert arista.parse_snmp_write_community_present("snmp-server community brworks ro\n") is False
+
+
 def test_collect_control_fields_for_telnet() -> None:
     cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
     fields = arista.collect_control_fields(cfg, "net.management.telnet")
@@ -226,6 +245,12 @@ def test_collect_control_fields_for_port_security_missing() -> None:
     cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
     fields = arista.collect_control_fields(cfg, "net.l2.port_security_missing")
     assert fields == {"access_port_without_port_security": True}
+
+
+def test_collect_control_fields_for_snmp_write_community() -> None:
+    cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
+    fields = arista.collect_control_fields(cfg, "net.snmp.write_community")
+    assert fields == {"snmp_write_community_present": True}
 
 
 def test_collect_control_fields_for_unsupported_control_is_none() -> None:
