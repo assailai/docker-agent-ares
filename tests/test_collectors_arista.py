@@ -135,6 +135,35 @@ def test_one_unrestricted_vty_among_restricted_ones_still_flags() -> None:
     assert arista.parse_unrestricted_management_source(cfg) is True
 
 
+def test_planted_config_has_an_unprotected_access_port() -> None:
+    # Ethernet3 is `switchport mode access` with no `spanning-tree bpduguard enable` and no global
+    # default, so the user edge is unprotected against a rogue switch asserting spanning-tree root.
+    cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
+    assert arista.parse_access_port_without_bpduguard(cfg) is True
+
+
+def test_clean_config_protects_its_access_port_with_bpduguard() -> None:
+    # edge-router's access port carries `spanning-tree bpduguard enable`.
+    cfg = (_FIX / "ceos_running_config_clean.txt").read_text()
+    assert arista.parse_access_port_without_bpduguard(cfg) is False
+
+
+def test_global_bpduguard_default_protects_every_access_port() -> None:
+    # A fleet-wide edge-port default covers access ports without a per-port line.
+    cfg = "spanning-tree edge-port bpduguard default\ninterface Ethernet5\n   switchport mode access\n"
+    assert arista.parse_access_port_without_bpduguard(cfg) is False
+
+
+def test_a_routed_or_trunk_only_device_has_no_access_port_to_flag() -> None:
+    cfg = "interface Ethernet1\n   switchport mode trunk\ninterface Ethernet2\n   no switchport\n"
+    assert arista.parse_access_port_without_bpduguard(cfg) is False
+
+
+def test_per_port_bpduguard_enable_protects_that_access_port() -> None:
+    cfg = "interface Ethernet7\n   switchport mode access\n   spanning-tree bpduguard enable\n"
+    assert arista.parse_access_port_without_bpduguard(cfg) is False
+
+
 def test_collect_control_fields_for_telnet() -> None:
     cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
     fields = arista.collect_control_fields(cfg, "net.management.telnet")
@@ -163,6 +192,12 @@ def test_collect_control_fields_for_unrestricted_management_source() -> None:
     cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
     fields = arista.collect_control_fields(cfg, "net.management.unrestricted_source")
     assert fields == {"unrestricted_management_source": True}
+
+
+def test_collect_control_fields_for_bpduguard_missing() -> None:
+    cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
+    fields = arista.collect_control_fields(cfg, "net.l2.bpduguard_missing")
+    assert fields == {"access_port_without_bpduguard": True}
 
 
 def test_collect_control_fields_for_unsupported_control_is_none() -> None:

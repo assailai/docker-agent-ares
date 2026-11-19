@@ -23,6 +23,10 @@ interface Ethernet2
    description uplink
    switchport mode trunk
 !
+interface Ethernet3
+   description user-access-port
+   switchport mode access
+!
 line vty 0 31
    transport input ssh telnet
 !

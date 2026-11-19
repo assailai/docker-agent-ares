@@ -16,6 +16,7 @@ interface Ethernet1
    description access-user-port
    switchport mode access
    switchport nonegotiate
+   spanning-tree bpduguard enable
 !
 line vty 0 31
    transport input ssh

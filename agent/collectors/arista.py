@@ -47,6 +47,14 @@ _REVERSIBLE_SECRET_TYPES = frozenset({"0", "7"})
 _VTY_LINE = re.compile(r"^line vty\b")
 _ACCESS_CLASS_IN = re.compile(r"^ip access-class \S+ in$")
 
+# BPDU guard protects an edge/access port from a rogue switch asserting a spanning-tree root. EOS
+# applies it per-port with `spanning-tree bpduguard enable`, or fleet-wide to edge ports with a
+# global `spanning-tree ... bpduguard default`. An access-mode port covered by neither is left
+# unprotected against an L2 topology attack from the user edge.
+_BPDUGUARD_DEFAULT = re.compile(r"^spanning-tree .*bpduguard default$")
+_SWITCHPORT_ACCESS = re.compile(r"^switchport mode access$")
+_BPDUGUARD_ENABLE = re.compile(r"^spanning-tree bpduguard enable$")
+
 
 def _indented(line: str) -> bool:
     return line.startswith((" ", "\t"))
@@ -163,6 +171,39 @@ def parse_unrestricted_management_source(running_config: str) -> bool:
     return False
 
 
+def parse_access_port_without_bpduguard(running_config: str) -> bool:
+    """True when an access-mode Ethernet port is covered by no BPDU guard.
+
+    A global `spanning-tree ... bpduguard default` protects every edge port, so its presence makes
+    this a definite False. Otherwise each access-mode (`switchport mode access`) Ethernet port must
+    carry its own `spanning-tree bpduguard enable`; one that does not is unprotected. The
+    running-config is complete evidence, so a device with no access-mode port (a pure routed or
+    trunk device) has nothing to flag and is also a definite False.
+    """
+    lines = running_config.splitlines()
+    if any(_BPDUGUARD_DEFAULT.match(line.strip()) for line in lines):
+        return False
+    index = 0
+    while index < len(lines):
+        header = _INTERFACE.match(lines[index].strip())
+        if header and header.group(1).lower().startswith("ethernet"):
+            is_access = False
+            protected = False
+            index += 1
+            while index < len(lines) and _indented(lines[index]):
+                stripped = lines[index].strip()
+                if _SWITCHPORT_ACCESS.match(stripped):
+                    is_access = True
+                elif _BPDUGUARD_ENABLE.match(stripped):
+                    protected = True
+                index += 1
+            if is_access and not protected:
+                return True
+            continue
+        index += 1
+    return False
+
+
 # Which control fields this parser can extract, and how. Each returns the field's typed value, or
 # raises to signal the config did not show it (the collector then abstains for that field).
 _FIELD_EXTRACTORS = {
@@ -176,6 +217,9 @@ _FIELD_EXTRACTORS = {
     ),
     ("net.management.unrestricted_source", "unrestricted_management_source"): (
         parse_unrestricted_management_source
+    ),
+    ("net.l2.bpduguard_missing", "access_port_without_bpduguard"): (
+        parse_access_port_without_bpduguard
     ),
 }
 
