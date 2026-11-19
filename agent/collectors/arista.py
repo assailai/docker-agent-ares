@@ -183,6 +183,35 @@ def parse_ntp_unconfigured(running_config: str) -> bool:
     return not any(_NTP_SERVER.match(line.strip()) for line in running_config.splitlines())
 
 
+def parse_unencrypted_api_enabled(running_config: str) -> bool:
+    """True when an enabled HTTP management API binds plaintext `protocol http`.
+
+    EOS's `management api http-commands` defaults to HTTPS (no protocol line); a `protocol http`
+    inside a block that is not shutdown serves eAPI over plaintext. The running-config is complete
+    evidence, so a device with no management-api block, a shut one, or one on https only, is a
+    definite False.
+    """
+    lines = running_config.splitlines()
+    index = 0
+    while index < len(lines):
+        if lines[index].strip() == "management api http-commands":
+            shut = False
+            http = False
+            index += 1
+            while index < len(lines) and _indented(lines[index]):
+                stripped = lines[index].strip()
+                if stripped == "shutdown":
+                    shut = True
+                elif stripped == "protocol http" or stripped.startswith("protocol http "):
+                    http = True
+                index += 1
+            if not shut and http:
+                return True
+            continue
+        index += 1
+    return False
+
+
 def parse_reversible_enable_secret(running_config: str) -> bool:
     """True when the privileged enable secret is stored with a reversible encoding (type 0 or 7).
 
@@ -292,6 +321,9 @@ _FIELD_EXTRACTORS = {
     ),
     ("net.logging.no_remote_syslog", "remote_syslog_absent"): parse_remote_syslog_absent,
     ("net.ntp.no_ntp", "ntp_unconfigured"): parse_ntp_unconfigured,
+    ("net.management.http_api_unencrypted", "unencrypted_api_enabled"): (
+        parse_unencrypted_api_enabled
+    ),
     ("net.management.weak_enable_secret", "reversible_enable_secret"): (
         parse_reversible_enable_secret
     ),

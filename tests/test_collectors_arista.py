@@ -229,6 +229,31 @@ def test_clean_config_has_ntp() -> None:
     assert arista.parse_ntp_unconfigured(cfg) is False
 
 
+def test_planted_config_serves_eapi_over_http() -> None:
+    cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
+    assert arista.parse_unencrypted_api_enabled(cfg) is True
+
+
+def test_clean_config_has_no_unencrypted_api() -> None:
+    cfg = (_FIX / "ceos_running_config_clean.txt").read_text()
+    assert arista.parse_unencrypted_api_enabled(cfg) is False
+
+
+def test_default_eapi_is_https_and_not_flagged() -> None:
+    cfg = "management api http-commands\n   no shutdown\n"
+    assert arista.parse_unencrypted_api_enabled(cfg) is False
+
+
+def test_explicit_https_eapi_is_not_flagged() -> None:
+    cfg = "management api http-commands\n   protocol https\n   no shutdown\n"
+    assert arista.parse_unencrypted_api_enabled(cfg) is False
+
+
+def test_shutdown_http_api_is_not_enabled() -> None:
+    cfg = "management api http-commands\n   protocol http\n   shutdown\n"
+    assert arista.parse_unencrypted_api_enabled(cfg) is False
+
+
 def test_collect_control_fields_for_telnet() -> None:
     cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
     fields = arista.collect_control_fields(cfg, "net.management.telnet")
@@ -287,6 +312,13 @@ def test_collect_control_fields_for_remote_syslog() -> None:
 def test_collect_control_fields_for_ntp() -> None:
     cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
     assert arista.collect_control_fields(cfg, "net.ntp.no_ntp") == {"ntp_unconfigured": True}
+
+
+def test_collect_control_fields_for_unencrypted_api() -> None:
+    cfg = (_FIX / "ceos_running_config_planted.txt").read_text()
+    assert arista.collect_control_fields(cfg, "net.management.http_api_unencrypted") == {
+        "unencrypted_api_enabled": True
+    }
 
 
 def test_collect_control_fields_for_unsupported_control_is_none() -> None:

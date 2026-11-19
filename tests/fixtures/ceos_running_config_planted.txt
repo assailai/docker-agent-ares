@@ -11,6 +11,7 @@ management telnet
    no shutdown
 !
 management api http-commands
+   protocol http
    no shutdown
 !
 snmp-server community public ro
