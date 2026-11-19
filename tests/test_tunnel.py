@@ -636,10 +636,15 @@ def test_a_pattern_approved_name_cannot_reach_special_use_space(
     address: str, allowed: set[str], host: str
 ) -> None:
     """Kept as a table because this is a policy about the special-use registries, and those shift
-    between Python releases: production runs 3.12 while a dev venv may be newer."""
+    between Python releases: production runs 3.12 while a dev venv may be newer.
+
+    Two rules refuse these, and either is a pass: the dial guard, which holds for every approval
+    and owns loopback, link-local, metadata, unspecified and multicast ("never dials"), and the
+    pattern rule, which keeps a pattern off everything else that is not public ("not public address
+    space"). tests/test_dial_guard.py pins which rule owns which address."""
     client = _client(networks=["10.0.0.0/24"], allowed_hosts=allowed)
     _stub_resolver(client, {host: [address]})
-    with pytest.raises(Refused, match="not public address space"):
+    with pytest.raises(Refused, match="not public address space|never dials"):
         asyncio.run(client._approved_addresses(host, 443))
 
 
@@ -654,14 +659,17 @@ def test_a_pattern_named_public_address_is_still_reachable() -> None:
 @pytest.mark.parametrize(
     "answers",
     [
-        ["93.184.216.34", "169.254.169.254"],
-        ["169.254.169.254", "93.184.216.34"],
+        ["93.184.216.34", "10.9.9.9"],
+        ["10.9.9.9", "93.184.216.34"],
     ],
 )
 def test_one_bad_answer_refuses_the_whole_name(answers: list[str]) -> None:
     """Every answer has to pass, not only the one that would be dialled. Whoever controls the DNS
     reply controls its order, so checking a mixed reply and then taking the first record would be
-    the same as not checking - hence both orderings here."""
+    the same as not checking - hence both orderings here.
+
+    A private record is the case for this rule. A record the dial guard forbids (metadata, loopback)
+    is dropped before the rule runs and never dialled, which tests/test_dial_guard.py covers."""
     client = _client(networks=["10.0.0.0/24"], allowed_hosts={"*"})
     _stub_resolver(client, {"mixed.example.test": answers})
     with pytest.raises(Refused, match="not public address space"):
@@ -685,12 +693,21 @@ def test_the_login_wildcard_does_not_downgrade_the_hunts_own_target() -> None:
     assert asyncio.run(client._approved_addresses("intranet.acme.local", 443)) == ["10.5.0.7"]
 
 
-def test_an_operator_scoped_host_reaches_any_address_class() -> None:
+def test_an_operator_scoped_host_reaches_private_space_outside_the_networks() -> None:
     """A standing decision by a person who typed one exact destination. That is the point of scope:
     an operator can add a host this agent's own detection never reached."""
     client = _client(networks=["10.0.0.0/24"], scoped_hosts={"pinned.example.test"})
+    _stub_resolver(client, {"pinned.example.test": ["10.5.0.7"]})
+    assert asyncio.run(client._approved_addresses("pinned.example.test", 443)) == ["10.5.0.7"]
+
+
+def test_an_operator_scoped_host_still_cannot_reach_cloud_metadata() -> None:
+    """Scope names a host, not the answer its DNS gives at dial time, so it is no route to the
+    agent host's own metadata endpoint (ARES-2308). This used to be allowed."""
+    client = _client(networks=["10.0.0.0/24"], scoped_hosts={"pinned.example.test"})
     _stub_resolver(client, {"pinned.example.test": ["169.254.169.254"]})
-    assert asyncio.run(client._approved_addresses("pinned.example.test", 443)) == ["169.254.169.254"]
+    with pytest.raises(Refused, match="never dials"):
+        asyncio.run(client._approved_addresses("pinned.example.test", 443))
 
 
 def test_a_name_inside_the_registered_networks_needs_no_approval_at_all() -> None:
