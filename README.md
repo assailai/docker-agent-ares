@@ -57,7 +57,7 @@ host privileges to grant.
    affected. The one exception is loopback written as an address inside this agent's own
    networks, which only `ARES_SCAN_SCOPE=host-all` or an explicit `ARES_NETWORKS` puts there, so
    a host-networked agent can still assess services bound to the host's localhost. Agents older
-   than 3.14.2 dial an exactly approved name wherever it resolves.
+   than 3.14.3 dial an exactly approved name wherever it resolves.
 5. **Pause** - pausing the agent in the dashboard stops it working until you resume it. The agent
    learns of it on its next heartbeat: it cancels the scan it is running and hands that task back,
    asks for no new tasks, and closes its tunnel. On Resume the handed-back work runs again. Agents
