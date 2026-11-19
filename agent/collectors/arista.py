@@ -22,11 +22,8 @@ _MGMT_SERVICE = re.compile(r"^management (ssh|telnet)$")
 _TRANSPORT_INPUT = re.compile(r"^transport input (.+)$")
 _MANAGEMENT_PROTOCOL_WORDS = frozenset({"ssh", "telnet"})
 
-# An interface block header, and a `switchport mode dynamic ...` line inside it. EOS leaves an access
-# port with DTP enabled when the mode is `dynamic auto`/`dynamic desirable`, so a switched port left
-# in a dynamic mode is negotiating trunking rather than being pinned to access.
+# An interface block header, used to walk each Ethernet interface's config block.
 _INTERFACE = re.compile(r"^interface (\S+)$")
-_DYNAMIC_MODE = re.compile(r"^switchport mode dynamic (auto|desirable)$")
 
 # An SNMP community declaration: `snmp-server community <name> [view <v>] [ro|rw] [<acl>]`. The
 # community string is the first token after the keyword. The well-known factory defaults below are
@@ -35,18 +32,7 @@ _DYNAMIC_MODE = re.compile(r"^switchport mode dynamic (auto|desirable)$")
 _SNMP_COMMUNITY = re.compile(r"^snmp-server community (\S+)")
 _DEFAULT_SNMP_COMMUNITIES = frozenset({"public", "private"})
 
-# A privileged enable secret and its storage encoding type: `enable (password|secret) <type> <hash>`.
-# EOS/IOS type 0 is cleartext and type 7 is the reversible Vigenere cipher, both recoverable from the
-# config; type 5 (MD5) and 8/9 (scrypt/pbkdf2) are one-way. A reversible secret in the config is a
-# credential anyone who can read the config can recover.
-_ENABLE_SECRET = re.compile(r"^enable (?:password|secret) (\d+) \S")
-_REVERSIBLE_SECRET_TYPES = frozenset({"0", "7"})
 
-# A management access line (vty) block header, and the source restriction that may be bound inside it.
-# EOS permits any source on a vty with no `ip access-class ... in`, so a vty block that binds none
-# leaves the management plane reachable from unrestricted source networks.
-_VTY_LINE = re.compile(r"^line vty\b")
-_ACCESS_CLASS_IN = re.compile(r"^ip access-class \S+ in$")
 
 # BPDU guard protects an edge/access port from a rogue switch asserting a spanning-tree root. EOS
 # applies it per-port with `spanning-tree bpduguard enable`, or fleet-wide to edge ports with a
@@ -109,30 +95,6 @@ def parse_management_protocols(running_config: str) -> list[str]:
                     protocols.add(word)
         index += 1
     return sorted(protocols)
-
-
-def parse_dynamic_trunk_negotiation(running_config: str) -> bool:
-    """True when any switched interface is left negotiating a trunk (DTP on a `dynamic` mode).
-
-    Device-level for v1: the control is "dynamic trunk negotiation on an approved access-role port",
-    and this returns whether ANY Ethernet interface is in `switchport mode dynamic auto|desirable`.
-    Binding the verdict to the port's approved role (so an uplink that is meant to trunk is excluded)
-    is the hardening the control's own limitation note names; here the role is not yet modelled, so a
-    True means at least one switched port is negotiating, which an access-role port must not.
-    """
-    lines = running_config.splitlines()
-    index = 0
-    while index < len(lines):
-        header = _INTERFACE.match(lines[index].strip())
-        if header and header.group(1).lower().startswith("ethernet"):
-            index += 1
-            while index < len(lines) and _indented(lines[index]):
-                if _DYNAMIC_MODE.match(lines[index].strip()):
-                    return True
-                index += 1
-            continue
-        index += 1
-    return False
 
 
 def parse_default_snmp_community_present(running_config: str) -> bool:
@@ -212,45 +174,6 @@ def parse_unencrypted_api_enabled(running_config: str) -> bool:
     return False
 
 
-def parse_reversible_enable_secret(running_config: str) -> bool:
-    """True when the privileged enable secret is stored with a reversible encoding (type 0 or 7).
-
-    The running-config is complete evidence, so a device with no enable secret, or one stored with a
-    one-way encoding (type 5/8/9), is a definite False rather than an abstention. A reversible secret
-    is recoverable by anyone who can read the config, so its encoding type alone decides this.
-    """
-    for line in running_config.splitlines():
-        match = _ENABLE_SECRET.match(line.strip())
-        if match and match.group(1) in _REVERSIBLE_SECRET_TYPES:
-            return True
-    return False
-
-
-def parse_unrestricted_management_source(running_config: str) -> bool:
-    """True when a management access line (vty) binds no source access-class, leaving it reachable
-    from any source network.
-
-    EOS defaults a vty to permit-any, so a vty block with no `ip access-class ... in` is unrestricted.
-    The running-config is complete evidence: a device whose every vty binds a source access-class is a
-    definite False. A device with no vty block at all has no such line to flag, so it is also False.
-    """
-    lines = running_config.splitlines()
-    index = 0
-    while index < len(lines):
-        if _VTY_LINE.match(lines[index].strip()):
-            restricted = False
-            index += 1
-            while index < len(lines) and _indented(lines[index]):
-                if _ACCESS_CLASS_IN.match(lines[index].strip()):
-                    restricted = True
-                index += 1
-            if not restricted:
-                return True
-            continue
-        index += 1
-    return False
-
-
 def _ethernet_blocks(running_config: str) -> Iterator[list[str]]:
     """Yield the stripped body lines of each `interface EthernetN` block."""
     lines = running_config.splitlines()
@@ -312,7 +235,6 @@ def parse_access_port_without_port_security(running_config: str) -> bool:
 # raises to signal the config did not show it (the collector then abstains for that field).
 _FIELD_EXTRACTORS = {
     ("net.management.telnet", "management_protocols"): parse_management_protocols,
-    ("net.port.dynamic_trunk", "dynamic_trunk_negotiation"): parse_dynamic_trunk_negotiation,
     ("net.snmp.default_community", "default_snmp_community_present"): (
         parse_default_snmp_community_present
     ),
@@ -323,12 +245,6 @@ _FIELD_EXTRACTORS = {
     ("net.ntp.no_ntp", "ntp_unconfigured"): parse_ntp_unconfigured,
     ("net.management.http_api_unencrypted", "unencrypted_api_enabled"): (
         parse_unencrypted_api_enabled
-    ),
-    ("net.management.weak_enable_secret", "reversible_enable_secret"): (
-        parse_reversible_enable_secret
-    ),
-    ("net.management.unrestricted_source", "unrestricted_management_source"): (
-        parse_unrestricted_management_source
     ),
     ("net.l2.bpduguard_missing", "access_port_without_bpduguard"): (
         parse_access_port_without_bpduguard
