@@ -45,8 +45,19 @@ host privileges to grant.
    waiting Ares may approve a whole *domain* (or briefly any name at all). Those broader approvals
    are limited to **public** addresses: a name approved by pattern rather than by name cannot
    resolve to loopback, link-local (so not cloud metadata), private, carrier-grade NAT, multicast
-   or reserved space. A destination you approved by exact name or address is unaffected, so an
-   internal host you added by hand still works.
+   or reserved space. A destination you approved by exact name or address may still be private,
+   so an internal host you added by hand still works.
+
+   Some addresses are never dialled, however a destination was approved: loopback, link-local
+   (where cloud metadata services such as `169.254.169.254` live), the metadata addresses that sit
+   elsewhere (`100.100.100.200`, `fd00:ec2::254` and a few more), unspecified, multicast and
+   broadcast. The agent judges every address a name resolves to at the moment it dials, and then
+   connects to the address it judged, so a name whose DNS answer changes after Ares approved it
+   cannot become a route to this host or to its cloud credentials. Private addresses are not
+   affected. The one exception is loopback written as an address inside this agent's own
+   networks, which only `ARES_SCAN_SCOPE=host-all` or an explicit `ARES_NETWORKS` puts there, so
+   a host-networked agent can still assess services bound to the host's localhost. Agents older
+   than 3.14.3 dial an exactly approved name wherever it resolves.
 5. **Pause** - pausing the agent in the dashboard stops it working until you resume it. The agent
    learns of it on its next heartbeat: it cancels the scan it is running and hands that task back,
    asks for no new tasks, and closes its tunnel. On Resume the handed-back work runs again. Agents
@@ -418,7 +429,9 @@ echo "10.1.2.3  sso.acme.internal" | sudo tee -a /etc/hosts
 For a pin you do not want in the host file, `ARES_HOST_ALIASES=sso.acme.internal=10.1.2.3` does
 the same thing. Either way a pin only supplies the *address* DNS would have; the destination is
 still checked against this agent's registered networks and what Ares approved, so pinning a name
-can never widen what the agent will reach.
+can never widen what the agent will reach. A pinned address is also held to the addresses the
+agent never dials (see [How it works](#how-it-works)), so a name pinned to loopback is refused,
+including the `127.0.1.1` line many distributions add for the machine's own name.
 
 **A slow resolver is not a broken one.** glibc walks the nameservers in `/etc/resolv.conf` in
 order at roughly five seconds each, so a name the first server will not answer only resolves once
@@ -443,7 +456,10 @@ you deploy.
   the agent side. It exists only while a hunt is running. Names are resolved here, never in the
   cloud, and every refusal is logged with its reason. A broader, pattern-based approval (a login
   domain, or the wildcard used while an interactive sign-in is parked) reaches public addresses
-  only, so it can never become a route into private, loopback or link-local space.
+  only, so it can never become a route into private, loopback or link-local space. Whatever
+  approved a destination, the agent never dials loopback, link-local, cloud metadata,
+  unspecified, multicast or broadcast addresses, and it checks the address a name resolves to at
+  the moment it dials, so a changed DNS answer cannot redirect an approved name there.
 - **Scan scope is enforced twice** - a scan task names the network to scan, and the agent checks
   that network against its own scope before it starts. With `ARES_NETWORKS` set explicitly, that
   list is a ceiling the agent will not scan outside of, even if it is asked to.

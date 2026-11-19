@@ -15,8 +15,11 @@ agent pick it up on its next dial. That is the whole point of preferring the mou
 ``--add-host``: a pin costs an edit, never a container recreate.
 
 A pin is authorization-neutral. It only supplies the address DNS would have; every address it
-yields still goes through the same registered-networks / ares-approved check in ``_dial_address``,
-so pinning a name cannot widen what this agent will dial.
+yields still goes through the same dial guard (:mod:`agent.dial_guard`) and the same
+registered-networks / ares-approved check in ``TunnelClient._approved_addresses``, so pinning a
+name cannot widen what this agent will dial. That includes the ``127.0.1.1 <hostname>`` line many
+distributions put in ``/etc/hosts``: a pushed name equal to this machine's hostname is refused,
+not dialled onto loopback.
 """
 
 from __future__ import annotations
