@@ -118,11 +118,26 @@ The bootstrap script checks Docker is available, starts the container, and waits
 reports online:
 
 ```bash
-ARES_TOKEN=<your-registration-token> bash <(curl -fsSL https://raw.githubusercontent.com/assailai/ares-agent/main/scripts/bootstrap.sh)
+ARES_TOKEN=<your-registration-token> bash <(curl -fsSL https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.0/scripts/bootstrap.sh)
 ```
 
 It also accepts the token as an argument or prompts for it interactively. Works on macOS, Linux,
 and Windows (Git Bash / WSL).
+
+Fetch it from the release tag, not from `main`: a tag is immutable, so a command you issued last
+month still runs the script that was reviewed for that release. The dashboard's install command
+pins the current one for you. To check the script before running it:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.0/scripts/bootstrap.sh
+shasum -a 256 bootstrap.sh   # compare against the checksum on the v3.15.0 release page
+```
+
+Before it starts anything, the installer cosign-verifies both images against the Ares publisher
+and then runs the verified **digest** rather than the tag. It fails closed: if it cannot verify,
+nothing is started. That means a host which cannot reach ghcr.io (for cosign), Fulcio or Rekor
+will fail the install rather than quietly proceed — point `ARES_COSIGN_IMAGE` at an internal
+mirror of `ghcr.io/sigstore/cosign/cosign` if that is your situation.
 
 ### Option D: Kubernetes
 
@@ -140,7 +155,7 @@ The `assailai/ares-agent` and `assailai/ares-updater` images are public on Docke
 image pull secret is required.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/assailai/ares-agent/main/deploy/k8s/ares-agent.yaml
+curl -fsSLO https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.0/deploy/k8s/ares-agent.yaml
 # set ARES_TOKEN in the Secret at the top of the file (and pin the image to a release), then:
 kubectl apply -f ares-agent.yaml
 kubectl rollout status deploy/ares-agent
@@ -624,7 +639,7 @@ docker volume rm ares-agent-data
 Or let the installer do it, which is the same thing plus a clean re-enrollment:
 
 ```bash
-ARES_RESET=1 ARES_TOKEN=<fresh-token> bash <(curl -fsSL https://raw.githubusercontent.com/assailai/ares-agent/main/scripts/bootstrap.sh)
+ARES_RESET=1 ARES_TOKEN=<fresh-token> bash <(curl -fsSL https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.0/scripts/bootstrap.sh)
 ```
 
 ## Versioning
