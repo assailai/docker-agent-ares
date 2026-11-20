@@ -92,6 +92,11 @@ spec:
     metadata: { labels: { app: ares-agent } }
     spec:
       serviceAccountName: ares-updater
+      # Mirrors deploy/k8s/ares-agent.yaml: the token goes to the updater container alone, so the
+      # e2e exercises the topology we ship rather than the pod-wide automount (ARES-2327). The
+      # agent container is the one facing untrusted scanned networks; a token there can patch this
+      # very Deployment, which is the cosign gate bypassed in one API call.
+      automountServiceAccountToken: false
       securityContext: { fsGroup: 10001 }
       containers:
         - name: ares-agent
@@ -106,8 +111,17 @@ spec:
             - { name: ARES_UPDATE_CONTAINER, value: "ares-agent" }
             - { name: ARES_UPDATE_REQUIRE_SIGNATURE, value: "false" }
             - { name: ARES_UPDATE_POLL_SECONDS, value: "5" }
-          volumeMounts: [{ name: data, mountPath: /data, readOnly: true }]
-      volumes: [{ name: data, persistentVolumeClaim: { claimName: ares-agent-data } }]
+          volumeMounts:
+            - { name: data, mountPath: /data, readOnly: true }
+            - { name: kube-api-access, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: ares-agent-data } }
+        - name: kube-api-access
+          projected:
+            sources:
+              - serviceAccountToken: { path: token, expirationSeconds: 3607 }
+              - configMap: { name: kube-root-ca.crt, items: [{ key: ca.crt, path: ca.crt }] }
+              - downwardAPI: { items: [{ path: namespace, fieldRef: { fieldPath: metadata.namespace } }] }
 YAML
 
 echo "==> Wait for the initial pod (agent 2.4.0) to be Ready"
@@ -147,6 +161,15 @@ PHASE="$($KCTL -n "$NS" get pod -l app=ares-agent -o jsonpath='{.items[0].status
 [ "$RUNNING_UPD" = "ares-updater:2.5.0" ] || fail "the rolled pod runs updater $RUNNING_UPD"
 UPD_READY="$($KCTL -n "$NS" get pod -l app=ares-agent -o jsonpath='{.items[0].status.containerStatuses[?(@.name=="ares-updater")].ready}')"
 [ "$UPD_READY" = "true" ] || fail "the new updater container is not ready"
+echo "==> Confirm the agent container holds no Kubernetes credential"
+POD="$($KCTL -n "$NS" get pod -l app=ares-agent -o jsonpath='{.items[0].metadata.name}')"
+if $KCTL -n "$NS" exec "$POD" -c ares-agent -- test -e /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null; then
+    fail "the agent container has a ServiceAccount token: it can patch its own Deployment"
+fi
+# and the updater still has one, or the whole rollout above happened by accident
+$KCTL -n "$NS" exec "$POD" -c ares-updater -- test -s /var/run/secrets/kubernetes.io/serviceaccount/token \
+    || fail "the updater container has no ServiceAccount token"
+
 # A healthy roll must never trip the gate. If it does, the deadline or the readiness conditions are
 # wrong and every real update would be rolled straight back.
 if $KCTL -n "$NS" logs -l app=ares-agent -c ares-updater --tail=200 2>/dev/null | grep -q "rolling back"; then
