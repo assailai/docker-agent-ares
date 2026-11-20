@@ -117,6 +117,10 @@ echo "==> Write the update target (2.5.0) into the shared volume (stands in for 
 POD="$($KCTL -n "$NS" get pod -l app=ares-agent -o jsonpath='{.items[0].metadata.name}')"
 $KCTL -n "$NS" exec "$POD" -c ares-agent -- sh -c 'printf "{\"version\": \"2.5.0\"}" > /data/update-target.json' || fail "write target"
 
+# The updater patches both containers at once, so Recreate destroys the very container doing the
+# patching somewhere between the PATCH and its first health poll. That is by design (one patch =
+# one rollout), and it is why the new sidecar's "rolling out or stuck" lines during the roll are
+# expected rather than a fault.
 echo "==> Wait for the updater to patch the Deployment -> agent AND updater :2.5.0, and k8s to roll it"
 OK=""
 for _ in $(seq 1 40); do
@@ -143,6 +147,11 @@ PHASE="$($KCTL -n "$NS" get pod -l app=ares-agent -o jsonpath='{.items[0].status
 [ "$RUNNING_UPD" = "ares-updater:2.5.0" ] || fail "the rolled pod runs updater $RUNNING_UPD"
 UPD_READY="$($KCTL -n "$NS" get pod -l app=ares-agent -o jsonpath='{.items[0].status.containerStatuses[?(@.name=="ares-updater")].ready}')"
 [ "$UPD_READY" = "true" ] || fail "the new updater container is not ready"
+# A healthy roll must never trip the gate. If it does, the deadline or the readiness conditions are
+# wrong and every real update would be rolled straight back.
+if $KCTL -n "$NS" logs -l app=ares-agent -c ares-updater --tail=200 2>/dev/null | grep -q "rolling back"; then
+    fail "the updater rolled back a rollout that succeeded"
+fi
 echo ""
 echo "K8S E2E PASSED: updater patched ares-agent and itself via scoped RBAC in one rollout;"
 echo "                the pod runs $RUNNING_IMG with $RUNNING_UPD (pod $PHASE)."

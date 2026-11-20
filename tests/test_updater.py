@@ -373,20 +373,10 @@ def test_docker_apply_drops_labels_when_the_old_image_is_unreadable(
 
 
 def test_k8s_apply_patches_the_deployment_image(monkeypatch: pytest.MonkeyPatch) -> None:
-    seen: dict = {}
+    deployment = _FakeDeployment().install(monkeypatch)
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "PATCH":
-            seen["body"] = request.read().decode()
-        return httpx.Response(200, json={})
-
-    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://k8s")
-    monkeypatch.setattr(kube, "_client", lambda: client)
-    monkeypatch.setattr(kube, "_namespace", lambda _s: "default")
-
-    K8sBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent:2.5.0"))
-    container = json.loads(seen["body"])["spec"]["template"]["spec"]["containers"][0]
-    assert container == {"name": "ares-agent", "image": "assailai/ares-agent:2.5.0"}
+    assert K8sBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent:2.5.0")) is True
+    assert deployment.patched(0)[0] == {"name": "ares-agent", "image": "assailai/ares-agent:2.5.0"}
 
 
 class _FakeBackend:
@@ -748,36 +738,128 @@ def test_docker_removes_a_predecessor_that_failed_to_remove_itself(
     assert engine.calls == [("DELETE", "/containers/ares-updater-old", "")]
 
 
-def _k8s_deployment(monkeypatch: pytest.MonkeyPatch, containers: list[dict]) -> list[dict]:
-    """Serve a Deployment with ``containers``; return the patches the backend sends."""
-    patches: list[dict] = []
+class _FakeDeployment:
+    """The agent Deployment as the API server reports it.
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    PATCHes mutate the pod template and bump metadata.generation, the way the apiserver does
+    synchronously; GETs return that spec plus the status the test drives. ``ready_after`` is how
+    many polls the rollout takes to report itself up, and ``ready_for`` how long it stays that way
+    before falling over again (a crash loop is Ready between restarts).
+    """
+
+    def __init__(
+        self,
+        *,
+        containers: list[dict] | None = None,
+        replicas: int = 1,
+        ready_after: int = 0,
+        ready_for: int | None = None,
+        observes_after: int = 0,
+        rollback_status: int = 200,
+    ) -> None:
+        self.containers = containers if containers is not None else [
+            {"name": "ares-agent", "image": "assailai/ares-agent:2.4.0"},
+            {"name": "ares-updater", "image": f"{_UPDATER}:2.4.0"},
+        ]
+        self.replicas = replicas
+        self.ready_after = ready_after
+        self.ready_for = ready_for
+        self.observes_after = observes_after
+        self.rollback_status = rollback_status
+        self.generation = 1
+        self.observed = 1
+        self.patches: list[dict] = []
+        self.polls = 0
+
+    def _status(self) -> dict:
+        # before the first patch the Deployment is simply up; afterwards the test drives it.
+        if not self.patches:
+            return {
+                "observedGeneration": self.generation,
+                "updatedReplicas": self.replicas,
+                "readyReplicas": self.replicas,
+                "availableReplicas": self.replicas,
+            }
+        observed = self.generation if self.polls >= self.observes_after else self.generation - 1
+        up = self.polls >= self.ready_after
+        if up and self.ready_for is not None and self.polls >= self.ready_after + self.ready_for:
+            up = False  # came up, then fell over: CrashLoopBackOff
+        return {
+            "observedGeneration": observed,
+            "updatedReplicas": self.replicas if up else 0,
+            "readyReplicas": self.replicas if up else 0,
+            "availableReplicas": self.replicas if up else 0,
+        }
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
         if request.method == "PATCH":
-            patches.append(json.loads(request.read()))
+            body = json.loads(request.read())
+            self.patches.append(body)
+            if len(self.patches) > 1 and self.rollback_status != 200:
+                return httpx.Response(self.rollback_status, json={})
+            wanted = {c["name"]: c["image"] for c in body["spec"]["template"]["spec"]["containers"]}
+            for container in self.containers:
+                if container["name"] in wanted:
+                    container["image"] = wanted[container["name"]]
+            self.generation += 1
+            self.polls = 0
             return httpx.Response(200, json={})
-        deployment = {"spec": {"template": {"spec": {"containers": containers}}}}
-        return httpx.Response(200, json=deployment)
+        self.polls += 1
+        return httpx.Response(
+            200,
+            json={
+                "metadata": {"generation": self.generation},
+                "spec": {"replicas": self.replicas, "template": {"spec": {"containers": self.containers}}},
+                "status": self._status(),
+            },
+        )
 
-    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://k8s")
-    monkeypatch.setattr(kube, "_client", lambda: client)
-    monkeypatch.setattr(kube, "_namespace", lambda _s: "default")
-    return patches
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> _FakeDeployment:
+        # a fresh client per call, as the real _client() is: it reads the SA token each time, and
+        # an httpx.Client cannot be reopened once a `with` block has closed it.
+        monkeypatch.setattr(
+            kube,
+            "_client",
+            lambda: httpx.Client(transport=httpx.MockTransport(self.handler), base_url="https://k8s"),
+        )
+        monkeypatch.setattr(kube, "_namespace", lambda _s: "default")
+        # A fake clock advanced by sleep, not a no-op sleep: the gate polls against a wall-clock
+        # deadline, so a no-op would spin forever, and patching the deadline down to 1 would stop
+        # the tests exercising the real constant.
+        clock = types.SimpleNamespace(now=1000.0)
+        self.clock = clock
+        monkeypatch.setattr(kube.time, "sleep", lambda s: setattr(clock, "now", clock.now + s))
+        monkeypatch.setattr(kube.time, "monotonic", lambda: clock.now)
+        monkeypatch.setattr(kube, "_said_not_rolled_out", False)
+        return self
+
+    def patched(self, index: int) -> list[dict]:
+        return self.patches[index]["spec"]["template"]["spec"]["containers"]
+
+    @property
+    def images(self) -> dict[str, str]:
+        return {c["name"]: c["image"] for c in self.containers}
+
+
+def _k8s_deployment(monkeypatch: pytest.MonkeyPatch, containers: list[dict]) -> list[dict]:
+    """Serve a healthy Deployment with ``containers``; return the patches the backend sends."""
+    return _FakeDeployment(containers=containers).install(monkeypatch).patches
 
 
 def test_k8s_moves_the_agent_and_the_updater_in_one_rollout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # given the agent Deployment, with the updater as its sidecar
-    patches = _k8s_deployment(monkeypatch, containers=[])
+    deployment = _FakeDeployment().install(monkeypatch)
 
     # when both are behind
     plan = UpdatePlan(agent="assailai/ares-agent@sha256:a", updater=f"{_UPDATER}@sha256:u")
-    K8sBackend().apply(_settings(), plan)
+    assert K8sBackend().apply(_settings(), plan) is True
 
-    # then one patch sets both images, so the pod rolls once rather than twice
-    (patch,) = patches
-    assert patch["spec"]["template"]["spec"]["containers"] == [
+    # then one patch sets both images, so the pod rolls once rather than twice, and the rollback
+    # never ran
+    assert len(deployment.patches) == 1
+    assert deployment.patched(0) == [
         {"name": "ares-agent", "image": plan.agent},
         {"name": "ares-updater", "image": plan.updater},
     ]
@@ -787,16 +869,166 @@ def test_k8s_moves_only_the_updater_when_the_agent_is_current(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # given an agent already on the target
-    patches = _k8s_deployment(monkeypatch, containers=[])
+    deployment = _FakeDeployment().install(monkeypatch)
 
     # when only the updater moves
-    K8sBackend().apply(_settings(), UpdatePlan(updater=f"{_UPDATER}@sha256:u"))
+    assert K8sBackend().apply(_settings(), UpdatePlan(updater=f"{_UPDATER}@sha256:u")) is True
 
     # then the patch names the updater container alone
-    (patch,) = patches
-    assert patch["spec"]["template"]["spec"]["containers"] == [
-        {"name": "ares-updater", "image": f"{_UPDATER}@sha256:u"}
+    assert len(deployment.patches) == 1
+    assert deployment.patched(0) == [{"name": "ares-updater", "image": f"{_UPDATER}@sha256:u"}]
+
+
+def test_k8s_apply_waits_for_the_rollout_before_reporting_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given a rollout that comes up straight away
+    deployment = _FakeDeployment().install(monkeypatch)
+
+    # when the agent is moved
+    assert K8sBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent@sha256:a")) is True
+
+    # then it did not take the first Ready as proof: a crash-looping container is Ready between
+    # restarts, so the condition has to hold across consecutive polls (as dockerd's _stays_up does)
+    assert deployment.polls >= kube._ROLLOUT_SETTLE_CHECKS
+    assert len(deployment.patches) == 1
+
+
+def test_k8s_apply_does_not_read_the_pre_patch_status_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given a controller that takes four polls to notice the patch at all. Until it does, status
+    # is the one from BEFORE the patch - which says Ready.
+    deployment = _FakeDeployment(observes_after=4).install(monkeypatch)
+
+    # when the agent is moved
+    assert K8sBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent@sha256:a")) is True
+
+    # then observedGeneration held it back. Without that check the first three polls would have
+    # settled it, because the status they carry is the pre-patch one and it says Ready - which is
+    # how every failed rollout used to read as a success.
+    assert deployment.polls > kube._ROLLOUT_SETTLE_CHECKS
+
+
+def test_k8s_apply_rolls_back_the_agent_when_the_new_pod_never_becomes_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given a signed image that cannot run here at all (a wrong-architecture platform digest, or
+    # any signed build that dies at startup): the pod never reports Ready
+    deployment = _FakeDeployment(ready_after=10**6).install(monkeypatch)
+    started = deployment.clock.now
+
+    # when the agent is moved to it
+    moved = K8sBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent@sha256:broken"))
+
+    # then the previous image is put back, and the caller is told the agent did not move. k8s does
+    # not do this by itself: progressDeadlineSeconds only writes a status condition.
+    assert moved is False
+    assert deployment.patched(1) == [{"name": "ares-agent", "image": "assailai/ares-agent:2.4.0"}]
+    assert deployment.images["ares-agent"] == "assailai/ares-agent:2.4.0"
+    assert deployment.clock.now - started >= kube._ROLLOUT_DEADLINE
+
+
+def test_k8s_apply_rolls_back_the_agent_when_it_does_not_stay_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given a pod that comes up and then falls over before the settle window closes: the k8s twin
+    # of test_docker_keeps_the_old_agent_when_the_new_one_is_crash_looping
+    deployment = _FakeDeployment(ready_after=1, ready_for=1).install(monkeypatch)
+
+    moved = K8sBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent@sha256:flaky"))
+
+    assert moved is False
+    assert deployment.images["ares-agent"] == "assailai/ares-agent:2.4.0"
+
+
+def test_k8s_apply_restores_both_images_when_a_combined_rollout_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # one patch is one rollout, so "skip the updater" has no meaning here the way it does on
+    # Docker; the coherent equivalent is that nothing moved
+    deployment = _FakeDeployment(ready_after=10**6).install(monkeypatch)
+
+    plan = UpdatePlan(agent="assailai/ares-agent@sha256:a", updater=f"{_UPDATER}@sha256:u")
+    assert K8sBackend().apply(_settings(), plan) is False
+
+    assert deployment.patched(1) == [
+        {"name": "ares-agent", "image": "assailai/ares-agent:2.4.0"},
+        {"name": "ares-updater", "image": f"{_UPDATER}:2.4.0"},
     ]
+
+
+def test_k8s_apply_says_so_when_it_cannot_roll_back(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # the agent is down and we cannot put it back: the log is the only thing standing between an
+    # operator and a silent outage, so it has to name what to restore
+    deployment = _FakeDeployment(ready_after=10**6, rollback_status=403).install(monkeypatch)
+
+    with caplog.at_level(logging.ERROR, logger="ares.updater.k8s"):
+        moved = K8sBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent@sha256:a"))
+
+    assert moved is False
+    assert "assailai/ares-agent:2.4.0" in caplog.text
+    assert "rollout undo" in caplog.text
+    assert len(deployment.patches) == 2
+
+
+def test_k8s_apply_treats_a_scaled_down_deployment_as_rolled_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # an operator who scaled the agent to zero must not get an infinite wait and a spurious
+    # rollback on every tick
+    deployment = _FakeDeployment(replicas=0, ready_after=10**6).install(monkeypatch)
+
+    assert K8sBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent@sha256:a")) is True
+    assert len(deployment.patches) == 1
+
+
+def test_k8s_apply_skips_a_container_the_deployment_does_not_have(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # an operator who deleted the sidecar. A strategic-merge patch naming an unknown container
+    # tries to ADD one and is rejected for the fields it cannot invent, so every update would
+    # break rather than just the updater's own move.
+    deployment = _FakeDeployment(
+        containers=[{"name": "ares-agent", "image": "assailai/ares-agent:2.4.0"}]
+    ).install(monkeypatch)
+
+    plan = UpdatePlan(agent="assailai/ares-agent@sha256:a", updater=f"{_UPDATER}@sha256:u")
+    assert K8sBackend().apply(_settings(), plan) is True
+
+    assert deployment.patched(0) == [{"name": "ares-agent", "image": "assailai/ares-agent@sha256:a"}]
+
+
+def test_k8s_running_image_waits_for_the_rollout_to_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # running_image read the Deployment SPEC, so right after a patch it reported the target as
+    # running. That is what made a failed rollout indistinguishable from a successful one - on
+    # that tick and every later one, including after an updater restart, because the spec outlives
+    # the in-memory cache.
+    deployment = _FakeDeployment(ready_after=2).install(monkeypatch)
+    deployment.patches.append({})  # pretend a patch landed, so the status is the driven one
+    deployment.generation = 2
+
+    assert K8sBackend().running_image(_settings()) is None  # not rolled out yet
+    deployment.polls = 5
+    assert K8sBackend().running_image(_settings()) == "assailai/ares-agent:2.4.0"
+
+
+def test_k8s_inspect_self_still_finds_its_own_image_mid_rollout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # the rollout gate is deliberately NOT on inspect_self: an updater that cannot name its own
+    # image mid-roll could never compute a self-target
+    deployment = _FakeDeployment(ready_after=10**6).install(monkeypatch)
+    deployment.patches.append({})
+    deployment.generation = 2
+
+    assert K8sBackend().inspect_self(_settings()) == SelfInspection(
+        role=Role.OWNER, image=f"{_UPDATER}:2.4.0"
+    )
 
 
 def test_k8s_finds_the_updater_sidecar_or_reports_it_unmanaged(
