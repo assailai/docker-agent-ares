@@ -22,6 +22,13 @@ on:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    # `release` holds the Docker Hub credentials and is restricted to the protected branch, so
+    # GitHub refuses the job on any other ref rather than trusting the in-job guard below - which
+    # lives in a file an unreviewed ref could edit. A PR validation build pushes nothing and needs
+    # no credentials, so it names a second, unprotected environment: `name` takes an expression,
+    # but what an EMPTY name does is undocumented, so never produce one.
+    environment:
+      name: ${{ inputs.push && 'release' || 'pr-validation' }}
     permissions:
       contents: read
       id-token: write   # keyless cosign signing via OIDC
@@ -36,6 +43,16 @@ jobs:
             image: assailai/ares-updater
 
     steps:
+      # Fulcio takes the certificate SAN from job_workflow_ref, and the ref there is the CALLER's.
+      # The updater trusts exactly one: this workflow at refs/heads/main, the protected branch.
+      # Anything else must not reach the registry login, the push or the signature, so fail before
+      # the first of them rather than publish something nobody reviewed.
+      - name: Refuse to publish from an unreviewed ref
+        if: inputs.push && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::push requested from ${{ github.ref }}; release images are built from refs/heads/main only"
+          exit 1
+
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 

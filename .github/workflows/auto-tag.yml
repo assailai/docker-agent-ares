@@ -21,6 +21,9 @@ on:
 
 jobs:
   tag:
+    # main only, dispatch included: this job creates release tags and calls the signing workflow,
+    # and a dispatch on an arbitrary ref would run the workflow file as it exists on that ref.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write   # create the tag and the GitHub release

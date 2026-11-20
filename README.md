@@ -553,11 +553,16 @@ Notes:
   need it installed locally):
 
   ```bash
-  docker run --rm --entrypoint cosign docker.io/assailai/ares-updater:3.3.3 \
-    verify docker.io/assailai/ares-agent:3.3.3 \
-    --certificate-identity-regexp '^https://github\.com/assailai/docker-agent-ares/\.github/workflows/docker-build\.yml@refs/(heads/main|tags/v.*)$' \
+  docker run --rm --entrypoint cosign docker.io/assailai/ares-updater:3.15.0 \
+    verify docker.io/assailai/ares-agent:3.15.0 \
+    --certificate-identity-regexp '^https://github\.com/assailai/docker-agent-ares/\.github/workflows/docker-build\.yml@refs/heads/main$' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```
+
+  The identity names `refs/heads/main` and nothing else. `main` is the protected branch, so a
+  release signed under it was reviewed; tag refs are not protected — anyone with push access can
+  create one — so from 3.15.0 they are no longer trusted, and no workflow builds release images
+  from a tag push.
 
   If this fails while the image is genuinely published, the expected signer identity has drifted from
   what CI signs with — the updater logs both sides of the comparison on failure.

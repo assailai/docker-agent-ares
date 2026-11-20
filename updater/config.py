@@ -54,12 +54,17 @@ class UpdaterSettings(BaseSettings):
     #     that calls it. Naming the caller (docker-publish.yml) is a regexp that can never match.
     #   * the REF is the caller's ref, since docker-build.yml is invoked as a local reusable
     #     workflow. The release path (auto-tag.yml, on a version-bump merge) therefore signs at
-    #     refs/heads/main; refs/tags/v* only appears when a human pushes a v* tag directly, because
-    #     a GITHUB_TOKEN tag push cannot re-trigger a workflow. Both are accepted below.
-    # So the boundary this enforces is "built and signed by this repo's build workflow via GitHub
-    # OIDC" - branch / latest / sha images satisfy it too. That is fine: the updater only ever pulls
-    # <repo>:<target-version> as named by the control plane (see main._tick), so it cannot drift onto
-    # a floating tag, and it applies the exact digest cosign attested rather than re-resolving.
+    #     refs/heads/main, which is the protected branch: a merge there has been reviewed.
+    # refs/tags/v* used to be accepted too, and must not be. Any account with push access can
+    # create a tag, no ruleset stopped it, and docker-publish.yml built and signed on one - so an
+    # attacker who could not merge to main could still publish an image under release tags with
+    # the identity the whole fleet trusts. docker-publish.yml no longer triggers on tags, and
+    # docker-build.yml refuses to push from any other ref.
+    # So the boundary this enforces is "built and signed from this repo's protected branch by its
+    # build workflow, via GitHub OIDC" - branch / latest / sha images on main satisfy it too. The
+    # updater only ever pulls <repo>:<target-version> as named by the control plane, and _tick
+    # refuses a target that is not a release version, so it cannot drift onto one of those; it
+    # applies the exact digest cosign attested rather than re-resolving.
     #
     # Defaulted to this image's own publishing workflow so every deploy shape (docker run, compose,
     # k8s) verifies out of the box without spelling the regexp out in each install command; override
@@ -67,7 +72,7 @@ class UpdaterSettings(BaseSettings):
     cosign_identity: str = (
         r"^https://github\.com/assailai/docker-agent-ares/"
         r"\.github/workflows/docker-build\.yml@"
-        r"refs/(heads/main|tags/v.*)$"
+        r"refs/heads/main$"
     )
     cosign_issuer: str = "https://token.actions.githubusercontent.com"
     # cosign key-based verification (alternative): path to a cosign public key.

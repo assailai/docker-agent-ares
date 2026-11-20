@@ -90,10 +90,16 @@ def test_default_signer_identity_matches_what_ci_actually_signs_with() -> None:
     assert settings.cosign_issuer == "https://token.actions.githubusercontent.com"
 
     identity = re.compile(settings.cosign_identity)
-    # the release path (auto-tag.yml -> docker-build.yml) signs at the caller's ref, refs/heads/main;
-    # a hand-pushed v* tag signs at the tag ref. Both are ours.
+    # the release path (auto-tag.yml -> docker-build.yml) signs at the caller's ref, refs/heads/main.
+    # That is the protected branch, so a merge there has been reviewed.
     assert identity.search(_san("docker-build.yml", "refs/heads/main"))
-    assert identity.search(_san("docker-build.yml", "refs/tags/v3.3.1"))
+    # a TAG ref is not ours, whatever it is named. Anyone with push access can create a tag, and
+    # nothing in GitHub stopped it, so a v* build would have been an unreviewed commit signed
+    # under the identity the whole fleet trusts (ARES-2327).
+    assert not identity.search(_san("docker-build.yml", "refs/tags/v3.3.1"))
+    assert not identity.search(_san("docker-build.yml", "refs/tags/v99.0.0"))
+    # nor is another branch, for the same reason: only main is protected.
+    assert not identity.search(_san("docker-build.yml", "refs/heads/feature"))
     # not ours, or not a signer: another owner/repo, the caller workflow that holds no cosign step,
     # and an unmerged PR build (which does not push or sign at all).
     assert not identity.search(_san("docker-build.yml", "refs/heads/main", repo="attacker/evil"))
@@ -102,6 +108,35 @@ def test_default_signer_identity_matches_what_ci_actually_signs_with() -> None:
     # cosign's -regexp flags are substring matches, so the anchors have to hold on both ends.
     assert not identity.search(_san("docker-build.yml", "refs/heads/main") + ".evil.example")
     assert not identity.search("https://evil.example/" + _san("docker-build.yml", "refs/heads/main"))
+
+
+def test_the_readme_publishes_the_identity_the_updater_actually_uses() -> None:
+    # customers verify images by hand with the regexp README.md prints, so a drift between the two
+    # sends them chasing a failure that is not there. It has drifted once already.
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    assert UpdaterSettings().cosign_identity in readme, (
+        "README.md does not publish the updater's current --certificate-identity-regexp"
+    )
+
+
+def test_only_main_can_reach_the_signing_step() -> None:
+    # the identity above is only worth what CI will produce. If any workflow can push and sign
+    # from another ref, narrowing the regexp just moves the hole rather than closing it.
+    workflows = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+    if not workflows.is_dir():
+        pytest.skip("no .github/workflows checkout (e.g. running inside the built image)")
+
+    build = (workflows / "docker-build.yml").read_text()
+    assert "github.ref != 'refs/heads/main'" in build, "no ref guard in front of the push and sign"
+    assert "environment:" in build, "the Docker Hub credentials are not held in an environment"
+
+    # no entry workflow may build release images off a tag push: any pusher can create a tag.
+    for name in ("docker-publish.yml", "auto-tag.yml"):
+        triggers = (workflows / name).read_text().split("\njobs:")[0]
+        live = [line for line in triggers.splitlines() if not line.lstrip().startswith("#")]
+        assert not [line for line in live if re.match(r"\s*tags:", line)], (
+            f"{name} still triggers on a tag push"
+        )
 
 
 def test_default_signer_identity_names_the_workflow_that_signs() -> None:
