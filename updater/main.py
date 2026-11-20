@@ -73,7 +73,9 @@ _said_unmanaged = False
 # the release this image was built as (Dockerfile.updater writes it); absent outside an image
 _RELEASE_FILE = Path(__file__).with_name("RELEASE")
 _RELEASE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
-_declined_downgrades: set[str] = set()
+_declined_downgrades: set[str] = set()  # the updater's own move
+# the agent's. Separate, because either guard may be off while the other is on.
+_declined_rollbacks: set[str] = set()
 
 
 class _Resolution(BaseModel):
@@ -118,6 +120,59 @@ def _is_backwards(target: str) -> bool:
         return False  # no release baked in, so nothing to compare against
     wanted = _release_key(target)
     return wanted is None or wanted < own
+
+
+def _rollback_reason(target: str) -> str | None:
+    """Why moving the agent to ``target`` would take it backwards, or None when it is fine."""
+    floor = _release_key(_own_release() or "")
+    if floor is None:
+        return None  # no release baked in (a checkout, the tests): nothing to compare against
+    wanted = _release_key(target)
+    if wanted is None:
+        return f"{target} is not a release version"
+    if wanted < floor:
+        return f"{target} is older than {_own_release()}"
+    return None
+
+
+def _agent_may_move(target: str) -> bool:
+    """Whether the agent may be moved to ``target`` at all, before any image is verified.
+
+    The signature gate proves an image was built and signed by this repo's workflow. It does not
+    prove the version is the current one, and the version handoff is the untrusted half: it comes
+    from the control plane, and it is WRITTEN by the agent container, whose compromise is the
+    thing the signature gate exists to survive. Without this, naming an old but genuinely signed
+    release reintroduces every vulnerability fixed since, and naming a signed non-release build
+    (``latest``, ``sha-<...>``, a branch tag - CI signs those too) picks from a far larger pool.
+
+    The floor is this updater's own baked release. It is set at image build from the single version
+    source, out of reach of the environment (an ENV would be inherited by a successor from the
+    older updater that started it) and out of reach of /data, which is what the attacker controls.
+    Because the updater follows the agent onto every release, it tracks the fleet forward by
+    construction and can never exceed the highest release this install reached - which is what
+    makes it safe as a floor: it never blocks a forward move.
+
+    It fails open rather than closed in three places, each weakening the guard without ever
+    freezing an install: self-update off or a container the updater cannot prove is its own leaves
+    the floor where it was installed, and a checkout has no baked release at all.
+    """
+    reason = _rollback_reason(target)
+    if reason is None:
+        return True
+    if settings.allow_downgrade:
+        if target not in _declined_rollbacks:
+            logger.warning("ARES_UPDATE_ALLOW_DOWNGRADE is set; moving the agent back (%s)", reason)
+            _declined_rollbacks.add(target)
+        return True
+    if target not in _declined_rollbacks:
+        logger.warning(
+            "refusing to move the agent to %s: %s "
+            "(set ARES_UPDATE_ALLOW_DOWNGRADE=true on this host to override)",
+            target,
+            reason,
+        )
+        _declined_rollbacks.add(target)
+    return False
 
 
 def _self_target(me: SelfInspection, target: str) -> str | None:
@@ -165,6 +220,10 @@ def _tick(backend: Backend) -> None:
     if me.role is Role.STANDBY:
         return  # another container holds this updater's name: a handoff to this one is in flight
     _settle_role(backend, me)
+    # before running_image and before _resolve: a refused target must still cost nothing, and a
+    # cosign subprocess every poll_seconds for a target that stands forever is not nothing.
+    if not _agent_may_move(target):
+        return
     running = backend.running_image(settings)
     if running is None:
         return  # no agent yet

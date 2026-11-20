@@ -88,6 +88,10 @@ services:
       # images under a different signer, or set ARES_UPDATE_REQUIRE_SIGNATURE=false for local/dev
       # with unsigned images.
       - ARES_UPDATE_REQUIRE_SIGNATURE=true
+      # The updater refuses to move the agent to a release older than its own: a signed-but-old
+      # image is still a downgrade attack, since the signature is genuine and the version handoff
+      # is not. Uncomment for a deliberate, operator-driven rollback.
+      # - ARES_UPDATE_ALLOW_DOWNGRADE=true
     restart: unless-stopped
 
 volumes:

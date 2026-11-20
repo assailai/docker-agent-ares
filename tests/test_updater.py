@@ -24,13 +24,18 @@ def _settings(**over) -> UpdaterSettings:
 
 
 @pytest.fixture(autouse=True)
-def _clear_verified_cache(monkeypatch: pytest.MonkeyPatch):
+def _clear_verified_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # the verified-digest caches and the retry clock are module globals; isolate them between tests.
     main._verified.clear()
     main._verified_self.clear()
     main._self_retry_after.clear()
     main._declined_downgrades.clear()
+    main._declined_rollbacks.clear()
     monkeypatch.setattr(main, "_predecessor_removed", False)
+    # Dockerfile.updater writes updater/RELEASE into the image; a checkout has none, and the whole
+    # suite quietly depends on that (targets here are older than the repo's own version). Pin it
+    # rather than leave it to whether someone built in the working tree.
+    monkeypatch.setattr(main, "_RELEASE_FILE", tmp_path / "no-release")
     yield
 
 
@@ -952,9 +957,11 @@ def test_a_handoff_that_returns_waits_before_it_is_tried_again(
 def test_the_updater_never_moves_itself_backwards(
     target: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # given an updater built as 3.14.0, and a target older than that (an operator rolling the agent
-    # back), or a target it cannot read as a release
-    monkeypatch.setattr(main, "settings", _settings())
+    # given an updater built as 3.14.0 with the agent's rollback guard opted out of (the only way
+    # the agent moves back at all), and a target older than that, or one it cannot read as a
+    # release. The opt-out is deliberately agent-only: see
+    # test_the_agent_never_moves_back_below_the_updaters_release for the default.
+    monkeypatch.setattr(main, "settings", _settings(allow_downgrade=True))
     monkeypatch.setattr(main, "_read_target", lambda: target)
     monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
     _verify_to_digest(monkeypatch)
@@ -983,6 +990,179 @@ def test_the_updater_moves_forward_past_its_own_release(monkeypatch: pytest.Monk
     # when it ticks, then it moves itself forward as usual
     main._tick(backend)
     assert backend.plan == UpdatePlan(updater=f"{_UPDATER}@sha256:3.15.0")
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["3.13.2", "latest", "sha-deadbeef"],
+    ids=["an-older-release", "a-floating-tag", "a-branch-build"],
+)
+def test_the_agent_never_moves_back_below_the_updaters_release(
+    target: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # given an updater built as 3.14.0 and a handoff naming something CI did sign, but that is not
+    # a step forward: an older release, or a build that is no release at all
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: target)
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    seen = _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(
+        running="docker.io/assailai/ares-agent:3.14.0", me=_owner(f"{_UPDATER}:3.14.0")
+    )
+
+    # when it ticks
+    main._tick(backend)
+
+    # then nothing moves, and cosign was never asked: the signature would have PASSED, which is
+    # the whole point - it proves the artifact, not that the version is the current one
+    assert backend.plan is None
+    assert seen == []
+    assert backend.running == "docker.io/assailai/ares-agent:3.14.0"
+
+
+def test_the_agent_moves_forward_past_the_updaters_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given an updater built as 3.14.0 and the next release marked current
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: "3.15.0")
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(
+        running="docker.io/assailai/ares-agent:3.14.0", me=_owner(f"{_UPDATER}:3.14.0")
+    )
+
+    # when it ticks, then the ordinary path is untouched
+    main._tick(backend)
+    assert backend.plan.agent == f"docker.io/assailai/ares-agent@sha256:3.15.0"
+
+
+def test_the_agent_may_catch_up_to_the_release_the_updater_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given an install whose agent lags its own updater (the updater moves second, so a half-done
+    # rollout looks exactly like this)
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: "3.14.0")
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(
+        running="docker.io/assailai/ares-agent:3.13.2", me=_owner(f"{_UPDATER}:3.14.0")
+    )
+
+    # when it ticks, then equal is allowed: the floor is "older than", not "not newer than"
+    main._tick(backend)
+    assert backend.plan.agent == f"docker.io/assailai/ares-agent@sha256:3.14.0"
+
+
+def test_a_prerelease_target_reads_as_its_release(monkeypatch: pytest.MonkeyPatch) -> None:
+    # given a 3.14.1-rc1 target on a 3.14.0 updater: a suffix reads as its release, as it does for
+    # the updater's own guard
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: "3.14.1-rc1")
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(
+        running="docker.io/assailai/ares-agent:3.14.0", me=_owner(f"{_UPDATER}:3.14.0")
+    )
+
+    main._tick(backend)
+    assert backend.plan.agent == f"docker.io/assailai/ares-agent@sha256:3.14.1-rc1"
+
+
+def test_the_rollback_guard_is_off_without_a_baked_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given a checkout rather than an image: updater/RELEASE does not exist, so there is no floor
+    # to compare against. This is what keeps scripts/e2e_updater.sh working - it ticks from the
+    # host with uv and targets 3.19 and 99.99.99-nope - and it is a deliberate fail-open, since
+    # that path already requires host access.
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: "3.13.2")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(running="docker.io/assailai/ares-agent:3.14.0")
+
+    main._tick(backend)
+    assert backend.plan.agent == f"docker.io/assailai/ares-agent@sha256:3.13.2"
+
+
+def test_a_refused_target_is_logged_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # a standing target is read every poll_seconds; saying so every 30 seconds forever would bury
+    # everything else in the log
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(running="docker.io/assailai/ares-agent:3.14.0")
+
+    with caplog.at_level(logging.WARNING, logger="ares.updater"):
+        monkeypatch.setattr(main, "_read_target", lambda: "3.13.2")
+        for _ in range(3):
+            main._tick(backend)
+        assert len(caplog.records) == 1
+        assert "refusing to move the agent to 3.13.2" in caplog.text
+
+        # a different refused target is its own line
+        monkeypatch.setattr(main, "_read_target", lambda: "3.12.0")
+        main._tick(backend)
+
+    assert len(caplog.records) == 2
+
+
+def test_allow_downgrade_lets_an_operator_move_the_agent_back(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # the lever for a deliberate, vendor-initiated rollback. Reachable only by someone who already
+    # has host/cluster config access, so it hands the control-plane attacker nothing.
+    monkeypatch.setattr(main, "settings", _settings(allow_downgrade=True))
+    monkeypatch.setattr(main, "_read_target", lambda: "3.13.2")
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(running="docker.io/assailai/ares-agent:3.14.0")
+
+    with caplog.at_level(logging.WARNING, logger="ares.updater"):
+        main._tick(backend)
+
+    assert backend.plan.agent == f"docker.io/assailai/ares-agent@sha256:3.13.2"
+    assert "ARES_UPDATE_ALLOW_DOWNGRADE is set" in caplog.text
+
+
+def test_allow_downgrade_never_moves_the_updater_backwards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # the two guards are separate predicates on purpose: one lever must not quietly disable the
+    # other. An updater taken below 3.14.0 could never update itself again (ARES-2049).
+    monkeypatch.setattr(main, "settings", _settings(allow_downgrade=True))
+    monkeypatch.setattr(main, "_read_target", lambda: "3.13.2")
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(
+        running="docker.io/assailai/ares-agent:3.14.0", me=_owner(f"{_UPDATER}:3.14.0")
+    )
+
+    main._tick(backend)
+
+    assert backend.plan == UpdatePlan(agent=f"docker.io/assailai/ares-agent@sha256:3.13.2")
+    assert backend.plan.updater is None
+
+
+def test_the_rollback_guard_does_not_skip_removing_a_predecessor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # the guard sits after _settle_role: a leftover ares-updater-old must not be stranded on the
+    # host just because the standing target is bogus
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: "3.13.2")
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    backend = _FakeBackend(
+        running="docker.io/assailai/ares-agent:3.14.0", me=_owner(f"{_UPDATER}:3.14.0")
+    )
+
+    main._tick(backend)
+
+    assert backend.plan is None
+    assert backend.predecessor_removals == 1
 
 
 def test_the_owner_removes_its_predecessor_once(monkeypatch: pytest.MonkeyPatch) -> None:

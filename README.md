@@ -538,6 +538,15 @@ Notes:
 
 - The agent moves to the exact version the dashboard marks current (a pinned tag), so rollouts
   are deterministic and promotable across environments.
+- **Updates only go forward.** The version handoff is the untrusted half of the chain: it comes
+  from the control plane, and the agent container is what writes it. A signature proves the
+  artifact, not that the version is the current one, so without this an old but genuinely signed
+  release would reintroduce every vulnerability fixed since. The updater refuses a target older
+  than its own release, and refuses one that is no release at all (`latest`, a `sha-...` build, a
+  branch tag — CI signs those too). For a deliberate rollback, set
+  `ARES_UPDATE_ALLOW_DOWNGRADE=true` on the updater, or reinstall at the version you want
+  (`ARES_VERSION=3.14.3 bash scripts/bootstrap.sh`). It never lets the updater move *itself* back:
+  one taken below 3.14.0 could never update itself again.
 - Verification is **fail-closed** (`ARES_UPDATE_REQUIRE_SIGNATURE=true`): the updater refuses an
   image it cannot cosign-verify. Set it `false` only for local/dev, before image signing is wired.
   To reproduce the updater's check by hand (cosign ships inside the updater image, so you do not

@@ -144,6 +144,11 @@ spec:
             # when self-hosting the images under a different signer.
             - name: ARES_UPDATE_REQUIRE_SIGNATURE
               value: "true"
+            # The updater refuses to move the agent to a release older than its own: a
+            # signed-but-old image is still a downgrade attack, since the signature is genuine and
+            # the version handoff is not. Uncomment for a deliberate, operator-driven rollback.
+            # - name: ARES_UPDATE_ALLOW_DOWNGRADE
+            #   value: "true"
           volumeMounts:
             - name: data
               mountPath: /data        # reads the agent's update-target.json only

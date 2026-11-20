@@ -31,6 +31,12 @@ class UpdaterSettings(BaseSettings):
     # off for a host whose updater is managed some other way (GitOps, change control): the agent
     # still updates, the updater stays on what was installed.
     self_update: bool = True
+    # The updater refuses to move the AGENT to a release older than its own, or to a target that is
+    # no release at all. A signed-but-old image is still a downgrade attack: the signature is
+    # genuine, and the version handoff is not. Set this only for a deliberate, operator-driven
+    # rollback on a host you control. It never lets the updater move ITSELF backwards - that guard
+    # has no override, because an updater taken below 3.14.0 could never update itself again.
+    allow_downgrade: bool = False
     # never set by hand. An updater stamps it onto the successor it starts, so that while both run
     # during a handoff each can tell which container is its own (dockerd.inspect_self).
     instance: str = ""

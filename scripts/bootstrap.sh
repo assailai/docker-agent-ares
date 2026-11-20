@@ -361,6 +361,11 @@ start_updater() {
     if [ -n "$ca_dir" ]; then
         updater_args+=(-v "$ca_dir:/host-ca:ro")
     fi
+    # A deliberate, operator-driven rollback. The updater otherwise refuses to move the agent to
+    # a release older than its own, because a signed-but-old image is still a downgrade attack.
+    if [ -n "${ARES_UPDATE_ALLOW_DOWNGRADE:-}" ]; then
+        updater_args+=(-e "ARES_UPDATE_ALLOW_DOWNGRADE=$ARES_UPDATE_ALLOW_DOWNGRADE")
+    fi
     updater_args+=(--restart=always)
 
     # The agent runs either way, so this does not stop the install, but it is reported as a failure
