@@ -72,7 +72,8 @@ The Ares Agent implements multiple layers of security:
 
 ### Network Security
 - TLS 1.2+ for all connections, verified against the union of the image's CA store, certifi's
-  public roots, and any CA the operator mounts
+  public roots, and any CA the operator mounts that the host trusts for TLS **server**
+  authentication (a host's e-mail and code-signing trust extracts are not loaded)
 - Outbound-only: the control plane is HTTPS and the data plane is an outbound WebSocket the agent
   opens only while a hunt runs. No inbound ports are required.
 - The host CA mount (`/host-ca`) is read-only and covers the public certificate directory only;

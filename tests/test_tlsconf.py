@@ -47,14 +47,42 @@ def _hint(exc: BaseException) -> str:
     return tlsconf.verification_hint(exc, insecure=False, ca_bundle="")
 
 
-def _write_ca(directory: Path, name: str) -> tuple[Path, str]:
-    """A real CA PEM on disk, plus the organization name to look for in a loaded context."""
+def _write_ca(directory: Path, name: str, *, filename: str | None = None) -> tuple[Path, str]:
+    """A real CA PEM on disk, plus the organization name to look for in a loaded context.
+
+    ``filename`` where the host's own name for the file is what the test is about
+    (``tls-ca-bundle.pem`` and friends); otherwise ``<name>.crt``.
+    """
     directory.mkdir(parents=True, exist_ok=True)
     organization = f"{name}.test"
     authority = trustme.CA(organization_name=organization)
-    path = directory / f"{name}.crt"
+    path = directory / (filename or f"{name}.crt")
     authority.cert_pem.write_to_path(str(path))
     return path, organization
+
+
+def _write_bundle(path: Path, *names: str) -> list[str]:
+    """One PEM holding several roots, the way a host's extracted bundle holds many.
+
+    Returns the organization names, in order, so a test can say which of them reached the context.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    organizations = [f"{name}.test" for name in names]
+    authorities = [trustme.CA(organization_name=organization) for organization in organizations]
+    path.write_bytes(b"".join(authority.cert_pem.bytes() for authority in authorities))
+    return organizations
+
+
+def _rhel_extracts(host_ca: Path) -> dict[str, str]:
+    """A directory shaped like /etc/pki/ca-trust/extracted/pem: one bundle per purpose.
+
+    This is what scripts/bootstrap.sh mounts at /host-ca on a RHEL-family host, because
+    `readlink -f /etc/pki/tls/certs/ca-bundle.crt` lands inside it.
+    """
+    return {
+        purpose: _write_ca(host_ca, f"{purpose}-root", filename=f"{purpose}-ca-bundle.pem")[1]
+        for purpose in ("tls", "email", "objsign")
+    }
 
 
 def _organizations(context: ssl.SSLContext) -> set[str]:
@@ -74,6 +102,7 @@ def test_given_nothing_mounted_then_public_roots_are_still_trusted() -> None:
     assert trust.verifies
     assert trust.loaded == ()
     assert trust.rejected == ()
+    assert trust.skipped == ()
     # certifi alone is hundreds of roots; an empty store would mean we broke ordinary TLS.
     assert len(trust.context.get_ca_certs()) > 50
     assert trust.summary() == "image store, certifi"
@@ -113,6 +142,140 @@ def test_given_both_directories_then_every_root_is_trusted(
     organizations = _organizations(_build().context)
 
     assert {from_host, from_mount} <= organizations
+
+
+def test_given_the_rhel_extract_layout_then_only_the_tls_bundle_is_trusted(
+    _isolate_trust: tuple[Path, Path],
+) -> None:
+    """A host trusts a set of roots *per purpose*, and RHEL writes one file per purpose. Loading
+    all three would make an S/MIME or code-signing root a valid issuer for the control plane."""
+    host_ca, _ = _isolate_trust
+    _rhel_extracts(host_ca)
+
+    trust = _build()
+
+    assert [path.name for path in trust.loaded] == ["tls-ca-bundle.pem"]
+    assert [path.name for path in trust.skipped] == [
+        "email-ca-bundle.pem",
+        "objsign-ca-bundle.pem",
+    ]
+    assert len(trust.context.get_ca_certs()) > 50  # still a union, not a replacement
+
+
+def test_given_a_root_only_in_the_email_extract_then_it_never_enters_the_ssl_context(
+    _isolate_trust: tuple[Path, Path],
+) -> None:
+    """The finding itself: an on-path attacker holding a certificate for the control-plane name
+    under a root the host trusts only for e-mail must not complete the handshake."""
+    host_ca, _ = _isolate_trust
+    organizations = _rhel_extracts(host_ca)
+
+    trusted = _organizations(_build().context)
+
+    assert organizations["tls"] in trusted
+    assert organizations["email"] not in trusted
+    assert organizations["objsign"] not in trusted
+
+
+def test_given_an_inspection_root_in_every_extract_then_it_is_still_trusted(
+    _isolate_trust: tuple[Path, Path],
+) -> None:
+    """The regression that would hurt a paying customer. A corporate root installed the ordinary
+    RHEL way carries no purpose restriction, so update-ca-trust writes it into all three extracts;
+    the rule selects files, never certificates, so it survives in the TLS one."""
+    host_ca, _ = _isolate_trust
+    host_ca.mkdir(parents=True, exist_ok=True)
+    corp, public = _write_bundle(host_ca / "tls-ca-bundle.pem", "corp-proxy", "a-public-root")
+    _write_bundle(host_ca / "email-ca-bundle.pem", "corp-proxy", "an-email-only-root")
+    (email_only,) = _write_bundle(host_ca / "objsign-ca-bundle.pem", "an-objsign-only-root")
+
+    trusted = _organizations(_build().context)
+
+    assert {corp, public} <= trusted
+    assert email_only not in trusted
+    assert "an-email-only-root.test" not in trusted
+
+
+def test_given_a_non_tls_extract_without_its_tls_sibling_then_it_is_still_declined(
+    _isolate_trust: tuple[Path, Path],
+) -> None:
+    """A half-copied extract directory, or a ConfigMap built from two of the three files. The
+    whitelist half has nothing to trigger on, so the name rule has to carry it."""
+    host_ca, _ = _isolate_trust
+    _, email = _write_ca(host_ca, "email-root", filename="email-ca-bundle.pem")
+    _, corp = _write_ca(host_ca, "corp-root")
+
+    trust = _build()
+
+    assert [path.name for path in trust.loaded] == ["corp-root.crt"]
+    assert [path.name for path in trust.skipped] == ["email-ca-bundle.pem"]
+    assert corp in _organizations(trust.context)
+    assert email not in _organizations(trust.context)
+
+
+def test_given_the_debian_layout_then_the_bundle_loads_and_nothing_is_skipped(
+    _isolate_trust: tuple[Path, Path],
+) -> None:
+    """Debian, Ubuntu, Alpine and SUSE mount one real bundle (plus symlinks that dangle inside the
+    container). Nothing about that layout may change."""
+    host_ca, _ = _isolate_trust
+    _, organization = _write_ca(host_ca, "corp-root", filename="ca-certificates.crt")
+    for name in ("3513523f.0", "a94d09e5.0", "Corp_Root.pem"):
+        (host_ca / name).symlink_to("/usr/share/ca-certificates/nothing-here.crt")
+
+    trust = _build()
+
+    assert [path.name for path in trust.loaded] == ["ca-certificates.crt"]
+    assert trust.skipped == ()
+    assert "skipped" not in trust.summary()
+    assert organization in _organizations(trust.context)
+
+
+def test_given_a_skipped_bundle_then_the_summary_says_so_rather_than_dropping_it_silently(
+    _isolate_trust: tuple[Path, Path], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Mounting three files and reading "(1 file)" is otherwise a mystery worth a support ticket.
+    And it is not a WARNING: skipping those two is normal on RHEL, not an operator mistake."""
+    host_ca, _ = _isolate_trust
+    _rhel_extracts(host_ca)
+
+    with caplog.at_level(logging.WARNING, logger="ares.agent.tls"):
+        summary = _build().summary()
+
+    assert "(1 file)" in summary
+    assert "skipped as not TLS server-auth" in summary
+    assert "email-ca-bundle.pem" in summary and "objsign-ca-bundle.pem" in summary
+    assert caplog.records == []
+
+
+def test_given_a_drop_in_named_like_a_non_tls_extract_then_it_is_declined(
+    _isolate_trust: tuple[Path, Path],
+) -> None:
+    """The prefix match, not the exact basename, so p11-kit's .trust.crt variants go too."""
+    _, extra = _isolate_trust
+    _, objsign = _write_ca(extra, "objsign-root", filename="objsign-ca-bundle.trust.crt")
+    _, corp = _write_ca(extra, "corp-root")
+
+    trust = _build()
+
+    assert [path.name for path in trust.loaded] == ["corp-root.crt"]
+    assert [path.name for path in trust.skipped] == ["objsign-ca-bundle.trust.crt"]
+    assert objsign not in _organizations(trust.context)
+
+
+def test_given_ares_ca_bundle_names_a_non_tls_file_then_the_operator_still_wins(
+    _isolate_trust: tuple[Path, Path],
+) -> None:
+    """We filter what we *discover*, never what we were pointed at. This is the escape hatch for
+    anyone who genuinely wants a root the host extracts for another purpose."""
+    host_ca, _ = _isolate_trust
+    path, organization = _write_ca(host_ca / "elsewhere", "email-root", filename="email-ca-bundle.pem")
+
+    trust = _build(ca_bundle=str(path))
+
+    assert trust.loaded == (path,)
+    assert trust.skipped == ()
+    assert organization in _organizations(trust.context)
 
 
 def test_given_dangling_symlinks_then_the_real_bundle_loads_and_nothing_is_logged(

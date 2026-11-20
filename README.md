@@ -329,8 +329,8 @@ hosts are reported with their ports and without a name; the port results are nev
 | Path | Description |
 |------|-------------|
 | `/data` | Persistent state. Holds `agent-state.json` (the agent id and its auth token) so the agent keeps its identity across restarts. |
-| `/host-ca` | *(optional, read-only)* This host's CA directory, mounted by the install command. Lets the agent trust whatever the host trusts. See [TLS inspection](#tls-inspection-corporate-proxy). |
-| `/certs` | *(optional, read-only)* Drop-in for extra CA roots the host store does not have, e.g. a Kubernetes ConfigMap. Every `.crt`, `.pem`, or `.cer` inside is trusted. |
+| `/host-ca` | *(optional, read-only)* This host's CA directory, mounted by the install command. Lets the agent trust whatever the host trusts **for TLS server authentication**. See [TLS inspection](#tls-inspection-corporate-proxy). |
+| `/certs` | *(optional, read-only)* Drop-in for extra CA roots the host store does not have, e.g. a Kubernetes ConfigMap. Every `.crt`, `.pem`, or `.cer` inside is trusted, except bundles the host extracted for a non-TLS purpose (`email-ca-bundle.*`, `objsign-ca-bundle.*`). |
 
 ## Network requirements
 
@@ -374,6 +374,20 @@ If it says only `image store, certifi`, the mount did not happen. Add it by hand
 # /etc/pki/ca-trust/extracted/pem instead.
 -v /etc/ssl/certs:/host-ca:ro
 ```
+
+That RHEL directory holds one bundle per purpose: `tls-ca-bundle.pem` beside `email-ca-bundle.pem`
+and `objsign-ca-bundle.pem`. The agent loads only the TLS one, so a root the host trusts just for
+S/MIME or code signing can never issue a certificate the agent accepts for the control plane. You
+will see the other two named on the trust line:
+
+```
+INFO ares.agent TLS trust: image store, certifi, /host-ca (1 file); skipped as not TLS server-auth: /host-ca/email-ca-bundle.pem, /host-ca/objsign-ca-bundle.pem
+```
+
+That is normal, not an error — it is why a three-file mount reports one file. An inspection root
+installed the ordinary way (`update-ca-trust`) is written into all three bundles, so it is in the
+TLS one and still trusted. To trust a root the host deliberately keeps out of TLS, name the file
+with `ARES_CA_BUNDLE`: what the agent *discovers* is filtered, what you point it at is not.
 
 Both halves of the agent are covered: the control plane and the `wss://` data-plane tunnel that
 live missions run over. `bash scripts/e2e_tls_inspection.sh` proves it against a real mitmproxy,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import types
@@ -1085,6 +1086,87 @@ def test_an_unreadable_image_bundle_leaves_the_default_trust_alone(
 
     assert tlsconf.install_ca_bundle() is None
     assert "SSL_CERT_FILE" not in os.environ
+
+
+def test_the_non_tls_extracts_are_left_out_of_the_merged_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # SSL_CERT_FILE is what cosign reads, so a root the host trusts only for e-mail or code
+    # signing would otherwise become a valid issuer for the registry and the Sigstore log. The
+    # mount is the RHEL extract directory, which holds one bundle per purpose.
+    host_ca, _ = _prepare_ca_dirs(tmp_path, monkeypatch)
+    host_ca.mkdir()
+    (host_ca / "tls-ca-bundle.pem").write_text("TLS ROOTS\n")
+    (host_ca / "email-ca-bundle.pem").write_text("EMAIL ROOT\n")
+    (host_ca / "objsign-ca-bundle.pem").write_text("OBJSIGN ROOT\n")
+
+    bundle = tlsconf.install_ca_bundle()
+
+    assert bundle is not None
+    body = bundle.read_text()
+    assert "PUBLIC ROOTS" in body and "TLS ROOTS" in body
+    assert "EMAIL ROOT" not in body
+    assert "OBJSIGN ROOT" not in body
+    assert os.environ["SSL_CERT_FILE"] == str(bundle)
+
+
+def test_only_non_tls_extracts_leave_ssl_cert_file_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Nothing eligible once the rule has run. SSL_CERT_FILE *replaces* the default trust, so the
+    # choice is only ever "widen or leave alone", and the image's own store is the answer.
+    host_ca, _ = _prepare_ca_dirs(tmp_path, monkeypatch)
+    host_ca.mkdir()
+    (host_ca / "email-ca-bundle.pem").write_text("EMAIL ROOT\n")
+
+    assert tlsconf.install_ca_bundle() is None
+    assert "SSL_CERT_FILE" not in os.environ
+
+
+def test_the_skipped_extracts_are_named_in_the_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # said before the early return, or "I mounted a directory and the updater did nothing" has no
+    # explanation anywhere - and unlike the agent, the updater has no startup summary line.
+    host_ca, _ = _prepare_ca_dirs(tmp_path, monkeypatch)
+    host_ca.mkdir()
+    (host_ca / "email-ca-bundle.pem").write_text("EMAIL ROOT\n")
+
+    with caplog.at_level(logging.INFO, logger="ares.updater.tls"):
+        tlsconf.install_ca_bundle()
+
+    assert "email-ca-bundle.pem" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        {"tls-ca-bundle.pem": "TLS", "email-ca-bundle.pem": "MAIL", "objsign-ca-bundle.pem": "OBJ"},
+        {"ca-certificates.crt": "DEBIAN"},
+        {"email-ca-bundle.pem": "MAIL", "corp-root.crt": "CORP"},
+        {"corp-root.crt": "CORP", "internal.pem": "INTERNAL"},
+    ],
+    ids=["rhel-extracts", "debian-bundle", "a-stray-email-extract", "an-ordinary-drop-in"],
+)
+def test_the_updater_selects_the_same_host_ca_files_as_the_agent(
+    tmp_path: Path, layout: dict[str, str]
+) -> None:
+    # The two _server_auth_only are the same text on purpose: the updater image ships updater/
+    # only, so it cannot import agent.tlsconf. Compare behaviour rather than source, so a
+    # reformat does not fail and a logic change on one side cannot pass.
+    from agent import tlsconf as agent_tlsconf
+
+    directory = tmp_path / "host-ca"
+    directory.mkdir()
+    for name, body in layout.items():
+        (directory / name).write_text(f"{body}\n")
+
+    assert tlsconf._server_auth_only(tlsconf._pems_in(directory)) == agent_tlsconf._server_auth_only(
+        agent_tlsconf._pems_in(directory)
+    )
+    assert tlsconf._PEM_SUFFIXES == agent_tlsconf._PEM_SUFFIXES
+    assert tlsconf._TLS_BUNDLE_NAME == agent_tlsconf._TLS_BUNDLE_NAME
+    assert tlsconf._NON_TLS_BUNDLE_PREFIXES == agent_tlsconf._NON_TLS_BUNDLE_PREFIXES
 
 
 def test_unreadable_mounted_files_leave_the_default_trust_alone(
