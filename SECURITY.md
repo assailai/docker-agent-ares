@@ -80,6 +80,12 @@ The Ares Agent implements multiple layers of security:
   `/etc/ssl/private` is never mounted, so no host private key is exposed to the container
 
 ### Dependencies
-- All dependencies pinned to specific versions
+- Direct dependencies pinned in `requirements.txt` / `requirements-updater.txt`; the full
+  transitive set, and a hash for every artifact, in the generated `*-lock.txt` beside them
+- The shipped images install from the lock with `pip --require-hashes`, so a release build
+  installs exactly the artifacts a reviewed commit recorded, or it fails
+- Every `FROM` that contributes to a shipped image is pinned by digest; `apk upgrade` still takes
+  Alpine's current packages on each build
 - Regular security audits and CVE monitoring
-- Automated dependency updates via Dependabot
+- Automated dependency updates via Dependabot, covering the transitive set as well as the direct
+  one

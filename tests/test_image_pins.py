@@ -28,6 +28,20 @@ def _pins(name: str) -> dict[str, str]:
     return {m.group(1).lower().replace("_", "-"): m.group(2) for m in matches if m}
 
 
+def _hashes(name: str) -> dict[str, int]:
+    """Package name to how many artifact hashes the lock records for it."""
+    counts: dict[str, int] = {}
+    current = ""
+    for line in (ROOT / name).read_text().splitlines():
+        match = _PIN.match(line.strip())
+        if match:
+            current = match.group(1).lower().replace("_", "-")
+            counts[current] = 0
+        elif "--hash=sha256:" in line and current:
+            counts[current] += line.count("--hash=sha256:")
+    return counts
+
+
 def _updater_dockerfile() -> str:
     return (ROOT / "Dockerfile.updater").read_text()
 
@@ -37,17 +51,97 @@ def _runtime_stage(dockerfile: str) -> str:
     return dockerfile[dockerfile.rindex("\nFROM ") :]
 
 
-def test_updater_pins_match_what_the_agent_tests_run_against() -> None:
-    # given the two requirements files
-    agent = _pins("requirements.txt")
-    updater = _pins("requirements-updater.txt")
+@pytest.mark.parametrize(
+    ("agent_file", "updater_file"),
+    [
+        ("requirements.txt", "requirements-updater.txt"),
+        ("requirements-lock.txt", "requirements-updater-lock.txt"),
+    ],
+    ids=["direct", "locked"],
+)
+def test_updater_pins_match_what_the_agent_tests_run_against(
+    agent_file: str, updater_file: str
+) -> None:
+    # given the agent's and the updater's pins, direct and then transitive
+    agent = _pins(agent_file)
+    updater = _pins(updater_file)
 
     # when the updater's pins are compared to the agent's
     drifted = {pkg: (ver, agent.get(pkg)) for pkg, ver in updater.items() if agent.get(pkg) != ver}
 
-    # then every updater pin is the version the test suite ran
-    assert updater, "requirements-updater.txt pins nothing"
-    assert not drifted, f"updater pins differ from requirements.txt (updater, agent): {drifted}"
+    # then every updater pin is the version the test suite ran, transitive packages included: the
+    # updater ships no tests of its own, so the agent's run is the only evidence either image has
+    assert updater, f"{updater_file} pins nothing"
+    assert not drifted, f"updater pins differ from {agent_file} (updater, agent): {drifted}"
+
+
+@pytest.mark.parametrize("lock", ["requirements-lock.txt", "requirements-updater-lock.txt"])
+def test_every_locked_package_carries_an_artifact_hash(lock: str) -> None:
+    # given the lock
+    hashes = _hashes(lock)
+
+    # then every package names at least one artifact. A pin says WHICH version; only a hash says
+    # which bytes, and a lock entry silently missing its hashes would pass --require-hashes while
+    # pinning nothing about the artifact itself
+    assert hashes, f"{lock} pins nothing"
+    assert not [pkg for pkg, count in hashes.items() if count == 0], (
+        f"{lock}: package(s) with no --hash: {[p for p, c in hashes.items() if c == 0]}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "lock"),
+    [("requirements.txt", "requirements-lock.txt"), ("requirements-updater.txt", "requirements-updater-lock.txt")],
+)
+def test_the_lock_is_in_step_with_the_file_it_was_compiled_from(source: str, lock: str) -> None:
+    # given the hand-edited pins and the generated lock
+    direct = _pins(source)
+    locked = _pins(lock)
+
+    # then the lock carries each of them at the same version. A stale lock is the quiet failure
+    # here: the build would keep installing the OLD version of a package someone just bumped,
+    # hashes and all, and nothing else would notice
+    stale = {pkg: (ver, locked.get(pkg)) for pkg, ver in direct.items() if locked.get(pkg) != ver}
+    assert direct, f"{source} pins nothing"
+    assert not stale, f"{lock} is out of step with {source} (wanted, locked): {stale}"
+
+
+@pytest.mark.parametrize("name", ["Dockerfile", "Dockerfile.updater"])
+def test_every_shipped_install_checks_hashes(name: str) -> None:
+    # given the image's Dockerfile
+    dockerfile = (ROOT / name).read_text()
+
+    # when the steps that resolve packages from an index are collected (installing wheels the
+    # builder stage already produced is not a resolution: those came from a checked resolve)
+    resolving = [
+        args
+        for args in re.findall(r"pip (?:install|wheel)([^\n\\]*(?:\\\n[^\n\\]*)*)", dockerfile)
+        if "-r " in args
+    ]
+
+    # then each one is hash-checked against a lock, so a build installs the recorded artifacts or
+    # it fails - never whatever the index happens to serve that day
+    assert resolving, f"{name} resolves no Python packages"
+    assert not [args for args in resolving if "--require-hashes" not in args], (
+        f"{name}: pip resolves without --require-hashes: {resolving}"
+    )
+    assert not [args for args in resolving if "-lock.txt" not in args], (
+        f"{name}: pip resolves from something other than a lock: {resolving}"
+    )
+
+
+@pytest.mark.parametrize("name", ["Dockerfile", "Dockerfile.updater"])
+def test_every_stage_starts_from_a_digest(name: str) -> None:
+    # given every FROM that contributes to the shipped image
+    froms = re.findall(r"^FROM\s+(?:--platform=\S+\s+)?(\S+)", (ROOT / name).read_text(), re.M)
+
+    # then each names an immutable digest. A floating tag lets the REGISTRY decide the base layers
+    # at build time; with a digest that choice is a reviewed commit, which Dependabot proposes.
+    # `apk upgrade` still takes Alpine's current packages, so this costs no freshness (ARES-2157).
+    assert froms, f"{name} has no FROM"
+    assert not [ref for ref in froms if not re.search(rf"@sha256:{_SHA256}$", ref)], (
+        f"{name}: stage(s) not pinned by digest: {[r for r in froms if '@sha256:' not in r]}"
+    )
 
 
 def test_every_pip_install_in_the_updater_image_reads_the_pinned_file() -> None:
@@ -56,11 +150,11 @@ def test_every_pip_install_in_the_updater_image_reads_the_pinned_file() -> None:
 
     # when its pip installs are collected
     installs = re.findall(r"pip install([^\n]*)", dockerfile)
-    unpinned = [args for args in installs if "-r /tmp/requirements-updater.txt" not in args]
+    unpinned = [args for args in installs if "-r /tmp/requirements-updater-lock.txt" not in args]
 
-    # then each one installs from the pinned file, never a bare package list
+    # then each one installs from the locked file, never a bare package list
     assert installs, "Dockerfile.updater installs no Python packages"
-    assert not unpinned, f"pip install without the pinned file: {unpinned}"
+    assert not unpinned, f"pip install without the locked file: {unpinned}"
 
 
 def test_cosign_is_built_from_the_commit_its_tag_pointed_at() -> None:

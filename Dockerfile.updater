@@ -67,22 +67,27 @@ RUN --mount=type=cache,target=/go/pkg/mod \
         -X sigs.k8s.io/release-utils/version.gitTreeState=dirty" \
       -o /out/cosign ./cmd/cosign
 
-FROM python:3.12-alpine
+# python 3.12.16 on alpine 3.24, by the multi-arch index digest so the registry cannot decide the
+# base layers at build time. `apk upgrade` below still ships Alpine's current packages - the ADD of
+# the package index is a cache key, not a repo - so pinning costs no freshness, it just means the
+# base moves through a reviewed Dependabot commit instead of silently.
+FROM python:3.12-alpine@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89
 
 LABEL org.opencontainers.image.title="Ares Updater"
 LABEL org.opencontainers.image.source="https://github.com/assailai/ares-agent"
 LABEL org.opencontainers.image.vendor="Assail AI"
 
 COPY --from=cosign /out/cosign /usr/local/bin/cosign
-COPY requirements-updater.txt /tmp/requirements-updater.txt
+# the lock, not requirements-updater.txt: see the agent's Dockerfile for why.
+COPY requirements-updater-lock.txt /tmp/requirements-updater-lock.txt
 # apk upgrade, and the ADD that makes it rerun against a cache: see the agent's Dockerfile for
 # both (zlib 1.4-r0 was in Alpine before the python image; krb5-libs 1.22.3-r0 was in Alpine
 # before this layer's cache entry expired).
 ADD https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/APKINDEX.tar.gz /usr/share/ares/apkindex.tar.gz
 RUN apk upgrade --no-cache \
     && apk add --no-cache ca-certificates \
-    && pip install --no-cache-dir -r /tmp/requirements-updater.txt \
-    && rm -rf /var/cache/apk/* /tmp/requirements-updater.txt
+    && pip install --no-cache-dir --require-hashes -r /tmp/requirements-updater-lock.txt \
+    && rm -rf /var/cache/apk/* /tmp/requirements-updater-lock.txt
 
 # Same CA mount points as the agent image: the host's store at /host-ca, the manual drop-in at
 # /certs. updater.tlsconf merges whatever it finds here into one bundle and exports SSL_CERT_FILE,

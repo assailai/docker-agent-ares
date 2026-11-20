@@ -634,6 +634,10 @@ We use [Semantic Versioning](https://semver.org/). For available versions, see t
 
 ### Cutting a release
 
+Dependencies first, if you changed any: `requirements.txt` and `requirements-updater.txt` hold
+the direct pins, and the `*-lock.txt` beside each is generated from it — regenerate with the
+command in the lock's own header, or the build fails on a hash it was not given.
+
 `agent/__version__.py` is the trigger. Bump it, move the pins that name the old version
 (`scripts/bootstrap.sh`, `docker-compose.yml`, `deploy/k8s/ares-agent.yaml`), and merge to `main`.
 `auto-tag.yml` then creates the `v<version>` tag and the GitHub release, and builds, pushes and
