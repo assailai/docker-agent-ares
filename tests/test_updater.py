@@ -29,6 +29,7 @@ def _clear_verified_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     main._verified.clear()
     main._verified_self.clear()
     main._self_retry_after.clear()
+    main._apply_retry_after.clear()
     main._declined_downgrades.clear()
     main._declined_rollbacks.clear()
     monkeypatch.setattr(main, "_predecessor_removed", False)
@@ -392,11 +393,17 @@ class _FakeBackend:
     """Stand-in backend that records what it was asked to apply. Unmanaged by default, so a test
     about the agent sees only the agent."""
 
-    def __init__(self, running: str | None, me: SelfInspection | None = None) -> None:
+    def __init__(
+        self,
+        running: str | None,
+        me: SelfInspection | None = None,
+        apply_result: bool = True,
+    ) -> None:
         self.running = running
         self.me = me or SelfInspection(role=Role.UNMANAGED)
         self.plan: UpdatePlan | None = None
         self.predecessor_removals = 0
+        self.apply_result = apply_result  # False = the agent was left where it was
 
     @property
     def applied(self) -> str | None:
@@ -414,8 +421,9 @@ class _FakeBackend:
     def remove_predecessor(self, settings: UpdaterSettings) -> None:
         self.predecessor_removals += 1
 
-    def apply(self, settings: UpdaterSettings, plan: UpdatePlan) -> None:
+    def apply(self, settings: UpdaterSettings, plan: UpdatePlan) -> bool:
         self.plan = plan
+        return self.apply_result
 
 
 def test_tick_derives_repo_from_the_running_image(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -662,6 +670,21 @@ def test_docker_keeps_the_old_agent_when_the_new_one_is_crash_looping(
     # then the old agent is kept, not deleted for a replacement that never stays up
     assert ("DELETE", "/containers/ares-agent", "") not in engine.calls
     assert ("DELETE", "/containers/new1", "") in engine.calls
+
+
+def test_docker_apply_reports_whether_the_agent_moved(monkeypatch: pytest.MonkeyPatch) -> None:
+    # _tick keys its backoff off this answer, so the backend has to give a real one rather than
+    # let a crash-looping image be retried every poll_seconds forever
+    healthy = _FakeEngine(me=_updater_container())
+    healthy.install(monkeypatch)
+    moved = DockerBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent@sha256:a"))
+
+    crash_looping = _FakeEngine(me=_updater_container(), successor_restarts=3)
+    crash_looping.install(monkeypatch)
+    left = DockerBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent@sha256:a"))
+
+    assert moved is True
+    assert left is False
 
 
 def test_docker_takes_its_name_back_when_the_successor_cannot_take_it(
@@ -1163,6 +1186,68 @@ def test_the_rollback_guard_does_not_skip_removing_a_predecessor(
 
     assert backend.plan is None
     assert backend.predecessor_removals == 1
+
+
+def test_tick_backs_off_after_an_update_that_did_not_stick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given a target whose image verifies but does not survive the move (a crash-looping build, or
+    # a k8s rollout that was rolled back). Without a memo this repeats every poll_seconds forever:
+    # pull, create, wait ten seconds, delete, and a cosign subprocess each time.
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: "3.15.0")
+    seen = _verify_to_digest(monkeypatch)
+    clock = types.SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(main.time, "monotonic", lambda: clock.now)
+    backend = _FakeBackend(running="docker.io/assailai/ares-agent:3.14.0", apply_result=False)
+
+    # when it ticks, is told the agent did not move, and ticks again
+    main._tick(backend)
+    assert backend.plan is not None and len(seen) == 1
+    backend.plan = None
+    main._tick(backend)
+
+    # then nothing was attempted and cosign was not asked a second time
+    assert backend.plan is None
+    assert len(seen) == 1
+
+    # and once the wait is over it tries again, verifying afresh rather than reusing the digest
+    clock.now += main._APPLY_RETRY_SECONDS + 1
+    main._tick(backend)
+    assert backend.plan is not None
+    assert len(seen) == 2
+
+
+def test_tick_forgets_a_digest_whose_move_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # the cache maps a target to "the digest cosign attested for it". Keeping that across a failed
+    # move would let a retry apply an attestation that may since have been revoked.
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: "3.15.0")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(running="docker.io/assailai/ares-agent:3.14.0", apply_result=False)
+
+    main._tick(backend)
+
+    assert "3.15.0" not in main._verified
+
+
+def test_tick_does_not_back_the_agent_off_when_only_the_handoff_returned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # the two memos answer different questions, and conflating them would let a failed updater
+    # handoff freeze the agent's updates for half an hour
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: "3.15.0")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(
+        running="docker.io/assailai/ares-agent:3.15.0", me=_owner(f"{_UPDATER}:3.14.0")
+    )
+
+    main._tick(backend)
+
+    assert backend.plan == UpdatePlan(updater=f"{_UPDATER}@sha256:3.15.0")
+    assert "3.15.0" in main._self_retry_after
+    assert "3.15.0" not in main._apply_retry_after
 
 
 def test_the_owner_removes_its_predecessor_once(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -42,7 +42,7 @@ class K8sBackend:
     def remove_predecessor(self, settings: UpdaterSettings) -> None:
         """Nothing to remove: a rollout replaces the whole pod."""
 
-    def apply(self, settings: UpdaterSettings, plan: UpdatePlan) -> None:
+    def apply(self, settings: UpdaterSettings, plan: UpdatePlan) -> bool:
         namespace = _namespace(settings)
         containers = [
             {"name": name, "image": image}
@@ -53,7 +53,7 @@ class K8sBackend:
             if image
         ]
         if not containers:
-            return
+            return True
         # strategic-merge patch: set only these containers' images; k8s rolls the Deployment.
         patch = {"spec": {"template": {"spec": {"containers": containers}}}}
         with _client() as kube:
@@ -69,6 +69,7 @@ class K8sBackend:
             settings.container_name,
             ", ".join(f"{c['name']}={c['image']}" for c in containers),
         )
+        return True
 
 
 def _image_of(settings: UpdaterSettings, *, container: str) -> str | None:

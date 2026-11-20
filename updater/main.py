@@ -68,6 +68,12 @@ _verified_self: dict[str, str] = {}  # for this updater's own
 # on every tick, every poll_seconds, for as long as the target stands.
 _self_retry_after: dict[str, float] = {}
 _SELF_RETRY_SECONDS = 1800.0
+# target version -> monotonic time before which applying it to the AGENT is not tried again. A
+# replacement that did not stay up (docker), or a rollout that was rolled back (k8s), would
+# otherwise repeat every poll_seconds for as long as the target stands: pull, create, wait, delete,
+# and a cosign subprocess each time.
+_apply_retry_after: dict[str, float] = {}
+_APPLY_RETRY_SECONDS = 1800.0
 _predecessor_removed = False
 _said_unmanaged = False
 # the release this image was built as (Dockerfile.updater writes it); absent outside an image
@@ -227,6 +233,8 @@ def _tick(backend: Backend) -> None:
     running = backend.running_image(settings)
     if running is None:
         return  # no agent yet
+    if time.monotonic() < _apply_retry_after.get(target, 0.0):
+        return  # this target was applied and did not stick; wait before spending another verify
 
     # the repo is derived from the running agent's image, so the updater can only move to a new
     # tag of the same image the agent already runs (ARES_UPDATE_IMAGE_REPO overrides it).
@@ -242,12 +250,23 @@ def _tick(backend: Backend) -> None:
     if not (plan.agent or plan.updater):
         return
     try:
-        backend.apply(settings, plan)
+        applied = backend.apply(settings, plan)
     finally:
         # a Docker handoff that succeeds never returns here, and k8s replaces this process with the
         # rollout. Still being here means the updater was not replaced: wait before trying again.
         if plan.updater:
             _self_retry_after[target] = time.monotonic() + _SELF_RETRY_SECONDS
+    if plan.agent and not applied:
+        # Outside the finally on purpose: a transient apiserver or engine error propagates and is
+        # retried on the next tick, because freezing updates for half an hour over one 500 is
+        # worse than the churn it would save. This is the clean "we tried and undid it" answer.
+        _verified.pop(target, None)  # a retry re-verifies rather than reusing an old attestation
+        _apply_retry_after[target] = time.monotonic() + _APPLY_RETRY_SECONDS
+        logger.warning(
+            "the agent did not reach %s and was left where it was; not trying again for %.0f minutes",
+            target,
+            _APPLY_RETRY_SECONDS / 60,
+        )
 
 
 def main() -> None:
