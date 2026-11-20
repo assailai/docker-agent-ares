@@ -82,11 +82,18 @@ def smtp_ehlo_capabilities(reply: bytes) -> frozenset[str]:
     """The ESMTP capability keywords an EHLO reply advertised, uppercased (e.g. ``STARTTLS``,
     ``AUTH``, ``PIPELINING``). A multiline ``250-CAP`` / ``250 CAP`` reply; a line that is not a 250
     response contributes nothing, and an unreadable or non-EHLO reply yields an empty set, never a
-    false claim that a capability is absent."""
+    false claim that a capability is absent.
+
+    The FIRST 250 line is the server's greeting (its domain/identification), not a capability, so it
+    is skipped: capability keywords begin on the second 250 line. A real reply opens with
+    ``250-mail.example.com`` and that host name must not land in the capability set."""
+    reply_250 = [
+        line
+        for line in _reply_lines(reply)
+        if len(line) >= 4 and line[:3] == "250" and line[3] in (" ", "-")
+    ]
     capabilities: set[str] = set()
-    for line in _reply_lines(reply):
-        if len(line) < 4 or line[:3] != "250" or line[3] not in (" ", "-"):
-            continue
+    for line in reply_250[1:]:  # skip the greeting line
         token = line[4:].strip().split()
         if token:
             capabilities.add(token[0].upper())

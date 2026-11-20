@@ -74,16 +74,27 @@ def test_smtp_ehlo_reports_starttls_when_advertised() -> None:
         b"250 AUTH PLAIN LOGIN\r\n"
     )
     caps = smtp_ehlo_capabilities(reply)
-    assert {"PIPELINING", "SIZE", "STARTTLS", "AUTH"} <= caps
+    # exact set: the greeting host (mail.example.com) is NOT a capability
+    assert caps == {"PIPELINING", "SIZE", "STARTTLS", "AUTH"}
     assert smtp_supports_starttls(reply) is True
 
 
 def test_smtp_ehlo_without_starttls_is_a_read_negative_not_an_abstention() -> None:
     reply = b"250-mail.example.com\r\n250-PIPELINING\r\n250 AUTH PLAIN LOGIN\r\n"
     caps = smtp_ehlo_capabilities(reply)
-    assert caps  # a reply WAS read and parsed
+    assert caps == {"PIPELINING", "AUTH"}  # a reply WAS read and parsed, greeting excluded
     assert "STARTTLS" not in caps
     assert smtp_supports_starttls(reply) is False
+
+
+def test_smtp_ehlo_greeting_line_is_not_a_capability() -> None:
+    # The first 250 line is the server host/greeting, never a capability: a real EHLO reply opens
+    # with "250-<host>". This was caught by a live aiosmtpd reply that capability-only fixtures had
+    # masked (the earlier subset assertions let the host name slip into the set unnoticed).
+    assert smtp_ehlo_capabilities(b"250 mail.example.com at your service\r\n") == frozenset()
+    caps = smtp_ehlo_capabilities(b"250-mail.example.com\r\n250-8BITMIME\r\n250 HELP\r\n")
+    assert caps == {"8BITMIME", "HELP"}
+    assert "MAIL.EXAMPLE.COM" not in caps
 
 
 def test_smtp_ehlo_abstains_on_an_unreadable_or_error_reply() -> None:
