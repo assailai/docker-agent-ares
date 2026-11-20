@@ -26,6 +26,14 @@ SYS_DESCR_OID: tuple[int, ...] = (1, 3, 6, 1, 2, 1, 1, 1, 0)
 # well-known defaults, never a dictionary attack: this is discovery, not credential brute force.
 DEFAULT_COMMUNITIES: tuple[str, ...] = ("public", "private")
 
+# SNMP agents answer on UDP 161.
+SNMP_PORT = 161
+
+# The ``udp_operations`` token the control plane sends to request this probe, shared byte-for-byte
+# with ares-v2's ``NetworkDiscoverTaskV1``. The agent runs the probe only when a verified job lists
+# it, and ignores any token it does not recognise (forward-compatible).
+SNMP_DEFAULT_COMMUNITY_OP = "snmp_default_community"
+
 _VERSION_V2C = 1  # SNMP version field: 0 is v1, 1 is v2c
 
 # BER tags.

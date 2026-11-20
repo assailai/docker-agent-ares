@@ -12,7 +12,6 @@ from __future__ import annotations
 import base64
 
 import pytest
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from agent import assessment, assessment_discover
 
@@ -173,3 +172,21 @@ def test_sealed_result_payload_bytes_are_canonical() -> None:
         signer_key_id="k",
     )
     assert base64.b64decode(envelope["payload"]) == b'{"a":2,"b":1}'
+
+
+def test_derive_scope_parses_udp_operations() -> None:
+    scope = assessment_discover.derive_scope(_job(udp_operations=["snmp_default_community"]))
+    assert scope.udp_operations == ("snmp_default_community",)
+
+
+def test_derive_scope_without_udp_operations_is_empty() -> None:
+    assert assessment_discover.derive_scope(_job()).udp_operations == ()
+
+
+def test_derive_scope_drops_non_string_udp_operations() -> None:
+    # The job is verified before this runs, but the parser still keeps only well-formed string ops
+    # and an unknown op is simply carried for the handler to ignore (forward-compatible).
+    scope = assessment_discover.derive_scope(
+        _job(udp_operations=["snmp_default_community", "", 7, None])
+    )
+    assert scope.udp_operations == ("snmp_default_community",)

@@ -110,6 +110,9 @@ class DiscoverScope:
     networks: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]
     excludes: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]
     ports: tuple[int, ...]
+    # The bounded UDP operations the verified job asked for (e.g. the SNMP default-community probe).
+    # A trailing field with a default, so existing constructions and the TCP-only path are unchanged.
+    udp_operations: tuple[str, ...] = ()
 
     def in_scope(self, ip: str) -> bool:
         """Whether ``ip`` is inside a target network AND outside every exclude. Fails closed on an
@@ -140,7 +143,10 @@ def derive_scope(job: dict) -> DiscoverScope:
     if not networks:
         raise ValueError("verified job has no target networks")
     ports = tuple(parse_port_spec(job["tcp_ports"]))
-    return DiscoverScope(networks=networks, excludes=excludes, ports=ports)
+    udp_operations = tuple(op for op in job.get("udp_operations", []) if isinstance(op, str) and op)
+    return DiscoverScope(
+        networks=networks, excludes=excludes, ports=ports, udp_operations=udp_operations
+    )
 
 
 def service_observation(

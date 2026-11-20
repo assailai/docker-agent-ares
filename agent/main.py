@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import resource
+import secrets
 import ssl
 import sys
 import time
@@ -32,7 +33,7 @@ from agent.hostpins import HostPins
 from agent.identify import IdentityProbe
 from agent.kubeinfo import KubeApi, KubeConfigError, KubernetesEvidence, safe_collect
 from agent.progress import ProgressReporter
-from agent import assessment, assessment_collect, assessment_discover, protocols
+from agent import assessment, assessment_collect, assessment_discover, protocols, snmp
 from agent.collectors import ssh_collect, vendor
 from agent.credential_vault import CredentialVault
 from agent.state import AgentState, fingerprint, load_state, save_state
@@ -951,6 +952,125 @@ async def _read_banner(ip: str, port: int, *, timeout: float) -> bytes:
             await writer.wait_closed()
 
 
+class _SnmpDatagramProtocol(asyncio.DatagramProtocol):
+    """Captures the first datagram a UDP endpoint receives into a future, so one bounded SNMP round
+    trip can await a single reply and then close."""
+
+    def __init__(self, future: asyncio.Future[bytes]) -> None:
+        self._future = future
+
+    def datagram_received(self, data: bytes, _addr: object) -> None:
+        if not self._future.done():
+            self._future.set_result(data)
+
+    def error_received(self, _exc: Exception) -> None:
+        # An ICMP port-unreachable surfaces here: it is "no SNMP answer", not an error to raise.
+        if not self._future.done():
+            self._future.set_result(b"")
+
+
+async def _snmp_round_trip(
+    ip: str, payload: bytes, *, request_id: int, timeout: float
+) -> snmp.SnmpGetResponse | None:
+    """Send one SNMP datagram to ``ip`` and parse the first reply within ``timeout``; ``None`` on a
+    timeout, an ICMP refusal, a socket error or a reply that is not our response. Separated from
+    ``_probe_snmp`` so the transport and the retry-per-community logic are each testable alone."""
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[bytes] = loop.create_future()
+    try:
+        transport, _ = await loop.create_datagram_endpoint(
+            lambda: _SnmpDatagramProtocol(future), remote_addr=(ip, snmp.SNMP_PORT)
+        )
+    except OSError:
+        return None
+    try:
+        transport.sendto(payload)
+        data = await asyncio.wait_for(future, timeout=timeout)
+    except (OSError, asyncio.TimeoutError, TimeoutError):
+        return None
+    finally:
+        transport.close()
+    if not data:
+        return None
+    return snmp.parse_snmp_response(data, expected_request_id=request_id)
+
+
+async def _probe_snmp(ip: str, *, timeout: float) -> snmp.SnmpGetResponse | None:
+    """One bounded, read-only SNMPv2c default-community probe of ``ip``: a GET for sysDescr.0 under
+    each well-known default community (at most two small datagrams), returning the first accepted
+    response or ``None``. A GET never changes device state and the community list is exactly the
+    documented defaults, so this is discovery of a misconfiguration, not credential guessing.
+    Separated out so the discover handler stays testable by monkeypatching it."""
+    for community in snmp.DEFAULT_COMMUNITIES:
+        request_id = secrets.randbelow(0x7FFFFFFE) + 1
+        payload = snmp.build_snmp_get(community=community, request_id=request_id)
+        response = await _snmp_round_trip(ip, payload, request_id=request_id, timeout=timeout)
+        if response is not None and response.accepted:
+            return response
+    return None
+
+
+def _scope_udp_hosts(scope: assessment_discover.DiscoverScope, *, cap: int) -> list[str]:
+    """In-scope individual host addresses to send a UDP probe to, capped so a UDP sweep never
+    outgrows the TCP sweep's own host ceiling."""
+    hosts: list[str] = []
+    for network in scope.networks:
+        for address in network.hosts():
+            ip = str(address)
+            if scope.in_scope(ip):
+                hosts.append(ip)
+                if len(hosts) >= cap:
+                    return hosts
+    return hosts
+
+
+async def _snmp_discover(scope: assessment_discover.DiscoverScope) -> list[dict]:
+    """Probe in-scope hosts for an SNMP agent that answers a default community, when the signed job
+    asked for it (``snmp.SNMP_DEFAULT_COMMUNITY_OP`` in its udp_operations). A responder becomes one
+    OPEN udp/161 observation with ``protocol_id = "snmp"`` (identification IS the finding the
+    ``net.snmp.default_community`` rule consumes); a non-responder is left silent, never reported as
+    closed, so a UDP no-response stays indeterminate rather than an implied clean."""
+    if snmp.SNMP_DEFAULT_COMMUNITY_OP not in scope.udp_operations:
+        return []
+    hosts = _scope_udp_hosts(scope, cap=settings.scan_max_hosts)
+    if not hosts:
+        return []
+
+    # A bounded worker pool, never one task per host: a large scope would otherwise materialise
+    # hundreds of thousands of tasks and sockets at once. At most `concurrency` probes are in flight.
+    queue: asyncio.Queue[str] = asyncio.Queue()
+    for ip in hosts:
+        queue.put_nowait(ip)
+    observations: list[dict] = []
+
+    async def _worker() -> None:
+        while True:
+            try:
+                ip = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            response = await _probe_snmp(ip, timeout=settings.scan_connect_timeout)
+            if response is None:
+                continue
+            descr = response.sys_descr or ""
+            observations.append(
+                assessment_discover.service_observation(
+                    address=ip,
+                    port=snmp.SNMP_PORT,
+                    transport="udp",
+                    outcome="open",
+                    protocol_id="snmp",
+                    banner_sha256=(
+                        hashlib.sha256(descr.encode("utf-8")).hexdigest() if descr else None
+                    ),
+                )
+            )
+
+    worker_count = min(max(1, _scan_limits["concurrency"]), len(hosts))
+    await asyncio.gather(*(_worker() for _ in range(worker_count)))
+    return observations
+
+
 async def _probe_discover_scope(scope: assessment_discover.DiscoverScope) -> list[dict] | None:
     """Probe every in-scope network over the scope's ports, returning OPEN service observations, or
     None if a pause landed first (the caller then hands the task back).
@@ -995,6 +1115,10 @@ async def _probe_discover_scope(scope: assessment_discover.DiscoverScope) -> lis
                     banner_sha256=banner_sha256,
                 )
             )
+    snmp_hits = await _unless_paused(asyncio.create_task(_snmp_discover(scope)))
+    if snmp_hits is None:
+        return None
+    observations.extend(snmp_hits)
     return observations
 
 
