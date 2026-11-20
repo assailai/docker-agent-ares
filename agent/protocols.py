@@ -50,3 +50,72 @@ def identify_protocol(banner: bytes) -> str | None:
         if b"FTP" in upper:
             return "ftp"
     return None
+
+
+# ── active specialists: one bounded, read-only command, then parse the reply ──────────────────────
+#
+# Unlike identify_protocol these describe an ACTIVE probe: the agent sends one metadata command (an
+# SMTP EHLO, an FTP FEAT) and reads the capability reply. The spec bounds this hard: EHLO never DATA,
+# FEAT/SYST never a write, so nothing is delivered and no state changes. The functions here are the
+# PURE half (reply bytes in, a capability set out); the socket write that produces those bytes lives
+# in the discover handler, so this stays trivially testable from fixtures. The honesty rule mirrors
+# identify_protocol: a reply the agent cannot parse yields an EMPTY set (abstain), never a confident
+# "capability absent", so a missing STARTTLS is only ever asserted from a reply we actually read.
+
+# The command line each specialist sends. EHLO takes a client name; a bare, non-routable literal is
+# used so the probe reveals nothing about the agent's host and asks only for the capability list.
+SMTP_EHLO_COMMAND = b"EHLO ares-assessment.invalid\r\n"
+FTP_FEAT_COMMAND = b"FEAT\r\n"
+
+
+def _reply_lines(reply: bytes) -> list[str]:
+    """Decode a bounded multiline reply into text lines, tolerant of a server's odd bytes: a line
+    that will not decode is dropped rather than raising, since this is untrusted remote output."""
+    try:
+        text = reply.decode("ascii", "ignore")
+    except (UnicodeDecodeError, ValueError):
+        return []
+    return [line.rstrip("\r") for line in text.split("\n") if line.strip()]
+
+
+def smtp_ehlo_capabilities(reply: bytes) -> frozenset[str]:
+    """The ESMTP capability keywords an EHLO reply advertised, uppercased (e.g. ``STARTTLS``,
+    ``AUTH``, ``PIPELINING``). A multiline ``250-CAP`` / ``250 CAP`` reply; a line that is not a 250
+    response contributes nothing, and an unreadable or non-EHLO reply yields an empty set, never a
+    false claim that a capability is absent."""
+    capabilities: set[str] = set()
+    for line in _reply_lines(reply):
+        if len(line) < 4 or line[:3] != "250" or line[3] not in (" ", "-"):
+            continue
+        token = line[4:].strip().split()
+        if token:
+            capabilities.add(token[0].upper())
+    return frozenset(capabilities)
+
+
+def smtp_supports_starttls(reply: bytes) -> bool:
+    """Whether the EHLO reply advertised STARTTLS. False means "not advertised in a reply we read",
+    which the caller pairs with the fact that it DID read one, so an unread reply is never a finding."""
+    return "STARTTLS" in smtp_ehlo_capabilities(reply)
+
+
+def ftp_feat_features(reply: bytes) -> frozenset[str]:
+    """The feature tokens an FTP ``FEAT`` reply listed, uppercased. FEAT frames the list between
+    ``211-Features:`` and ``211 End`` with each feature on its own indented line; the ``211`` framing
+    lines are not features. An unreadable or error reply yields an empty set (abstain)."""
+    features: set[str] = set()
+    for line in _reply_lines(reply):
+        stripped = line.strip()
+        if not stripped or stripped[:3] == "211" or stripped[:3] == "500":
+            continue
+        features.add(stripped.upper())
+    return frozenset(features)
+
+
+def ftp_supports_auth_tls(reply: bytes) -> bool:
+    """Whether FEAT advertised AUTH TLS or AUTH SSL (FTPS over the control channel). The absence of
+    this in a reply we read is what makes a reachable FTP service a cleartext-credentials finding."""
+    return any(
+        feature.startswith("AUTH") and ("TLS" in feature or "SSL" in feature)
+        for feature in ftp_feat_features(reply)
+    )
