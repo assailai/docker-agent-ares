@@ -1,0 +1,17 @@
+Building configuration...
+
+Current configuration:
+!
+frr version 10.2.1_git
+frr defaults traditional
+hostname frr-edge
+no ipv6 forwarding
+service integrated-vtysh-config
+!
+access-list vty-mgmt seq 5 permit 10.10.0.0/24
+!
+line vty
+ access-class vty-mgmt
+exit
+!
+end

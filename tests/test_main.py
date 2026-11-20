@@ -282,7 +282,7 @@ async def test_run_task_reports_progress_and_streams_hosts(monkeypatch: pytest.M
 
     await main._run_task(
         "tok",
-        {"id": "t1", "target_network": "10.0.0.0/24", "tool_config": {"ports": [80]}},
+        {"id": "t1", "task_type": "local_network_scan", "target_network": "10.0.0.0/24", "tool_config": {"ports": [80]}},
     )
 
     assert started == ["t1"]
@@ -314,7 +314,7 @@ async def test_run_task_survives_a_failed_progress_post(monkeypatch: pytest.Monk
     monkeypatch.setattr(main.control_plane, "task_completed", _task_completed)
     monkeypatch.setattr(main.scan, "scan_cidr", _fake_scan)
 
-    await main._run_task("tok", {"id": "t1", "target_network": "10.0.0.0/24"})
+    await main._run_task("tok", {"id": "t1", "task_type": "local_network_scan", "target_network": "10.0.0.0/24"})
 
     assert completed == [[]]  # completed cleanly despite the progress post blowing up
 
@@ -331,7 +331,7 @@ async def test_run_task_fails_without_a_target_network(monkeypatch: pytest.Monke
     monkeypatch.setattr(main.control_plane, "task_failed", _task_failed)
     monkeypatch.setattr(main.scan, "scan_cidr", _should_not_run)
 
-    await main._run_task("tok", {"id": "t1"})
+    await main._run_task("tok", {"id": "t1", "task_type": "local_network_scan"})
 
     assert failed == ["missing target_network"]
 
@@ -392,7 +392,7 @@ async def test_run_task_scans_a_target_inside_ares_networks(
     seen = _scope_probe(monkeypatch)
     monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24")
 
-    await main._run_task("tok", {"id": "t1", "target_network": target})
+    await main._run_task("tok", {"id": "t1", "task_type": "local_network_scan", "target_network": target})
 
     assert seen.failed == []
     assert seen.started == ["t1"]
@@ -419,7 +419,7 @@ async def test_run_task_refuses_a_target_outside_ares_networks(
     seen = _scope_probe(monkeypatch)
     monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24")
 
-    await main._run_task("tok", {"id": "t1", "target_network": target})
+    await main._run_task("tok", {"id": "t1", "task_type": "local_network_scan", "target_network": target})
 
     assert seen.scanned == []
     assert seen.started == []  # never reported as begun, because it never began
@@ -448,7 +448,7 @@ async def test_run_task_refuses_a_target_that_is_never_a_scope(
         seen = _scope_probe(monkeypatch)
         monkeypatch.setattr(main.settings, "networks", networks)
 
-        await main._run_task("tok", {"id": "t1", "target_network": target})
+        await main._run_task("tok", {"id": "t1", "task_type": "local_network_scan", "target_network": target})
 
         assert seen.scanned == []
         assert seen.started == []
@@ -463,7 +463,7 @@ async def test_run_task_survives_a_typo_in_ares_networks(
     seen = _scope_probe(monkeypatch)
     monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24, oops, 192.168.5.0/24")
 
-    await main._run_task("tok", {"id": "t1", "target_network": "192.168.5.128/25"})
+    await main._run_task("tok", {"id": "t1", "task_type": "local_network_scan", "target_network": "192.168.5.128/25"})
 
     assert seen.scanned == ["192.168.5.128/25"]
 
@@ -487,7 +487,7 @@ async def test_run_task_refuses_everything_when_ares_networks_parses_to_nothing(
     seen = _scope_probe(monkeypatch)
     monkeypatch.setattr(main.settings, "networks", networks)
 
-    await main._run_task("tok", {"id": "t1", "target_network": "203.0.113.0/24"})
+    await main._run_task("tok", {"id": "t1", "task_type": "local_network_scan", "target_network": "203.0.113.0/24"})
 
     assert seen.scanned == []
     assert seen.started == []
@@ -529,7 +529,7 @@ async def test_run_task_warns_but_still_scans_outside_the_detected_scope(
     monkeypatch.setitem(main._reachable, "networks", ["10.0.0.0/8"])
 
     with caplog.at_level(logging.WARNING, logger="ares.agent"):
-        await main._run_task("tok", {"id": "t1", "target_network": "203.0.113.0/24"})
+        await main._run_task("tok", {"id": "t1", "task_type": "local_network_scan", "target_network": "203.0.113.0/24"})
 
     assert seen.scanned == ["203.0.113.0/24"]  # scanned, by choice
     warning = caplog.records[0].getMessage()
@@ -545,7 +545,7 @@ async def test_run_task_is_quiet_about_a_target_it_detected(
     monkeypatch.setitem(main._reachable, "networks", ["10.0.0.0/8"])
 
     with caplog.at_level(logging.WARNING, logger="ares.agent"):
-        await main._run_task("tok", {"id": "t1", "target_network": "10.4.0.0/24"})
+        await main._run_task("tok", {"id": "t1", "task_type": "local_network_scan", "target_network": "10.4.0.0/24"})
 
     assert seen.scanned == ["10.4.0.0/24"]
     assert caplog.records == []
@@ -561,7 +561,7 @@ async def test_run_task_does_not_call_an_empty_detection_drift(
     monkeypatch.setitem(main._reachable, "networks", [])
 
     with caplog.at_level(logging.WARNING, logger="ares.agent"):
-        await main._run_task("tok", {"id": "t1", "target_network": "10.4.0.0/24"})
+        await main._run_task("tok", {"id": "t1", "task_type": "local_network_scan", "target_network": "10.4.0.0/24"})
 
     assert seen.scanned == ["10.4.0.0/24"]
     assert caplog.records == []
@@ -573,7 +573,7 @@ async def test_run_task_reports_a_refusal_exactly_once(monkeypatch: pytest.Monke
     seen = _scope_probe(monkeypatch)
     monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24")
 
-    await main._run_task("tok", {"id": "t1", "target_network": "203.0.113.0/24"})
+    await main._run_task("tok", {"id": "t1", "task_type": "local_network_scan", "target_network": "203.0.113.0/24"})
 
     assert len(seen.failed) == 1
     assert seen.scanned == []
@@ -585,7 +585,7 @@ async def test_run_task_keeps_refusing_a_redelivered_task(
     """A retry is not a second opinion. Redelivering the same task must not eventually run it."""
     seen = _scope_probe(monkeypatch)
     monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24")
-    task = {"id": "t1", "target_network": "203.0.113.0/24"}
+    task = {"id": "t1", "task_type": "local_network_scan", "target_network": "203.0.113.0/24"}
 
     for _ in range(3):
         await main._run_task("tok", task)
@@ -602,7 +602,7 @@ async def test_run_task_scans_the_normalized_target(
     seen = _scope_probe(monkeypatch)
     monkeypatch.setattr(main.settings, "networks", "10.0.1.0/24")
 
-    await main._run_task("tok", {"id": "t1", "target_network": "10.0.1.7/24"})
+    await main._run_task("tok", {"id": "t1", "task_type": "local_network_scan", "target_network": "10.0.1.7/24"})
 
     assert seen.scanned == ["10.0.1.0/24"]
 
@@ -1189,7 +1189,7 @@ async def test_the_cluster_read_does_not_hold_up_the_sweep(
     monkeypatch.setattr(main, "_kubernetes_inventory", _inventory)
     monkeypatch.setattr(main.scan, "scan_cidr", _fake_scan)
 
-    await main._run_task("tok", {"id": "t1", "target_network": "10.0.0.0/24"})
+    await main._run_task("tok", {"id": "t1", "task_type": "local_network_scan", "target_network": "10.0.0.0/24"})
 
     assert _cluster_naming == []
     assert pending_when_sweep_began == [True]
@@ -1211,7 +1211,7 @@ async def test_a_cluster_read_nothing_used_does_not_outlive_its_task(
     monkeypatch.setattr(main, "_kubernetes_inventory", _inventory)
     monkeypatch.setattr(main.scan, "scan_cidr", _fake_scan)
 
-    await main._run_task("tok", {"id": "t1", "target_network": "10.0.0.0/24"})
+    await main._run_task("tok", {"id": "t1", "task_type": "local_network_scan", "target_network": "10.0.0.0/24"})
 
     (read,) = reads
     await asyncio.wait([read], timeout=1.0)
@@ -1236,7 +1236,7 @@ async def test_no_cluster_read_starts_when_cluster_naming_is_off(
     monkeypatch.setattr(main, "_kubernetes_inventory", _inventory)
     monkeypatch.setattr(main.scan, "scan_cidr", _fake_scan)
 
-    await main._run_task("tok", {"id": "t1", "target_network": "10.0.0.0/24"})
+    await main._run_task("tok", {"id": "t1", "task_type": "local_network_scan", "target_network": "10.0.0.0/24"})
 
     assert reads == [None]
     assert started == []
@@ -1309,6 +1309,7 @@ async def test_a_stalled_cluster_read_cannot_push_a_scan_past_its_budget(
 
     task = {
         "id": "t1",
+        "task_type": "local_network_scan",
         "target_network": "10.0.0.0/24",
         "tool_config": {"ports": [80], "timeout_seconds": 0.4},
     }
@@ -1395,7 +1396,7 @@ async def test_a_pause_mid_scan_cancels_it_and_hands_the_task_back(
     monkeypatch.setattr(main.scan, "scan_cidr", _never_ending_scan(scanning, cancelled))
 
     running = asyncio.create_task(
-        main._run_task("tok", {"id": "t1", "target_network": "10.0.0.0/24"})
+        main._run_task("tok", {"id": "t1", "task_type": "local_network_scan", "target_network": "10.0.0.0/24"})
     )
     await scanning.wait()
     main._paused.set()
@@ -1414,7 +1415,7 @@ async def test_a_shutdown_mid_scan_still_cancels_cleanly(monkeypatch: pytest.Mon
     monkeypatch.setattr(main.scan, "scan_cidr", _never_ending_scan(scanning, cancelled))
 
     running = asyncio.create_task(
-        main._run_task("tok", {"id": "t1", "target_network": "10.0.0.0/24"})
+        main._run_task("tok", {"id": "t1", "task_type": "local_network_scan", "target_network": "10.0.0.0/24"})
     )
     await scanning.wait()
     running.cancel()
@@ -1484,11 +1485,11 @@ async def test_claimed_tasks_not_yet_started_go_back_when_the_agent_is_paused(
 
     async def _poll(_s: object, _t: str) -> list[dict]:
         return [
-            {"id": "t1", "target_network": "10.0.0.0/24"},
+            {"id": "t1", "task_type": "local_network_scan", "target_network": "10.0.0.0/24"},
             {"id": "t2", "target_network": "10.0.1.0/24"},
         ]
 
-    async def _run_task(_token: str, task: dict) -> None:
+    async def _run_task(_token: str, task: dict, *, state: object = None) -> None:
         ran.append(task["id"])
         main._paused.set()
 

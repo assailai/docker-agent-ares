@@ -1,0 +1,35 @@
+! device: core-switch (cEOS)
+!
+hostname core-switch
+!
+enable password 7 105A1D0D1C09
+!
+management ssh
+   no shutdown
+!
+management telnet
+   no shutdown
+!
+management api http-commands
+   protocol http
+   no shutdown
+!
+snmp-server community public ro
+snmp-server community labwrite rw
+!
+interface Ethernet1
+   description access-user-port
+   switchport mode dynamic auto
+!
+interface Ethernet2
+   description uplink
+   switchport mode trunk
+!
+interface Ethernet3
+   description user-access-port
+   switchport mode access
+!
+line vty 0 31
+   transport input ssh telnet
+!
+end

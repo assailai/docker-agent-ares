@@ -199,7 +199,7 @@ async def test_the_scan_never_waits_on_a_progress_post(monkeypatch: pytest.Monke
     monkeypatch.setattr(main.scan, "scan_cidr", _fake_scan)
 
     # when a task runs and its scan reports every point
-    task = {"id": "t1", "target_network": "10.0.0.0/24"}
+    task = {"id": "t1", "task_type": "local_network_scan", "target_network": "10.0.0.0/24"}
     await asyncio.wait_for(main._run_task("tok", task), timeout=_RUN_TIMEOUT_S)
 
     # then the scan finishes, the task completes, and at most one progress post was ever made

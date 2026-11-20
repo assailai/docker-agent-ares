@@ -1,0 +1,31 @@
+! device: edge-router (cEOS)
+!
+hostname edge-router
+logging host 10.10.0.99
+ntp server 10.10.0.99
+banner login
+Authorized access only.
+EOF
+!
+enable secret 5 $1$salt$3xampleOneWayHashValue0
+!
+management ssh
+   no shutdown
+!
+management telnet
+   shutdown
+!
+snmp-server community s3cr3t-r0nly ro
+!
+interface Ethernet1
+   description access-user-port
+   switchport mode access
+   switchport nonegotiate
+   spanning-tree bpduguard enable
+   switchport port-security
+!
+line vty 0 31
+   transport input ssh
+   ip access-class MGMT-IN in
+!
+end

@@ -11,14 +11,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import ipaddress
 import json
 import logging
 import os
 import resource
+import secrets
 import ssl
 import sys
 import time
+from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 import httpx
@@ -30,6 +33,9 @@ from agent.hostpins import HostPins
 from agent.identify import IdentityProbe
 from agent.kubeinfo import KubeApi, KubeConfigError, KubernetesEvidence, safe_collect
 from agent.progress import ProgressReporter
+from agent import assessment, assessment_collect, assessment_discover, protocols, snmp
+from agent.collectors import ssh_collect, vendor
+from agent.credential_vault import CredentialVault
 from agent.state import AgentState, fingerprint, load_state, save_state
 from agent.tunnel import (
     TunnelManager,
@@ -190,13 +196,26 @@ def _server_name(resp: dict) -> str | None:
 async def _register(state: AgentState, networks: list[str]) -> AgentState:
     logger.info("Registering with %s (networks=%s)", settings.base_url, networks or "none")
     presented = settings.token.get_secret_value()
-    resp = await control_plane.register(settings, networks=networks, name=settings.agent_name)
+    # Generate the agent's signing keypair once, on first enrolment, and register only its public
+    # half; the control plane verifies the agent's signed results against it. Persisted below via
+    # save_state, so a restart reuses the same key.
+    if not state.signing_key_seed:
+        state.signing_key_seed = assessment.generate_signing_seed()
+    resp = await control_plane.register(
+        settings,
+        networks=networks,
+        name=settings.agent_name,
+        signing_public_key=assessment.public_key_b64_from_seed(state.signing_key_seed),
+    )
     state.agent_id = resp["agent_id"]
     state.agent_token = resp["agent_token"]
     # Bind the identity to the token that minted it. This is the whole point of the field: on a
     # later start it separates an ordinary restart (same token, keep serving) from an operator
     # re-running the installer with the token for a *different* agent. See _enroll.
     state.registration_token_fingerprint = fingerprint(presented)
+    keys = resp.get("assessment_signing_public_keys")
+    if isinstance(keys, list) and all(isinstance(k, str) for k in keys):
+        state.cp_assessment_public_keys = keys
     _cadence["heartbeat"] = resp.get("heartbeat_interval_seconds", _cadence["heartbeat"])
     _cadence["poll"] = resp.get("poll_interval_seconds", _cadence["poll"])
     save_state(settings.state_path, state)
@@ -236,6 +255,7 @@ async def _preflight(state: AgentState, ssl_context: ssl.SSLContext) -> None:
         # registration token, and this is the first proof the long-lived agent token works.
         logger.info("Preflight: control plane OK (%s)", settings.base_url)
         _apply_auto_rescan(resp.get("auto_rescan"), state=state)
+        _apply_cp_assessment_keys(resp.get("assessment_signing_public_keys"), state=state)
     except (httpx.HTTPError, OSError) as exc:
         logger.error("Preflight: control plane FAILED: %s%s", _reason(exc), _tls_hint(exc))
 
@@ -461,6 +481,7 @@ async def _heartbeat_loop(state: AgentState, tunnel: TunnelManager) -> None:
             _record_contact()  # feed the watchdog + refresh the healthcheck marker
             _cadence["heartbeat"] = resp.get("heartbeat_interval_seconds", _cadence["heartbeat"])
             _apply_auto_rescan(resp.get("auto_rescan"), state=state)
+            _apply_cp_assessment_keys(resp.get("assessment_signing_public_keys"), state=state)
             tunnel.sync(
                 bool(resp.get("tunnel_required")),
                 _allowed_hosts(resp.get("tunnel_allowed_hosts")),
@@ -748,8 +769,48 @@ async def _hand_back(token: str, task_id: str) -> None:
         logger.warning("Could not hand task %s back (%s); its lease will.", task_id, exc)
 
 
-async def _run_task(token: str, task: dict) -> None:
+# The task types THIS agent build knows how to run. A task type OUTSIDE this set (a new
+# network-assessment task dispatched to an un-upgraded agent, or a malformed one) must fail closed
+# BEFORE any target field is read, so it produces zero target activity. These mirror the control
+# plane's AgentTaskType values. The discover type is handled now (it verifies the signed job before
+# any probe); the credentialed COLLECT type is still deliberately absent until its collectors land,
+# so the fleet refuses it rather than running it as a sweep (the agent-first invariant during
+# rollout). Dispatch of discover stays control-plane-gated (the module ships dark) regardless.
+_HANDLED_TASK_TYPES = frozenset(
+    {"local_network_scan", "network_assessment_discover_v1", "network_assessment_collect_v1"}
+)
+
+
+async def _run_task(token: str, task: dict, *, state: AgentState | None = None) -> None:
+    # ``state`` is keyword-only and optional: the sweep path (``local_network_scan``) never needs it,
+    # so the existing callers that pass only (token, task) keep working. The signed discover path
+    # DOES need it (the control-plane keys to verify the job, the agent's own key to sign the
+    # result) and is only ever reached through _work_through, which threads the live state in.
     task_id = task["id"]
+    task_type = task.get("task_type")
+    if task_type not in _HANDLED_TASK_TYPES:
+        # Agent-first gate: classify the task type before reading any target field, so an unhandled
+        # type yields zero target activity and a typed rejection, never a fall-through to the
+        # scanner. Refused before task_started, so a task the agent will not run is never reported
+        # as one it began.
+        logger.warning("Refused task %s: unhandled task_type %r", task_id, task_type)
+        await control_plane.task_failed(
+            settings, token, task_id, reason=f"unsupported task type: {task_type!r}"
+        )
+        return
+    if task_type in ("network_assessment_discover_v1", "network_assessment_collect_v1"):
+        if state is None:  # defensive: the poll loop always threads state in on this path
+            await control_plane.task_failed(
+                settings, token, task_id, reason="internal: agent state unavailable"
+            )
+            return
+        # The signed-job path: verify the control plane's signature BEFORE reading any target field
+        # (agent-first), then act. Discover probes; collect reads a device config with a local cred.
+        if task_type == "network_assessment_discover_v1":
+            await _run_assessment_discover(state, token, task)
+        else:
+            await _run_assessment_collect(state, token, task)
+        return
     cidr = task.get("target_network")
     config = task.get("tool_config") or {}
     ports = config.get("ports") or list(scan.DEFAULT_PORTS)
@@ -858,6 +919,514 @@ async def _run_task(token: str, task: dict) -> None:
         await percentages.close()
 
 
+# The signature domain and envelope schema a discover JOB is sealed under by the control plane
+# (ares.infra.agent_runtime.network_assessment_dispatch.SIGN_DOMAIN_DISCOVER and
+# tasks.SCHEMA_DISCOVER_V1). The agent verifies against exactly these; a mismatch fails closed.
+_DISCOVER_JOB_DOMAIN = "ares.network-assessment.signed-task.discover:v1"
+_DISCOVER_JOB_SCHEMA = "ares.network-assessment.signed-task.discover.v1"
+
+
+# How many opening bytes to read from an open service to identify its protocol. A banner is small;
+# this bounds a server that would otherwise dribble bytes forever, and only the head is classified.
+_BANNER_MAX_BYTES = 512
+
+
+async def _read_banner(ip: str, port: int, *, timeout: float) -> bytes:
+    """Read up to ``_BANNER_MAX_BYTES`` a service sends FIRST, within ``timeout``; ``b""`` on a
+    timeout, refusal or silence.
+
+    A passive read: no bytes are sent, so it cannot drive a server-side action, and a service that
+    waits for the client to speak (HTTP) simply yields nothing and stays unidentified. Separated out
+    so the discover handler's probing stays testable by monkeypatching this one function."""
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=timeout)
+    except (OSError, asyncio.TimeoutError, TimeoutError):
+        return b""
+    try:
+        return await asyncio.wait_for(reader.read(_BANNER_MAX_BYTES), timeout=timeout) or b""
+    except (OSError, asyncio.TimeoutError, TimeoutError):
+        return b""
+    finally:
+        with contextlib.suppress(OSError):
+            writer.close()
+            await writer.wait_closed()
+
+
+async def _probe_specialist(ip: str, port: int, command: bytes, *, timeout: float) -> bytes:
+    """Open a connection, read and discard the greeting (the banner read already classified it), send
+    ONE bounded metadata command, and return its reply; ``b""`` on any failure.
+
+    This is the only place the discover path writes to a target, and it writes exactly one of the
+    allow-listed metadata commands (EHLO, FEAT), never DATA/MAIL/RCPT/STOR, so nothing is delivered
+    and no state changes. Separated out so the handler's active probing stays testable by
+    monkeypatching this one function."""
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=timeout)
+    except (OSError, asyncio.TimeoutError, TimeoutError):
+        return b""
+    try:
+        await asyncio.wait_for(reader.read(_BANNER_MAX_BYTES), timeout=timeout)  # greeting
+        writer.write(command)
+        await asyncio.wait_for(writer.drain(), timeout=timeout)
+        return await asyncio.wait_for(reader.read(_BANNER_MAX_BYTES), timeout=timeout) or b""
+    except (OSError, asyncio.TimeoutError, TimeoutError):
+        return b""
+    finally:
+        with contextlib.suppress(OSError):
+            writer.close()
+            await writer.wait_closed()
+
+
+# The active-specialist command for each protocol we enrich. Only SMTP and FTP today; a protocol with
+# no entry is left at passive identification, so nothing is written to it.
+_SPECIALIST_COMMANDS: dict[str, bytes] = {
+    "smtp": protocols.SMTP_EHLO_COMMAND,
+    "ftp": protocols.FTP_FEAT_COMMAND,
+}
+
+
+async def _specialist_capabilities(
+    ip: str, port: int, protocol_id: str | None, *, timeout: float
+) -> tuple[str, ...]:
+    """The capability tokens an active specialist reads for an identified service, or ``()``. For
+    SMTP this is the EHLO capability list (STARTTLS and friends); for FTP the FEAT feature list
+    (AUTH TLS and friends). Sorted for a deterministic observation. An unidentified service, or one
+    with no specialist, is never written to and returns ``()``."""
+    command = _SPECIALIST_COMMANDS.get(protocol_id or "")
+    if command is None:
+        return ()
+    reply = await _probe_specialist(ip, port, command, timeout=timeout)
+    if protocol_id == "smtp":
+        return tuple(sorted(protocols.smtp_ehlo_capabilities(reply)))
+    return tuple(sorted(protocols.ftp_feat_features(reply)))
+
+
+class _SnmpDatagramProtocol(asyncio.DatagramProtocol):
+    """Captures the first datagram a UDP endpoint receives into a future, so one bounded SNMP round
+    trip can await a single reply and then close."""
+
+    def __init__(self, future: asyncio.Future[bytes]) -> None:
+        self._future = future
+
+    def datagram_received(self, data: bytes, _addr: object) -> None:
+        if not self._future.done():
+            self._future.set_result(data)
+
+    def error_received(self, _exc: Exception) -> None:
+        # An ICMP port-unreachable surfaces here: it is "no SNMP answer", not an error to raise.
+        if not self._future.done():
+            self._future.set_result(b"")
+
+
+async def _snmp_round_trip(
+    ip: str, payload: bytes, *, request_id: int, timeout: float
+) -> snmp.SnmpGetResponse | None:
+    """Send one SNMP datagram to ``ip`` and parse the first reply within ``timeout``; ``None`` on a
+    timeout, an ICMP refusal, a socket error or a reply that is not our response. Separated from
+    ``_probe_snmp`` so the transport and the retry-per-community logic are each testable alone."""
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[bytes] = loop.create_future()
+    try:
+        transport, _ = await loop.create_datagram_endpoint(
+            lambda: _SnmpDatagramProtocol(future), remote_addr=(ip, snmp.SNMP_PORT)
+        )
+    except OSError:
+        return None
+    try:
+        transport.sendto(payload)
+        data = await asyncio.wait_for(future, timeout=timeout)
+    except (OSError, asyncio.TimeoutError, TimeoutError):
+        return None
+    finally:
+        transport.close()
+    if not data:
+        return None
+    return snmp.parse_snmp_response(data, expected_request_id=request_id)
+
+
+async def _probe_snmp(ip: str, *, timeout: float) -> snmp.SnmpGetResponse | None:
+    """One bounded, read-only SNMPv2c default-community probe of ``ip``: a GET for sysDescr.0 under
+    each well-known default community (at most two small datagrams), returning the first accepted
+    response or ``None``. A GET never changes device state and the community list is exactly the
+    documented defaults, so this is discovery of a misconfiguration, not credential guessing.
+    Separated out so the discover handler stays testable by monkeypatching it."""
+    for community in snmp.DEFAULT_COMMUNITIES:
+        request_id = secrets.randbelow(0x7FFFFFFE) + 1
+        payload = snmp.build_snmp_get(community=community, request_id=request_id)
+        response = await _snmp_round_trip(ip, payload, request_id=request_id, timeout=timeout)
+        if response is not None and response.accepted:
+            return response
+    return None
+
+
+def _scope_udp_hosts(scope: assessment_discover.DiscoverScope, *, cap: int) -> list[str]:
+    """In-scope individual host addresses to send a UDP probe to, capped so a UDP sweep never
+    outgrows the TCP sweep's own host ceiling."""
+    hosts: list[str] = []
+    for network in scope.networks:
+        for address in network.hosts():
+            ip = str(address)
+            if scope.in_scope(ip):
+                hosts.append(ip)
+                if len(hosts) >= cap:
+                    return hosts
+    return hosts
+
+
+async def _snmp_discover(scope: assessment_discover.DiscoverScope) -> list[dict]:
+    """Probe in-scope hosts for an SNMP agent that answers a default community, when the signed job
+    asked for it (``snmp.SNMP_DEFAULT_COMMUNITY_OP`` in its udp_operations). A responder becomes one
+    OPEN udp/161 observation with ``protocol_id = "snmp"`` (identification IS the finding the
+    ``net.snmp.default_community`` rule consumes); a non-responder is left silent, never reported as
+    closed, so a UDP no-response stays indeterminate rather than an implied clean."""
+    if snmp.SNMP_DEFAULT_COMMUNITY_OP not in scope.udp_operations:
+        return []
+    hosts = _scope_udp_hosts(scope, cap=settings.scan_max_hosts)
+    if not hosts:
+        return []
+
+    # A bounded worker pool, never one task per host: a large scope would otherwise materialise
+    # hundreds of thousands of tasks and sockets at once. At most `concurrency` probes are in flight.
+    queue: asyncio.Queue[str] = asyncio.Queue()
+    for ip in hosts:
+        queue.put_nowait(ip)
+    observations: list[dict] = []
+
+    async def _worker() -> None:
+        while True:
+            try:
+                ip = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            response = await _probe_snmp(ip, timeout=settings.scan_connect_timeout)
+            if response is None:
+                continue
+            descr = response.sys_descr or ""
+            observations.append(
+                assessment_discover.service_observation(
+                    address=ip,
+                    port=snmp.SNMP_PORT,
+                    transport="udp",
+                    outcome="open",
+                    protocol_id="snmp",
+                    banner_sha256=(
+                        hashlib.sha256(descr.encode("utf-8")).hexdigest() if descr else None
+                    ),
+                )
+            )
+
+    worker_count = min(max(1, _scan_limits["concurrency"]), len(hosts))
+    await asyncio.gather(*(_worker() for _ in range(worker_count)))
+    return observations
+
+
+async def _probe_discover_scope(scope: assessment_discover.DiscoverScope) -> list[dict] | None:
+    """Probe every in-scope network over the scope's ports, returning OPEN service observations, or
+    None if a pause landed first (the caller then hands the task back).
+
+    For each OPEN service a bounded, passive banner read identifies the protocol from what the
+    service EMITS (a telnet IAC negotiation, an SSH id string, an SMTP/FTP greeting), never from the
+    port: a service that answers with nothing distinctive stays ``protocol_id = None`` rather than
+    being guessed from the port it sits on. Every host is gated by ``scope.in_scope`` before it is
+    probed or counted, so an address outside the frozen scope is never reached even if the scanner,
+    handed a wider range, happened to see it."""
+    observations: list[dict] = []
+    for network in scope.networks:
+        hits = await _unless_paused(
+            asyncio.create_task(
+                scan.scan_cidr(
+                    str(network),
+                    list(scope.ports),
+                    timeout=settings.scan_connect_timeout,
+                    discovery_timeout=settings.scan_discovery_timeout,
+                    concurrency=_scan_limits["concurrency"],
+                    max_hosts=settings.scan_max_hosts,
+                    chunk_prefix=settings.scan_chunk_prefix,
+                )
+            )
+        )
+        if hits is None:
+            return None
+        for hit in hits:
+            ip, port = hit.get("ip"), hit.get("port")
+            if ip is None or port is None or not scope.in_scope(str(ip)):
+                continue
+            banner = await _read_banner(str(ip), int(port), timeout=settings.scan_connect_timeout)
+            protocol_id = protocols.identify_protocol(banner)
+            banner_sha256 = hashlib.sha256(banner).hexdigest() if banner else None
+            capabilities = await _specialist_capabilities(
+                str(ip), int(port), protocol_id, timeout=settings.scan_connect_timeout
+            )
+            observations.append(
+                assessment_discover.service_observation(
+                    address=str(ip),
+                    port=int(port),
+                    transport="tcp",
+                    outcome="open",
+                    protocol_id=protocol_id,
+                    banner_sha256=banner_sha256,
+                    capabilities=capabilities,
+                )
+            )
+    snmp_hits = await _unless_paused(asyncio.create_task(_snmp_discover(scope)))
+    if snmp_hits is None:
+        return None
+    observations.extend(snmp_hits)
+    return observations
+
+
+async def _run_assessment_discover(state: AgentState, token: str, task: dict) -> None:
+    """Run one signed Network Assessment discover job: verify, re-derive scope, probe, sign, submit.
+
+    Agent-first: the signed job is verified against the control plane's registered public keys
+    BEFORE any target field is read or any socket opened, so a forged, tampered or wrong-schema job
+    produces zero target activity and a typed rejection. The scope is then re-derived from the
+    VERIFIED job (never ambient config), every destination gated by ``scope.in_scope``, and the
+    result is signed with the agent's OWN enrolment key; the control plane verifies that signature
+    and binds the result to the frozen snapshot before persisting."""
+    task_id = task["id"]
+    envelope = (task.get("tool_config") or {}).get("envelope")
+    job = assessment.open_signed_job(
+        envelope,
+        public_keys=state.cp_assessment_public_keys or [],
+        domain=_DISCOVER_JOB_DOMAIN,
+        expected_schema=_DISCOVER_JOB_SCHEMA,
+    )
+    if job is None:
+        # Verified BEFORE task_started and BEFORE any probe: a job the agent cannot trust is refused
+        # with zero target activity. An empty key list (an agent that has not yet been told the
+        # control plane's keys) fails closed here too.
+        logger.warning("Refused assessment job %s: signature/schema verification failed", task_id)
+        await control_plane.task_failed(
+            settings, token, task_id, reason="signed assessment job failed verification"
+        )
+        return
+    if not state.signing_key_seed:
+        await control_plane.task_failed(
+            settings, token, task_id, reason="agent has no signing key to sign the result"
+        )
+        return
+    try:
+        scope = assessment_discover.derive_scope(job)
+    except ValueError as exc:
+        logger.warning("Refused assessment job %s: %s", task_id, exc)
+        await control_plane.task_failed(settings, token, task_id, reason=f"scope refused: {exc}")
+        return
+
+    await control_plane.task_started(settings, token, task_id)
+    try:
+        observations = await _probe_discover_scope(scope)
+        if observations is None:
+            logger.warning("Paused mid-discover; handing assessment task %s back.", task_id)
+            await _hand_back(token, task_id)
+            return
+        coverage = [
+            assessment_discover.coverage_entry(scope=str(network), state="assessed")
+            for network in scope.networks
+        ]
+        completed_at = datetime.now(UTC).isoformat()
+        result = assessment_discover.build_discover_result(
+            job,
+            services=observations,
+            coverage=coverage,
+            completed_at=completed_at,
+            partial=False,
+        )
+        sealed = assessment.seal_result(
+            result,
+            schema=assessment_discover.RESULT_SCHEMA,
+            seed_b64=state.signing_key_seed,
+            domain=assessment_discover.RESULT_DOMAIN,
+            signer_key_id=assessment.public_key_b64_from_seed(state.signing_key_seed),
+        )
+        await control_plane.submit_assessment_result(
+            settings, token, task_id, sealed, completed_at=completed_at
+        )
+        logger.info(
+            "Assessment discover %s: reported %d service(s) across %d network(s)",
+            task_id,
+            len(observations),
+            len(scope.networks),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - report any failure rather than dropping the task
+        logger.error("Assessment discover %s failed: %s", task_id, exc)
+        await control_plane.task_failed(
+            settings, token, task_id, reason=f"{type(exc).__name__}: {exc}"
+        )
+
+
+# The agent's HARD local ceilings for one credentialed collection: however generous the signed job's
+# budget is, a read on this box never waits longer or buys more than this. The control plane signs a
+# budget too (CollectBudgetV1), and the effective limit is the SMALLER of the two: the signed budget
+# can only ever tighten, never loosen, the agent's own bound. So a slow or chatty device cannot hang
+# the agent, and a forged-large budget cannot make it read unbounded either.
+_COLLECT_TIMEOUT_S = 20.0
+_COLLECT_MAX_BYTES = 2_000_000
+
+
+def _effective_collect_budget(job: dict) -> tuple[float, int]:
+    """(timeout_s, max_bytes) for the device read: the signed budget clamped to the agent ceilings.
+
+    Reads ``per_command_timeout_ms`` / ``max_received_bytes`` from the verified job's budget and
+    takes the smaller of each against the agent's own ceiling. A missing or malformed budget falls
+    back to the ceilings, so an older control plane that signs no budget still gets a bounded read."""
+    budget = job.get("budget")
+    timeout_s = _COLLECT_TIMEOUT_S
+    max_bytes = _COLLECT_MAX_BYTES
+    if isinstance(budget, dict):
+        ms = budget.get("per_command_timeout_ms")
+        if isinstance(ms, int) and ms > 0:
+            timeout_s = min(_COLLECT_TIMEOUT_S, ms / 1000)
+        cap = budget.get("max_received_bytes")
+        if isinstance(cap, int) and cap > 0:
+            max_bytes = min(_COLLECT_MAX_BYTES, cap)
+    return timeout_s, max_bytes
+
+
+async def _collect_neighbours(job: dict, credential, config: str, timeout_s: float, max_bytes: int):
+    """The device's LLDP neighbours, for the control plane's topology edges. Collected only for a
+    grammar that exposes LLDP (Arista); an FRR device has no LLDP daemon, so it reports none, which
+    the control plane records as an honest topology gap. A failed LLDP read is also no neighbours,
+    never a guess. Reported faithfully (management interfaces included); the control plane classifies
+    data-plane links apart from the shared management segment."""
+    if not vendor.has_lldp(config):
+        return []
+    try:
+        lldp_output = await ssh_collect.collect_lldp_output(
+            job["target_address"], credential, timeout=timeout_s, max_bytes=max_bytes
+        )
+    except Exception:  # noqa: BLE001 - a failed LLDP read is an honest topology gap, not a failure
+        return []
+    return [
+        assessment_collect.neighbour_entry(**neighbour)
+        for neighbour in vendor.collect_neighbours(config, lldp_output)
+    ]
+
+
+async def _collect_controls(
+    job: dict, control_ids: list[str], credential
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Read the device config ONCE, normalise it per control, and read its LLDP neighbours. Returns
+    (controls, coverage, neighbours).
+
+    No local credential, or a failed read, makes every requested control UNAVAILABLE (honest
+    coverage), never a guessed fact, and yields no neighbours. A control this agent's parser does not
+    support is UNSUPPORTED."""
+    target = job["target_address"]
+    if credential is None:
+        return (
+            [],
+            [
+                assessment_collect.coverage_entry(
+                    scope=f"{target}:{cid}", state="unavailable", reason_code="no_local_credential"
+                )
+                for cid in control_ids
+            ],
+            [],
+        )
+    timeout_s, max_bytes = _effective_collect_budget(job)
+    try:
+        config = await ssh_collect.collect_running_config(
+            target, credential, timeout=timeout_s, max_bytes=max_bytes
+        )
+    except Exception as exc:  # noqa: BLE001 - any connect/auth/read failure is honest UNAVAILABLE
+        reason = f"collect_failed:{type(exc).__name__}"
+        return (
+            [],
+            [
+                assessment_collect.coverage_entry(
+                    scope=f"{target}:{cid}", state="unavailable", reason_code=reason
+                )
+                for cid in control_ids
+            ],
+            [],
+        )
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    for control_id in control_ids:
+        fields = vendor.collect_control_fields(config, control_id)
+        if fields is None:
+            coverage.append(
+                assessment_collect.coverage_entry(
+                    scope=f"{target}:{control_id}", state="unsupported", reason_code="no_parser"
+                )
+            )
+            continue
+        controls.append(
+            assessment_collect.control_facts(control_id, fields, collection_complete=True)
+        )
+    neighbours = await _collect_neighbours(job, credential, config, timeout_s, max_bytes)
+    return controls, coverage, neighbours
+
+
+async def _run_assessment_collect(state: AgentState, token: str, task: dict) -> None:
+    """Run one signed credentialed COLLECT job: verify, resolve the LOCAL credential, read the
+    device config read-only, normalise to facts, sign and submit.
+
+    Agent-first: the signed job is verified against the control plane's keys BEFORE any field is
+    read or any session opened. The credential is resolved from the agent's OWN vault (the secret
+    never leaves the box); a reference the vault does not hold yields an honest UNAVAILABLE rather
+    than a failure. The result is signed with the agent's enrolment key."""
+    task_id = task["id"]
+    envelope = (task.get("tool_config") or {}).get("envelope")
+    job = assessment.open_signed_job(
+        envelope,
+        public_keys=state.cp_assessment_public_keys or [],
+        domain=assessment_collect.JOB_DOMAIN,
+        expected_schema=assessment_collect.JOB_SCHEMA,
+    )
+    if job is None:
+        logger.warning("Refused collect job %s: signature/schema verification failed", task_id)
+        await control_plane.task_failed(
+            settings, token, task_id, reason="signed collect job failed verification"
+        )
+        return
+    if not state.signing_key_seed:
+        await control_plane.task_failed(
+            settings, token, task_id, reason="agent has no signing key to sign the result"
+        )
+        return
+    try:
+        control_ids = assessment_collect.require_fields(job)
+    except ValueError as exc:
+        logger.warning("Refused collect job %s: %s", task_id, exc)
+        await control_plane.task_failed(settings, token, task_id, reason=f"malformed job: {exc}")
+        return
+
+    credential = CredentialVault(settings.credential_vault_path).resolve(job["credential_ref"])
+    await control_plane.task_started(settings, token, task_id)
+    try:
+        controls, coverage, neighbours = await _collect_controls(job, control_ids, credential)
+        completed_at = datetime.now(UTC).isoformat()
+        result = assessment_collect.build_collect_result(
+            job, controls=controls, coverage=coverage, neighbours=neighbours,
+            completed_at=completed_at, partial=not controls,
+        )
+        sealed = assessment.seal_result(
+            result,
+            schema=assessment_collect.RESULT_SCHEMA,
+            seed_b64=state.signing_key_seed,
+            domain=assessment_collect.RESULT_DOMAIN,
+            signer_key_id=assessment.public_key_b64_from_seed(state.signing_key_seed),
+        )
+        await control_plane.submit_assessment_result(
+            settings, token, task_id, sealed, completed_at=completed_at
+        )
+        logger.info(
+            "Assessment collect %s: %d control(s), %d coverage gap(s), %d neighbour(s) on %s",
+            task_id, len(controls), len(coverage), len(neighbours), job["target_address"],
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - report any failure rather than dropping the task
+        logger.error("Assessment collect %s failed: %s", task_id, exc)
+        await control_plane.task_failed(
+            settings, token, task_id, reason=f"{type(exc).__name__}: {exc}"
+        )
+
+
 def _detection_scope() -> str:
     """The settings a stored reachability answer is only good for (see AgentState.detected_scope).
 
@@ -906,6 +1475,22 @@ def _apply_auto_rescan(value: object, *, state: AgentState) -> None:
             "Automatic rescans turned off from the dashboard: keeping the networks already found "
             "and not probing again until they are turned back on."
         )
+
+
+def _apply_cp_assessment_keys(value: object, *, state: AgentState) -> None:
+    """Store the control plane's assessment signing public keys, as a register/heartbeat reported.
+
+    Only a list of strings counts. A response without the field (a control plane older than it)
+    changes nothing, so the agent keeps verifying against the last set it was told, and a key
+    rotation that reaches the fleet on the next beat replaces the set. Persisted with the identity
+    so a restart can verify a job before its first successful beat.
+    """
+    if not isinstance(value, list) or not all(isinstance(k, str) for k in value):
+        return
+    if value == state.cp_assessment_public_keys:
+        return
+    state.cp_assessment_public_keys = value
+    _persist(state)
 
 
 def _publish_reachable(networks: list[str], tunnel: TunnelManager | None) -> None:
@@ -1007,14 +1592,14 @@ async def _redetect_loop(state: AgentState, tunnel: TunnelManager | None = None)
         await asyncio.sleep(tick if delay is None else min(delay, tick))
 
 
-async def _work_through(token: str, tasks: list[dict]) -> None:
+async def _work_through(state: AgentState, token: str, tasks: list[dict]) -> None:
     """Run a polled batch in order. A poll claims several tasks at once, so a pause can land with
     some not yet started: those go straight back rather than sitting out their lease."""
     for task in tasks:
         if _paused.is_set():
             await _hand_back(token, task["id"])
             continue
-        await _run_task(token, task)
+        await _run_task(token, task, state=state)
 
 
 async def _poll_loop(state: AgentState) -> None:
@@ -1028,7 +1613,7 @@ async def _poll_loop(state: AgentState) -> None:
                     logger.info("Task polling recovered after %d failed attempt(s).", failures)
                     failures = 0
                 _record_contact()  # a successful poll is also live contact with Ares
-                await _work_through(state.agent_token or "", tasks)
+                await _work_through(state, state.agent_token or "", tasks)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - keep polling through any transient error

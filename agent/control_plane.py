@@ -79,7 +79,9 @@ def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-async def register(settings: Settings, *, networks: list[str], name: str) -> dict:
+async def register(
+    settings: Settings, *, networks: list[str], name: str, signing_public_key: str | None = None
+) -> dict:
     body = {
         "registration_token": settings.token.get_secret_value(),
         "internal_networks": networks,
@@ -87,6 +89,7 @@ async def register(settings: Settings, *, networks: list[str], name: str) -> dic
         "hostname": socket.gethostname(),
         "agent_version": settings.agent_version,
         "capabilities": capabilities(settings),
+        "signing_public_key": signing_public_key,
         "system_info": system_info(),
     }
     async with _client(settings) as client:
@@ -201,6 +204,31 @@ async def task_completed(
     async with _client(settings) as client:
         resp = await client.post(
             f"/api/v1/agent/tasks/{task_id}/complete",
+            json=body,
+            headers=_auth(token),
+        )
+    resp.raise_for_status()
+
+
+async def submit_assessment_result(
+    settings: Settings,
+    token: str,
+    task_id: str,
+    envelope: dict,
+    *,
+    completed_at: str | None = None,
+) -> None:
+    """Submit a signed Network Assessment discovery result: the sealed ``SignedEnvelope``.
+
+    The control plane verifies the signature against the agent's REGISTERED public key and binds the
+    result to the frozen snapshot before persisting, so a tamper in transit is refused there. The
+    agent only delivers; a non-2xx is raised so the task loop reports the failure."""
+    body: dict[str, object] = {"envelope": envelope}
+    if completed_at is not None:
+        body["completed_at"] = completed_at
+    async with _client(settings) as client:
+        resp = await client.post(
+            f"/api/v1/agent/tasks/{task_id}/assessment-result",
             json=body,
             headers=_auth(token),
         )
