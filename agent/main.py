@@ -952,6 +952,55 @@ async def _read_banner(ip: str, port: int, *, timeout: float) -> bytes:
             await writer.wait_closed()
 
 
+async def _probe_specialist(ip: str, port: int, command: bytes, *, timeout: float) -> bytes:
+    """Open a connection, read and discard the greeting (the banner read already classified it), send
+    ONE bounded metadata command, and return its reply; ``b""`` on any failure.
+
+    This is the only place the discover path writes to a target, and it writes exactly one of the
+    allow-listed metadata commands (EHLO, FEAT), never DATA/MAIL/RCPT/STOR, so nothing is delivered
+    and no state changes. Separated out so the handler's active probing stays testable by
+    monkeypatching this one function."""
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=timeout)
+    except (OSError, asyncio.TimeoutError, TimeoutError):
+        return b""
+    try:
+        await asyncio.wait_for(reader.read(_BANNER_MAX_BYTES), timeout=timeout)  # greeting
+        writer.write(command)
+        await asyncio.wait_for(writer.drain(), timeout=timeout)
+        return await asyncio.wait_for(reader.read(_BANNER_MAX_BYTES), timeout=timeout) or b""
+    except (OSError, asyncio.TimeoutError, TimeoutError):
+        return b""
+    finally:
+        with contextlib.suppress(OSError):
+            writer.close()
+            await writer.wait_closed()
+
+
+# The active-specialist command for each protocol we enrich. Only SMTP and FTP today; a protocol with
+# no entry is left at passive identification, so nothing is written to it.
+_SPECIALIST_COMMANDS: dict[str, bytes] = {
+    "smtp": protocols.SMTP_EHLO_COMMAND,
+    "ftp": protocols.FTP_FEAT_COMMAND,
+}
+
+
+async def _specialist_capabilities(
+    ip: str, port: int, protocol_id: str | None, *, timeout: float
+) -> tuple[str, ...]:
+    """The capability tokens an active specialist reads for an identified service, or ``()``. For
+    SMTP this is the EHLO capability list (STARTTLS and friends); for FTP the FEAT feature list
+    (AUTH TLS and friends). Sorted for a deterministic observation. An unidentified service, or one
+    with no specialist, is never written to and returns ``()``."""
+    command = _SPECIALIST_COMMANDS.get(protocol_id or "")
+    if command is None:
+        return ()
+    reply = await _probe_specialist(ip, port, command, timeout=timeout)
+    if protocol_id == "smtp":
+        return tuple(sorted(protocols.smtp_ehlo_capabilities(reply)))
+    return tuple(sorted(protocols.ftp_feat_features(reply)))
+
+
 class _SnmpDatagramProtocol(asyncio.DatagramProtocol):
     """Captures the first datagram a UDP endpoint receives into a future, so one bounded SNMP round
     trip can await a single reply and then close."""
@@ -1105,6 +1154,9 @@ async def _probe_discover_scope(scope: assessment_discover.DiscoverScope) -> lis
             banner = await _read_banner(str(ip), int(port), timeout=settings.scan_connect_timeout)
             protocol_id = protocols.identify_protocol(banner)
             banner_sha256 = hashlib.sha256(banner).hexdigest() if banner else None
+            capabilities = await _specialist_capabilities(
+                str(ip), int(port), protocol_id, timeout=settings.scan_connect_timeout
+            )
             observations.append(
                 assessment_discover.service_observation(
                     address=str(ip),
@@ -1113,6 +1165,7 @@ async def _probe_discover_scope(scope: assessment_discover.DiscoverScope) -> lis
                     outcome="open",
                     protocol_id=protocol_id,
                     banner_sha256=banner_sha256,
+                    capabilities=capabilities,
                 )
             )
     snmp_hits = await _unless_paused(asyncio.create_task(_snmp_discover(scope)))

@@ -157,11 +157,13 @@ def service_observation(
     outcome: str,
     protocol_id: str | None = None,
     banner_sha256: str | None = None,
+    capabilities: tuple[str, ...] = (),
 ) -> dict:
     """One ``DiscoveredService`` entry, validated to the exact shape the control plane admits. The
     outcome is kept honest (a timeout is not a refusal is not open); ``protocol_id`` /
     ``banner_sha256`` are set only when a specialist actually read something, never inferred from
-    the port."""
+    the port. ``capabilities`` are the tokens an active specialist read (SMTP EHLO, FTP FEAT), empty
+    when no specialist ran or none was read, so the absence of one is never read as a finding."""
     if transport not in ("tcp", "udp"):
         raise ValueError(f"transport must be tcp or udp, not {transport!r}")
     if not (1 <= port <= _MAX_PORT):
@@ -175,6 +177,7 @@ def service_observation(
         "outcome": outcome,
         "protocol_id": protocol_id,
         "banner_sha256": banner_sha256,
+        "capabilities": list(capabilities),
     }
 
 

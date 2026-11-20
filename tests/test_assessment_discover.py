@@ -106,6 +106,7 @@ def test_build_result_carries_the_job_binding_and_exact_shape() -> None:
         "outcome",
         "protocol_id",
         "banner_sha256",
+        "capabilities",
     }
 
 
