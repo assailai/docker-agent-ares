@@ -58,6 +58,26 @@ The Ares Agent implements multiple layers of security:
 - Images signed with keyless cosign (Sigstore/OIDC); the companion updater cosign-verifies the target digest before applying an update
 - Regular Docker Scout vulnerability scanning
 
+### Update Integrity
+- The companion updater applies only an image cosign verifies against this repository's build
+  workflow at `refs/heads/main`, and applies the digest that was attested rather than re-resolving
+  the tag
+- A signature proves the artifact, not that the version is the current one, so the updater
+  separately refuses any target that is not a plain `x.y.z` release, and any release older than
+  the one the updater itself was built as. `ARES_UPDATE_ALLOW_DOWNGRADE=true` lets an operator
+  move the agent back to an older release deliberately; nothing admits a non-release target
+- Known limitation, Kubernetes: the updater is a container in the Deployment it patches, and the
+  shipped manifest uses `strategy: Recreate` (a ReadWriteOnce PVC cannot attach to two pods at
+  once). Its own patch therefore usually terminates it, so **the automatic restore does not run on
+  that topology**; recovery from a bad rollout is `kubectl rollout undo`. What the updater does
+  guarantee there is that a failed rollout is never recorded as applied: the replacement sidecar
+  reads the Deployment's *status*, not its spec, so it keeps reporting the update as unfinished
+  instead of silently believing it succeeded. On Docker and Podman the updater is a separate
+  container, and it does restore the previous image itself
+- Known limitation, downgrade floor: the floor is the updater's own release, so with
+  `ARES_UPDATE_SELF_UPDATE=false` it stays at the release the updater was installed as while the
+  agent moves past it. The updater says so in its startup log
+
 ### Authentication
 - bcrypt password hashing (cost factor 12)
 - Secure session management with HttpOnly cookies

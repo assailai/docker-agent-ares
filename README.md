@@ -124,19 +124,26 @@ ARES_TOKEN=<your-registration-token> bash <(curl -fsSL https://raw.githubusercon
 It also accepts the token as an argument or prompts for it interactively. Works on macOS, Linux,
 and Windows (Git Bash / WSL).
 
-Fetch it from the release tag, not from `main`: a tag is immutable, so a command you issued last
-month still runs the script that was reviewed for that release. The dashboard's install command
-pins the current one for you. To check the script before running it:
+Fetch it from the release tag, not from `main`, so that a command you issued last month still runs
+the script that was reviewed for that release rather than whatever `main` holds today. A git tag is
+movable by default; the `v*` tags on this repository are protected by a ruleset that refuses
+updates and deletions, so `v3.15.0` names one commit permanently. The dashboard's install command
+pins the current release for you.
+
+To read the script before running it, fetch it and compare it with the tag in git, which is the
+same object the ruleset protects:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.0/scripts/bootstrap.sh
-shasum -a 256 bootstrap.sh   # compare against the checksum on the v3.15.0 release page
+git -c advice.detachedHead=false clone --depth 1 --branch v3.15.0 \
+    https://github.com/assailai/docker-agent-ares /tmp/ares-v3.15.0
+diff bootstrap.sh /tmp/ares-v3.15.0/scripts/bootstrap.sh && echo "matches the tag"
 ```
 
 Before it starts anything, the installer cosign-verifies both images against the Ares publisher
 and then runs the verified **digest** rather than the tag. It fails closed: if it cannot verify,
 nothing is started. That means a host which cannot reach ghcr.io (for cosign), Fulcio or Rekor
-will fail the install rather than quietly proceed — point `ARES_COSIGN_IMAGE` at an internal
+will fail the install rather than quietly proceed. Point `ARES_COSIGN_IMAGE` at an internal
 mirror of `ghcr.io/sigstore/cosign/cosign` if that is your situation.
 
 ### Option D: Kubernetes
@@ -399,10 +406,11 @@ will see the other two named on the trust line:
 INFO ares.agent TLS trust: image store, certifi, /host-ca (1 file); skipped as not TLS server-auth: /host-ca/email-ca-bundle.pem, /host-ca/objsign-ca-bundle.pem
 ```
 
-That is normal, not an error — it is why a three-file mount reports one file. An inspection root
+That is normal, not an error: it is why a three-file mount reports one file. An inspection root
 installed the ordinary way (`update-ca-trust`) is written into all three bundles, so it is in the
-TLS one and still trusted. To trust a root the host deliberately keeps out of TLS, name the file
-with `ARES_CA_BUNDLE`: what the agent *discovers* is filtered, what you point it at is not.
+TLS one and still trusted. To trust a root the host deliberately keeps out of TLS, point
+`ARES_CA_BUNDLE` at that **file**: a named file is taken as given, while a named directory is
+looked through and filtered like any other mount.
 
 Both halves of the agent are covered: the control plane and the `wss://` data-plane tunnel that
 live missions run over. `bash scripts/e2e_tls_inspection.sh` proves it against a real mitmproxy,
@@ -558,7 +566,7 @@ Notes:
   artifact, not that the version is the current one, so without this an old but genuinely signed
   release would reintroduce every vulnerability fixed since. The updater refuses a target older
   than its own release, and refuses one that is no release at all (`latest`, a `sha-...` build, a
-  branch tag — CI signs those too). For a deliberate rollback, set
+  branch tag; CI signs those too). For a deliberate rollback, set
   `ARES_UPDATE_ALLOW_DOWNGRADE=true` on the updater, or reinstall at the version you want
   (`ARES_VERSION=3.14.3 bash scripts/bootstrap.sh`). It never lets the updater move *itself* back:
   one taken below 3.14.0 could never update itself again.
@@ -575,8 +583,8 @@ Notes:
   ```
 
   The identity names `refs/heads/main` and nothing else. `main` is the protected branch, so a
-  release signed under it was reviewed; tag refs are not protected — anyone with push access can
-  create one — so from 3.15.0 they are no longer trusted, and no workflow builds release images
+  release signed under it was reviewed. Tag refs are not protected, since anyone with push access
+  can create one, so from 3.15.0 they are no longer trusted and no workflow builds release images
   from a tag push.
 
   If this fails while the image is genuinely published, the expected signer identity has drifted from
@@ -650,7 +658,7 @@ We use [Semantic Versioning](https://semver.org/). For available versions, see t
 ### Cutting a release
 
 Dependencies first, if you changed any: `requirements.txt` and `requirements-updater.txt` hold
-the direct pins, and the `*-lock.txt` beside each is generated from it — regenerate with the
+the direct pins, and the `*-lock.txt` beside each is generated from it. Regenerate with the
 command in the lock's own header, or the build fails on a hash it was not given.
 
 `agent/__version__.py` is the trigger. Bump it, move the pins that name the old version

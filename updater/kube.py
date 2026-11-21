@@ -12,6 +12,25 @@ rollout to come up *and stay up*, and put the previous images back when it does 
 The updater is a container in that same Deployment, so it updates itself the same way: when both
 the agent and the updater are behind, one patch sets both images and the pod rolls once. Nothing
 like the Docker handoff is needed, because k8s replaces the whole pod.
+
+**What that costs, stated plainly.** The updater lives in the pod it is patching, and ``Recreate``
+tears the whole pod down before building the new one. So on the shipped topology the PATCH below
+is very often the last thing this process does - for an agent-only patch as much as for a combined
+one - and :func:`_await_rollout` and the restore after it never run. They are not dead code: a
+Deployment on ``RollingUpdate`` (no RWO PVC) keeps the old pod alive through the gate, and the
+Docker backend has always run its own. But on the manifest in ``deploy/k8s`` the honest claim is
+not "this rolls a failed update back", it is:
+
+* the rollout is still gated, by :func:`running_image` - the successor sidecar comes up, sees a
+  Deployment that is not rolled out, reports no running image and so records nothing as applied.
+  A failed rollout therefore stays visibly unfinished and is retried, instead of reading as "already
+  current" forever off the Deployment *spec*, which is what it did before ARES-2327; and
+* recovery is ``kubectl rollout undo``, by an operator, on a Deployment whose history says exactly
+  what changed.
+
+Making the restore survive its own pod needs the previous images written somewhere that outlives
+the process - a Deployment annotation set in the same PATCH, reconciled by whoever comes up next.
+That is ARES-2337, not this change.
 """
 
 from __future__ import annotations
