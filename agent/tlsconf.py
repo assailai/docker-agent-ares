@@ -50,7 +50,6 @@ _PEM_SUFFIXES = frozenset({".crt", ".pem", ".cer"})
 # make a root the host trusts only for S/MIME or code signing a valid issuer for the control
 # plane's certificate, which is an on-path attacker's way in. These two names are how we tell the
 # difference without parsing certificates (see _server_auth_only for why we do not).
-_TLS_BUNDLE_NAME = "tls-ca-bundle.pem"
 _NON_TLS_BUNDLE_PREFIXES = ("email-ca-bundle", "objsign-ca-bundle")
 
 
@@ -117,12 +116,15 @@ def _pems_in(directory: Path) -> list[Path]:
 def _server_auth_only(paths: list[Path]) -> tuple[list[Path], list[Path]]:
     """Split one directory's PEMs into (trusted for TLS server auth, extracted for another purpose).
 
-    Two halves. ``tls-ca-bundle.pem`` is written by exactly one thing,
-    ``p11-kit extract --purpose server-auth``, so its presence means this directory is a set of
-    per-purpose extracts *and* that the server-auth answer is sitting right there: take only it,
-    and a fourth extract nobody has invented yet is excluded by construction. Everywhere else, fall
-    back to declining the two non-TLS names, which still catches a half-copied directory that has
-    ``email-ca-bundle.pem`` without its TLS sibling. Prefix match, so ``.trust.crt`` variants go too.
+    One rule: decline the two names a host writes for a purpose that is not TLS server auth. Prefix
+    match rather than exact, so ``.trust.crt`` variants go too.
+
+    Deliberately *not* "if this directory holds tls-ca-bundle.pem, take only that file". That reads
+    the RHEL extract layout correctly and every other directory wrongly: a ``/certs`` drop-in that
+    happens to carry a file by that name alongside an operator's own roots would silently lose them
+    on upgrade, and losing a root the operator put there by hand is a worse failure than the one
+    being fixed. On the RHEL directory the two rules select the same file anyway, since the only
+    other things there are the two names declined below (ARES-2327 review).
 
     This selects **files**, never certificates, which is what keeps TLS inspection working: a
     corporate root installed the ordinary RHEL way carries no purpose restriction, so
@@ -139,16 +141,10 @@ def _server_auth_only(paths: list[Path]) -> tuple[list[Path], list[Path]]:
     Order is preserved and the two lists together are the input, so a caller can report what it
     declined instead of dropping it silently.
     """
-    extracts = any(path.name == _TLS_BUNDLE_NAME for path in paths)
     keep: list[Path] = []
     skipped: list[Path] = []
     for path in paths:
-        eligible = (
-            path.name == _TLS_BUNDLE_NAME
-            if extracts
-            else not path.name.startswith(_NON_TLS_BUNDLE_PREFIXES)
-        )
-        (keep if eligible else skipped).append(path)
+        (skipped if path.name.startswith(_NON_TLS_BUNDLE_PREFIXES) else keep).append(path)
     return keep, skipped
 
 
@@ -167,10 +163,11 @@ def _candidate_files(ca_bundle: str) -> tuple[list[Path], list[Path]]:
     if not ca_bundle:
         return candidates, skipped
     # ARES_CA_BUNDLE takes a file or a directory, because operators reasonably expect both. A
-    # named file is passed through unfiltered, suffix and all: they told us to trust it, and a
-    # path that turns out not to exist should say so rather than vanish. That is also the escape
-    # hatch for anyone who genuinely wants a root the host extracts for another purpose - we filter
-    # what we *discover*, never what we were pointed at.
+    # named FILE is passed through unfiltered, suffix and all: they told us to trust that one
+    # thing, and a path that turns out not to exist should say so rather than vanish. That is the
+    # escape hatch for anyone who genuinely wants a root the host extracts for another purpose, and
+    # it is a file-only escape hatch: a named DIRECTORY is still a directory to look through, so it
+    # is filtered exactly like the mounts above. The README says "name the file" for this reason.
     configured = Path(ca_bundle)
     if not configured.is_dir():
         return candidates + [configured], skipped

@@ -196,11 +196,35 @@ def test_given_an_inspection_root_in_every_extract_then_it_is_still_trusted(
     assert "an-email-only-root.test" not in trusted
 
 
+def test_given_a_tls_bundle_beside_other_roots_then_the_other_roots_survive(
+    _isolate_trust: tuple[Path, Path],
+) -> None:
+    """The regression an earlier shape of this rule introduced, caught on review.
+
+    "If the directory holds tls-ca-bundle.pem, take only that file" reads the RHEL extract layout
+    correctly and a /certs drop-in wrongly: an operator who put their own root next to a file by
+    that name would lose it on upgrade, silently, and a root someone installed by hand is the one
+    thing here that has no other copy. The two rules agree on the RHEL directory anyway.
+    """
+    host_ca, extra = _isolate_trust
+    _, from_bundle = _write_ca(extra, "bundled-root", filename="tls-ca-bundle.pem")
+    _, from_drop_in = _write_ca(extra, "an-operators-own-root")
+
+    trust = _build()
+
+    assert [path.name for path in trust.loaded] == [
+        "an-operators-own-root.crt",
+        "tls-ca-bundle.pem",
+    ]
+    assert trust.skipped == ()
+    assert {from_bundle, from_drop_in} <= _organizations(trust.context)
+
+
 def test_given_a_non_tls_extract_without_its_tls_sibling_then_it_is_still_declined(
     _isolate_trust: tuple[Path, Path],
 ) -> None:
-    """A half-copied extract directory, or a ConfigMap built from two of the three files. The
-    whitelist half has nothing to trigger on, so the name rule has to carry it."""
+    """A half-copied extract directory, or a ConfigMap built from two of the three files. There is
+    no TLS sibling to anchor on, so the name rule is the whole of it."""
     host_ca, _ = _isolate_trust
     _, email = _write_ca(host_ca, "email-root", filename="email-ca-bundle.pem")
     _, corp = _write_ca(host_ca, "corp-root")
