@@ -119,6 +119,13 @@ def _release_key(version: str) -> tuple[int, int, int] | None:
     return (int(match[1]), int(match[2]), int(match[3])) if match else None
 
 
+def _own_release() -> str | None:
+    try:
+        return _RELEASE_FILE.read_text().strip() or None
+    except OSError:
+        return None  # not an image build: a checkout, or the tests
+
+
 def _floor() -> tuple[int, int, int] | None:
     """The release the agent is not taken below, or None when the guard is off entirely.
 
@@ -128,13 +135,6 @@ def _floor() -> tuple[int, int, int] | None:
     one, and ``main`` says so at startup if one ever reaches a host anyway.
     """
     return _release_key(_own_release() or "")
-
-
-def _own_release() -> str | None:
-    try:
-        return _RELEASE_FILE.read_text().strip() or None
-    except OSError:
-        return None  # not an image build: a checkout, or the tests
 
 
 def _is_backwards(target: str) -> bool:
