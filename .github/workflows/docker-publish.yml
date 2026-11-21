@@ -1,11 +1,13 @@
 name: Build and Publish Docker Image
 
+# No `tags: v*` trigger. Anyone with push access can create a tag, and that run would have
+# reached the Docker Hub credentials and signed an image under a release tag with the identity the
+# whole fleet trusts - without the commit ever being reviewed on main. auto-tag.yml is the one
+# producer of release images, and it only runs on a merge to the protected branch.
 on:
   push:
     branches:
       - main
-    tags:
-      - 'v*'
   pull_request:
     branches:
       - main
@@ -13,20 +15,21 @@ on:
 
 jobs:
   build:
+    # main only for a manual dispatch too. A dispatch runs the workflow files as they exist on the
+    # chosen ref, so this guard alone does not stop someone who can push a branch from editing it
+    # out - but an image signed at refs/heads/<their-branch> is not an identity the updater trusts
+    # (see updater/config.py), and the Docker Hub credentials live in the `release` environment.
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     permissions:
       contents: read
       id-token: write   # allow the reusable workflow to request an OIDC token for cosign
     uses: ./.github/workflows/docker-build.yml
     with:
       # Branch name (e.g. main), PR ref, short sha, and `latest` on the default branch.
-      # The semver lines only fire when a human pushes a v* tag directly; auto-created
-      # tags don't re-trigger this workflow, so auto-tag.yml builds those images itself.
+      # No semver lines: release tags have exactly one producing path, auto-tag.yml.
       meta_tags: |
         type=ref,event=branch
         type=ref,event=pr
-        type=semver,pattern={{version}}
-        type=semver,pattern={{major}}.{{minor}}
-        type=semver,pattern={{major}}
         type=sha,prefix=
         type=raw,value=latest,enable={{is_default_branch}}
       push: ${{ github.event_name != 'pull_request' }}

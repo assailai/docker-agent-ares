@@ -548,3 +548,99 @@ def test_every_install_path_pins_the_release_being_cut() -> None:
         assert set(found) == {expected}, (
             f"{path} pins {found}, but agent/__version__.py is {expected}"
         )
+
+
+# --- install-time verification: the updater gets the engine socket, so it is checked first ------
+
+
+def test_the_installer_verifies_both_images_before_anything_starts() -> None:
+    # The updater is handed the engine socket, which is the host. Before ARES-2327 the installer
+    # pulled it by a mutable tag with no check at all, so write access to the Docker Hub
+    # repositories was write access to the next host that installed - and the substituted updater
+    # then decided every later verification.
+    script = BOOTSTRAP.read_text()
+    order = [script.find(name) for name in ("verify_images", "start_container", "start_updater")]
+    assert -1 not in order, "the installer no longer verifies the images"
+    # the calls in main(), not the definitions and not the comments around them
+    main_body = script[script.rindex("\nmain() {") :]
+    steps = [
+        line.strip()
+        for line in main_body.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    calls = [steps.index(name) for name in ("verify_images", "start_container", "start_updater")]
+    assert calls == sorted(calls), "verification does not run before the containers start"
+
+
+def test_nothing_is_destroyed_before_the_images_are_verified() -> None:
+    # Verification is fail-closed and reaches ghcr.io, Fulcio and Rekor, so it is now a step that
+    # can fail on a healthy host behind a strict proxy. reset_state deletes the data volume this
+    # host's agent identity lives in. In that order a blocked install would take the identity with
+    # it and leave nothing running to go back to (ARES-2327 review).
+    main_body = BOOTSTRAP.read_text()
+    main_body = main_body[main_body.rindex("\nmain() {") :]
+    steps = [
+        line.strip()
+        for line in main_body.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert steps.index("verify_images") < steps.index("reset_state")
+
+
+def test_the_installer_runs_the_digest_it_verified() -> None:
+    # Verifying a tag and then running that tag is a TOCTOU: the registry can repoint it in
+    # between. verify_image prints the digest reference and verify_images writes it back over
+    # $IMAGE / $UPDATER_IMAGE, so what starts is the artifact that was checked.
+    script = BOOTSTRAP.read_text()
+    assert 'digest="${repo}@${sha}"' in script, "verify_image does not build a digest reference"
+    assert "printf -v \"$which\" '%s' \"$verified\"" in script, (
+        "the verified digest is not written back over the image reference"
+    )
+
+
+def test_the_installer_does_not_let_the_updater_vouch_for_itself() -> None:
+    # cosign comes from Sigstore, pinned by digest - not from the ares-updater image, which is one
+    # of the two things being checked. A substituted updater must not supply its own auditor.
+    script = BOOTSTRAP.read_text()
+    cosign = re.search(r'^COSIGN_IMAGE="\$\{ARES_COSIGN_IMAGE:-(\S+?)\}"', script, re.M)
+    assert cosign, "no cosign image pinned for install-time verification"
+    assert re.search(r"@sha256:[0-9a-f]{64}$", cosign.group(1)), cosign.group(1)
+    assert "ares-updater" not in cosign.group(1)
+
+
+def test_the_installer_has_no_way_to_skip_verification() -> None:
+    # Fail-closed on purpose. An override would be read by exactly the install this protects: an
+    # automated one, on a host where nobody sees the warning. ARES_COSIGN_IMAGE changes WHICH
+    # cosign runs (an internal mirror), never whether one does.
+    script = BOOTSTRAP.read_text()
+    assert not re.search(r"ARES_(SKIP|NO|DISABLE)_(IMAGE_)?VERIF", script), (
+        "the installer has a flag that skips signature verification"
+    )
+
+
+def test_the_installer_checks_the_same_signer_the_updater_does() -> None:
+    # Two copies of one regexp, in a shell script and in Python. They must agree, or an install
+    # accepts something the running updater would later refuse (or the other way round).
+    from updater.config import UpdaterSettings
+
+    script = BOOTSTRAP.read_text()
+    identity = re.search(r"^COSIGN_IDENTITY='(.+)'$", script, re.M)
+    issuer = re.search(r'^COSIGN_ISSUER="(.+)"$', script, re.M)
+    assert identity and issuer, "the installer does not pin a signer identity and issuer"
+
+    settings = UpdaterSettings()
+    assert identity.group(1) == settings.cosign_identity
+    assert issuer.group(1) == settings.cosign_issuer
+
+
+def test_the_installer_gives_cosign_the_host_cas_without_narrowing_its_trust() -> None:
+    # cosign has to reach the registry, Fulcio and Rekor through the same inspecting proxy as
+    # everything else. Go reads SSL_CERT_FILE and SSL_CERT_DIR, and naming only the host's file
+    # would REPLACE the image's public roots - which would break the Sigstore endpoints and fail
+    # every install behind a proxy, fail-closed, with a signature error that is not one.
+    script = BOOTSTRAP.read_text()
+    helper = script[script.index("cosign_ca_args() {") : script.index("# Pull an image,")]
+    assert "/host-ca:ro" in helper
+    assert "SSL_CERT_DIR=/etc/ssl/certs" in helper, "the image's own roots are dropped"
+    # and the same purpose rule the agent and updater use: only the TLS extract on RHEL
+    assert "tls-ca-bundle.pem" in helper

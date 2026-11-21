@@ -15,18 +15,29 @@
 # -----------------------------------------------------------------------------
 # Stage 1: build Python wheels
 # -----------------------------------------------------------------------------
-FROM python:3.12-alpine AS python-builder
+# python 3.12.16 on alpine 3.24, by the multi-arch index digest so the registry cannot decide the
+# base layers at build time. `apk upgrade` below still ships Alpine's current packages - the ADD of
+# the package index is a cache key, not a repo - so pinning costs no freshness, it just means the
+# base moves through a reviewed Dependabot commit instead of silently.
+FROM python:3.12-alpine@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89 AS python-builder
 
 RUN apk add --no-cache gcc musl-dev libffi-dev openssl-dev
 
 WORKDIR /build
-COPY requirements.txt .
-RUN pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
+# The lock, not requirements.txt: it pins the transitive packages too and carries a hash for every
+# artifact. --require-hashes makes pip refuse anything the lock does not name, so a compromised
+# upstream cannot put a new version of h11, httpcore or anyio into a signed image on build day.
+COPY requirements-lock.txt .
+RUN pip wheel --no-cache-dir --require-hashes --wheel-dir /wheels -r requirements-lock.txt
 
 # -----------------------------------------------------------------------------
 # Stage 2: minimal runtime
 # -----------------------------------------------------------------------------
-FROM python:3.12-alpine
+# python 3.12.16 on alpine 3.24, by the multi-arch index digest so the registry cannot decide the
+# base layers at build time. `apk upgrade` below still ships Alpine's current packages - the ADD of
+# the package index is a cache key, not a repo - so pinning costs no freshness, it just means the
+# base moves through a reviewed Dependabot commit instead of silently.
+FROM python:3.12-alpine@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89
 
 LABEL org.opencontainers.image.title="Ares Docker Agent"
 LABEL org.opencontainers.image.source="https://github.com/assailai/ares-agent"

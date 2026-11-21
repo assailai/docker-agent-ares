@@ -8,7 +8,9 @@
 #   1.0.2 -> 9.9.9   the 9.9.9 updater crashes on start: the agent moves, the 1.0.2 updater stays
 #                    in charge and leaves nothing behind
 #   self-update off  ARES_UPDATE_SELF_UPDATE=false moves the agent only
-#   1.0.1 -> 1.0.0   an older release moves the agent back and never the updater
+#   1.0.2 -> 1.0.0   an older release is refused: nothing moves
+#   1.0.2 -> 1.0.0   with ARES_UPDATE_ALLOW_DOWNGRADE, the agent moves back and never the
+#                    updater
 #
 # signature checks are off: these images are built here, unsigned. The cosign gate is the same
 # verify() path for the updater as for the agent, covered by tests/test_updater.py and exercised by
@@ -154,21 +156,41 @@ else
     updater_logs
 fi
 
+# The updater runs 1.0.1 and the target is 1.0.2, so the move is FORWARD: the agent's rollback
+# floor is the updater's own release, and a 1.0.2 updater would refuse to take the agent to 1.0.1.
 echo "==> Test 4: ARES_UPDATE_SELF_UPDATE=false moves the agent only"
-start_updater 1.0.2 -e ARES_UPDATE_SELF_UPDATE=false
-target 1.0.1
-if wait_for 120 "agent on 1.0.1" sh -c "[ \"\$(docker inspect -f '{{.Config.Image}}' $AGENT)\" = '$REG/ares-agent:1.0.1' ]"; then
+start_updater 1.0.1 -e ARES_UPDATE_SELF_UPDATE=false
+target 1.0.2
+if wait_for 120 "agent on 1.0.2" sh -c "[ \"\$(docker inspect -f '{{.Config.Image}}' $AGENT)\" = '$REG/ares-agent:1.0.2' ]"; then
     sleep 6  # several poll intervals: long enough for a handoff it should not start
-    [ "$(image_of "$UPDATER")" = "$REG/ares-updater:1.0.2" ] && [ -z "$(leftovers)" ] &&
-        ok "the agent moved to 1.0.1 and the updater stayed on 1.0.2" ||
+    [ "$(image_of "$UPDATER")" = "$REG/ares-updater:1.0.1" ] && [ -z "$(leftovers)" ] &&
+        ok "the agent moved to 1.0.2 and the updater stayed on 1.0.1" ||
         bad "updater=$(image_of "$UPDATER") leftovers=$(leftovers | tr '\n' ' ')"
 else
     bad "agent=$(image_of "$AGENT")"
     updater_logs
 fi
 
-echo "==> Test 5: an older release moves the agent back, and never the updater"
+# The version handoff is the untrusted half of the chain, and these images ARE validly signed in
+# production: naming an old release is the downgrade attack the signature cannot see.
+echo "==> Test 5: an older release is refused by default"
 start_updater 1.0.2
+BEFORE="$(image_of "$AGENT")"   # whatever Test 4 left: the point is that it does not change
+target 1.0.0
+refused() { docker logs "$UPDATER" 2>&1 | grep -q "refusing to move the agent to 1.0.0"; }
+if wait_for 30 "the updater to refuse the older release" refused; then
+    sleep 6  # several poll intervals: long enough for a move it should not make
+    [ "$(image_of "$AGENT")" = "$BEFORE" ] &&
+        [ "$(image_of "$UPDATER")" = "$REG/ares-updater:1.0.2" ] && [ -z "$(leftovers)" ] &&
+        ok "nothing moved: the agent stayed on $BEFORE and the updater on 1.0.2" ||
+        bad "agent=$(image_of "$AGENT") (was $BEFORE) updater=$(image_of "$UPDATER") leftovers=$(leftovers | tr '\n' ' ')"
+else
+    bad "agent=$(image_of "$AGENT")"
+    updater_logs
+fi
+
+echo "==> Test 6: ARES_UPDATE_ALLOW_DOWNGRADE moves the agent back, and never the updater"
+start_updater 1.0.2 -e ARES_UPDATE_ALLOW_DOWNGRADE=true
 target 1.0.0
 if wait_for 120 "agent on 1.0.0" sh -c "[ \"\$(docker inspect -f '{{.Config.Image}}' $AGENT)\" = '$REG/ares-agent:1.0.0' ]"; then
     declined() { docker logs "$UPDATER" 2>&1 | grep -q "rather than moving back to 1.0.0"; }
