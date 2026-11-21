@@ -7,8 +7,10 @@ version: 2
 # cosign included, and that is what flags a stale one. The golang image that builds it IS covered,
 # by the docker entry below, so the Go standard library compiled into cosign keeps moving.
 updates:
-  # requirements.txt and requirements-updater.txt share pins; tests/test_image_pins.py fails a bump
-  # that moves one and not the other
+  # Covers requirements.txt / requirements-updater.txt AND the generated *-lock.txt beside them,
+  # which is why those are named .txt rather than .lock: locking the transitive set would otherwise
+  # have cost exactly the Dependabot coverage it was meant to extend. All four share pins, and
+  # tests/test_image_pins.py fails a bump that moves one file and not the others.
   - package-ecosystem: pip
     directory: "/"
     schedule: { interval: weekly }
@@ -19,8 +21,9 @@ updates:
       python-minor-patch:
         update-types: [minor, patch]
 
-  # not grouped: both Dockerfiles use python:3.12-alpine, a tag with no patch number, so its
-  # proposals are interpreter upgrades (3.12 -> 3.13) and should arrive on their own; the cosign
+  # not grouped: both Dockerfiles use python:3.12-alpine, now pinned by digest, so its proposals
+  # are the base rebuilds this repository must adopt deliberately (and interpreter upgrades,
+  # 3.12 -> 3.13, which should arrive on their own); the cosign
   # builder's golang image is pinned to a patch and a digest, so its proposals are toolchain bumps
   - package-ecosystem: docker
     directory: "/"

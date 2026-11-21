@@ -47,7 +47,12 @@ class Backend(Protocol):
         """Remove an updater that handed over to this one but failed to remove itself."""
         ...
 
-    def apply(self, settings: UpdaterSettings, plan: UpdatePlan) -> None:
-        """Move the agent, then this updater, to the plan's images. A Docker handoff that succeeds
-        ends this process; returning means the updater was not replaced."""
+    def apply(self, settings: UpdaterSettings, plan: UpdatePlan) -> bool:
+        """Move the agent, then this updater, to the plan's images.
+
+        True when the agent reached the plan's image, or there was none to move. False when the
+        move was refused or undone and the image the agent was on still stands, which is what
+        tells the caller not to record the target as applied. A Docker handoff that succeeds ends
+        this process; returning at all means the updater was not replaced.
+        """
         ...

@@ -118,11 +118,33 @@ The bootstrap script checks Docker is available, starts the container, and waits
 reports online:
 
 ```bash
-ARES_TOKEN=<your-registration-token> bash <(curl -fsSL https://raw.githubusercontent.com/assailai/ares-agent/main/scripts/bootstrap.sh)
+ARES_TOKEN=<your-registration-token> bash <(curl -fsSL https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.0/scripts/bootstrap.sh)
 ```
 
 It also accepts the token as an argument or prompts for it interactively. Works on macOS, Linux,
 and Windows (Git Bash / WSL).
+
+Fetch it from the release tag, not from `main`, so that a command you issued last month still runs
+the script that was reviewed for that release rather than whatever `main` holds today. A git tag is
+movable by default; the `v*` tags on this repository are protected by a ruleset that refuses
+updates and deletions, so `v3.15.0` names one commit permanently. The dashboard's install command
+pins the current release for you.
+
+To read the script before running it, fetch it and compare it with the tag in git, which is the
+same object the ruleset protects:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.0/scripts/bootstrap.sh
+git -c advice.detachedHead=false clone --depth 1 --branch v3.15.0 \
+    https://github.com/assailai/docker-agent-ares /tmp/ares-v3.15.0
+diff bootstrap.sh /tmp/ares-v3.15.0/scripts/bootstrap.sh && echo "matches the tag"
+```
+
+Before it starts anything, the installer cosign-verifies both images against the Ares publisher
+and then runs the verified **digest** rather than the tag. It fails closed: if it cannot verify,
+nothing is started. That means a host which cannot reach ghcr.io (for cosign), Fulcio or Rekor
+will fail the install rather than quietly proceed. Point `ARES_COSIGN_IMAGE` at an internal
+mirror of `ghcr.io/sigstore/cosign/cosign` if that is your situation.
 
 ### Option D: Kubernetes
 
@@ -140,7 +162,7 @@ The `assailai/ares-agent` and `assailai/ares-updater` images are public on Docke
 image pull secret is required.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/assailai/ares-agent/main/deploy/k8s/ares-agent.yaml
+curl -fsSLO https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.0/deploy/k8s/ares-agent.yaml
 # set ARES_TOKEN in the Secret at the top of the file (and pin the image to a release), then:
 kubectl apply -f ares-agent.yaml
 kubectl rollout status deploy/ares-agent
@@ -329,8 +351,8 @@ hosts are reported with their ports and without a name; the port results are nev
 | Path | Description |
 |------|-------------|
 | `/data` | Persistent state. Holds `agent-state.json` (the agent id and its auth token) so the agent keeps its identity across restarts. |
-| `/host-ca` | *(optional, read-only)* This host's CA directory, mounted by the install command. Lets the agent trust whatever the host trusts. See [TLS inspection](#tls-inspection-corporate-proxy). |
-| `/certs` | *(optional, read-only)* Drop-in for extra CA roots the host store does not have, e.g. a Kubernetes ConfigMap. Every `.crt`, `.pem`, or `.cer` inside is trusted. |
+| `/host-ca` | *(optional, read-only)* This host's CA directory, mounted by the install command. Lets the agent trust whatever the host trusts **for TLS server authentication**. See [TLS inspection](#tls-inspection-corporate-proxy). |
+| `/certs` | *(optional, read-only)* Drop-in for extra CA roots the host store does not have, e.g. a Kubernetes ConfigMap. Every `.crt`, `.pem`, or `.cer` inside is trusted, except bundles the host extracted for a non-TLS purpose (`email-ca-bundle.*`, `objsign-ca-bundle.*`). |
 
 ## Network requirements
 
@@ -374,6 +396,21 @@ If it says only `image store, certifi`, the mount did not happen. Add it by hand
 # /etc/pki/ca-trust/extracted/pem instead.
 -v /etc/ssl/certs:/host-ca:ro
 ```
+
+That RHEL directory holds one bundle per purpose: `tls-ca-bundle.pem` beside `email-ca-bundle.pem`
+and `objsign-ca-bundle.pem`. The agent loads only the TLS one, so a root the host trusts just for
+S/MIME or code signing can never issue a certificate the agent accepts for the control plane. You
+will see the other two named on the trust line:
+
+```
+INFO ares.agent TLS trust: image store, certifi, /host-ca (1 file); skipped as not TLS server-auth: /host-ca/email-ca-bundle.pem, /host-ca/objsign-ca-bundle.pem
+```
+
+That is normal, not an error: it is why a three-file mount reports one file. An inspection root
+installed the ordinary way (`update-ca-trust`) is written into all three bundles, so it is in the
+TLS one and still trusted. To trust a root the host deliberately keeps out of TLS, point
+`ARES_CA_BUNDLE` at that **file**: a named file is taken as given, while a named directory is
+looked through and filtered like any other mount.
 
 Both halves of the agent are covered: the control plane and the `wss://` data-plane tunnel that
 live missions run over. `bash scripts/e2e_tls_inspection.sh` proves it against a real mitmproxy,
@@ -524,17 +561,31 @@ Notes:
 
 - The agent moves to the exact version the dashboard marks current (a pinned tag), so rollouts
   are deterministic and promotable across environments.
+- **Updates only go forward.** The version handoff is the untrusted half of the chain: it comes
+  from the control plane, and the agent container is what writes it. A signature proves the
+  artifact, not that the version is the current one, so without this an old but genuinely signed
+  release would reintroduce every vulnerability fixed since. The updater refuses a target older
+  than its own release, and refuses one that is no release at all (`latest`, a `sha-...` build, a
+  branch tag; CI signs those too). For a deliberate rollback, set
+  `ARES_UPDATE_ALLOW_DOWNGRADE=true` on the updater, or reinstall at the version you want
+  (`ARES_VERSION=3.14.3 bash scripts/bootstrap.sh`). It never lets the updater move *itself* back:
+  one taken below 3.14.0 could never update itself again.
 - Verification is **fail-closed** (`ARES_UPDATE_REQUIRE_SIGNATURE=true`): the updater refuses an
   image it cannot cosign-verify. Set it `false` only for local/dev, before image signing is wired.
   To reproduce the updater's check by hand (cosign ships inside the updater image, so you do not
   need it installed locally):
 
   ```bash
-  docker run --rm --entrypoint cosign docker.io/assailai/ares-updater:3.3.3 \
-    verify docker.io/assailai/ares-agent:3.3.3 \
-    --certificate-identity-regexp '^https://github\.com/assailai/docker-agent-ares/\.github/workflows/docker-build\.yml@refs/(heads/main|tags/v.*)$' \
+  docker run --rm --entrypoint cosign docker.io/assailai/ares-updater:3.15.0 \
+    verify docker.io/assailai/ares-agent:3.15.0 \
+    --certificate-identity-regexp '^https://github\.com/assailai/docker-agent-ares/\.github/workflows/docker-build\.yml@refs/heads/main$' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```
+
+  The identity names `refs/heads/main` and nothing else. `main` is the protected branch, so a
+  release signed under it was reviewed. Tag refs are not protected, since anyone with push access
+  can create one, so from 3.15.0 they are no longer trusted and no workflow builds release images
+  from a tag push.
 
   If this fails while the image is genuinely published, the expected signer identity has drifted from
   what CI signs with — the updater logs both sides of the comparison on failure.
@@ -596,7 +647,7 @@ docker volume rm ares-agent-data
 Or let the installer do it, which is the same thing plus a clean re-enrollment:
 
 ```bash
-ARES_RESET=1 ARES_TOKEN=<fresh-token> bash <(curl -fsSL https://raw.githubusercontent.com/assailai/ares-agent/main/scripts/bootstrap.sh)
+ARES_RESET=1 ARES_TOKEN=<fresh-token> bash <(curl -fsSL https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.0/scripts/bootstrap.sh)
 ```
 
 ## Versioning
@@ -605,6 +656,10 @@ We use [Semantic Versioning](https://semver.org/). For available versions, see t
 [tags on Docker Hub](https://hub.docker.com/r/assailai/ares-agent/tags).
 
 ### Cutting a release
+
+Dependencies first, if you changed any: `requirements.txt` and `requirements-updater.txt` hold
+the direct pins, and the `*-lock.txt` beside each is generated from it. Regenerate with the
+command in the lock's own header, or the build fails on a hash it was not given.
 
 `agent/__version__.py` is the trigger. Bump it, move the pins that name the old version
 (`scripts/bootstrap.sh`, `docker-compose.yml`, `deploy/k8s/ares-agent.yaml`), and merge to `main`.

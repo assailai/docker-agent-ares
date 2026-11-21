@@ -16,7 +16,7 @@
 
 services:
   ares-agent:
-    image: docker.io/assailai/ares-agent:3.14.3  # pin to a version (see Settings -> Agents); avoid :latest
+    image: docker.io/assailai/ares-agent:3.15.0  # pin to a version (see Settings -> Agents); avoid :latest
     container_name: ares-agent
     hostname: ares-agent
     volumes:
@@ -25,7 +25,9 @@ services:
       # already trusted here (it has to be, or nothing on the machine could browse), so handing it
       # over is all the agent needs. On a network that does not, this is an ordinary public bundle
       # and a no-op. Public certificates only: /etc/ssl/private is never mounted. On RHEL and
-      # Fedora use /etc/pki/ca-trust/extracted/pem instead.
+      # Fedora use /etc/pki/ca-trust/extracted/pem instead; that directory holds one bundle per
+      # purpose, and only tls-ca-bundle.pem is loaded - the e-mail and code-signing extracts are
+      # not valid issuers for a server certificate.
       - /etc/ssl/certs:/host-ca:ro
       # This host's /etc/hosts, read-only. A container gets docker's own /etc/hosts even under
       # network_mode: host, so without this a name pinned on the machine never reaches the agent.
@@ -64,7 +66,7 @@ services:
     restart: unless-stopped
 
   ares-updater:
-    image: docker.io/assailai/ares-updater:3.14.3
+    image: docker.io/assailai/ares-updater:3.15.0
     container_name: ares-updater
     volumes:
       - ares-agent-data:/data:ro                  # reads the agent's update-target.json
@@ -86,6 +88,10 @@ services:
       # images under a different signer, or set ARES_UPDATE_REQUIRE_SIGNATURE=false for local/dev
       # with unsigned images.
       - ARES_UPDATE_REQUIRE_SIGNATURE=true
+      # The updater refuses to move the agent to a release older than its own: a signed-but-old
+      # image is still a downgrade attack, since the signature is genuine and the version handoff
+      # is not. Uncomment for a deliberate, operator-driven rollback.
+      # - ARES_UPDATE_ALLOW_DOWNGRADE=true
     restart: unless-stopped
 
 volumes:

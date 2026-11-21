@@ -67,22 +67,27 @@ RUN --mount=type=cache,target=/go/pkg/mod \
         -X sigs.k8s.io/release-utils/version.gitTreeState=dirty" \
       -o /out/cosign ./cmd/cosign
 
-FROM python:3.12-alpine
+# python 3.12.16 on alpine 3.24, by the multi-arch index digest so the registry cannot decide the
+# base layers at build time. `apk upgrade` below still ships Alpine's current packages - the ADD of
+# the package index is a cache key, not a repo - so pinning costs no freshness, it just means the
+# base moves through a reviewed Dependabot commit instead of silently.
+FROM python:3.12-alpine@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89
 
 LABEL org.opencontainers.image.title="Ares Updater"
 LABEL org.opencontainers.image.source="https://github.com/assailai/ares-agent"
 LABEL org.opencontainers.image.vendor="Assail AI"
 
 COPY --from=cosign /out/cosign /usr/local/bin/cosign
-COPY requirements-updater.txt /tmp/requirements-updater.txt
+# the lock, not requirements-updater.txt: see the agent's Dockerfile for why.
+COPY requirements-updater-lock.txt /tmp/requirements-updater-lock.txt
 # apk upgrade, and the ADD that makes it rerun against a cache: see the agent's Dockerfile for
 # both (zlib 1.4-r0 was in Alpine before the python image; krb5-libs 1.22.3-r0 was in Alpine
 # before this layer's cache entry expired).
 ADD https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/APKINDEX.tar.gz /usr/share/ares/apkindex.tar.gz
 RUN apk upgrade --no-cache \
     && apk add --no-cache ca-certificates \
-    && pip install --no-cache-dir -r /tmp/requirements-updater.txt \
-    && rm -rf /var/cache/apk/* /tmp/requirements-updater.txt
+    && pip install --no-cache-dir --require-hashes -r /tmp/requirements-updater-lock.txt \
+    && rm -rf /var/cache/apk/* /tmp/requirements-updater-lock.txt
 
 # Same CA mount points as the agent image: the host's store at /host-ca, the manual drop-in at
 # /certs. updater.tlsconf merges whatever it finds here into one bundle and exports SSL_CERT_FILE,
@@ -92,12 +97,24 @@ RUN mkdir -p /host-ca /certs && chmod 555 /host-ca /certs
 WORKDIR /app
 COPY updater/ ./updater/
 # the release this image is, which the updater reads so it never moves itself backwards
-# (main._is_backwards). Written from the one version source at build time; an ENV would not do,
-# since a successor carries its predecessor's environment and would inherit the older release.
+# (main._is_backwards) and never moves the AGENT below it (main._agent_may_move). Written from the
+# one version source at build time; an ENV would not do, since a successor carries its
+# predecessor's environment and would inherit the older release.
+#
+# It must be a plain x.y.z, and the build fails if it is not. main._floor parses this with the
+# same anchored pattern it applies to an update target, so a RELEASE of "3.15.0-rc1" would not
+# parse, the floor would read as unknown, and the image would ship with the whole downgrade guard
+# silently switched off. Refusing it here is the only place that is cheap to catch.
 COPY agent/__version__.py /tmp/release.py
 RUN sed -n 's/^__version__ = "\(.*\)"$/\1/p' /tmp/release.py > updater/RELEASE \
     && rm /tmp/release.py \
-    && test -s updater/RELEASE
+    && test -s updater/RELEASE \
+    && release="$(cat updater/RELEASE)" \
+    && case "${release}" in \
+        *[!0-9.]* | *..* | .* | *. ) echo "RELEASE '${release}' is not a plain x.y.z" >&2; exit 1 ;; \
+    esac \
+    && [ "$(echo "${release}" | tr -cd . | wc -c)" -eq 2 ] \
+        || { echo "RELEASE '${release}' is not a plain x.y.z" >&2; exit 1; }
 ENV PYTHONPATH=/app \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1

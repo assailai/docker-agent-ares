@@ -97,7 +97,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: ares-agent          # the patched container; ARES_UPDATE_CONTAINER matches this
-          image: docker.io/assailai/ares-agent:3.14.3   # pinned; the updater rolls this forward
+          image: docker.io/assailai/ares-agent:3.15.0   # pinned; the updater rolls this forward
           envFrom:
             - secretRef:
                 name: ares-agent
@@ -134,7 +134,7 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 3
         - name: ares-updater         # companion; keeps ares-agent, then itself, on the marked version
-          image: docker.io/assailai/ares-updater:3.14.3
+          image: docker.io/assailai/ares-updater:3.15.0
           env:
             - name: ARES_UPDATE_CONTAINER
               value: "ares-agent"
@@ -144,6 +144,11 @@ spec:
             # when self-hosting the images under a different signer.
             - name: ARES_UPDATE_REQUIRE_SIGNATURE
               value: "true"
+            # The updater refuses to move the agent to a release older than its own: a
+            # signed-but-old image is still a downgrade attack, since the signature is genuine and
+            # the version handoff is not. Uncomment for a deliberate, operator-driven rollback.
+            # - name: ARES_UPDATE_ALLOW_DOWNGRADE
+            #   value: "true"
           volumeMounts:
             - name: data
               mountPath: /data        # reads the agent's update-target.json only

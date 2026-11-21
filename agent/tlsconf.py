@@ -5,7 +5,8 @@ disagree about what is trusted. It is the **union** of every CA we can find, nev
 
 * the image's own store (which also honours ``SSL_CERT_FILE`` / ``SSL_CERT_DIR``),
 * certifi's public roots, so those are present even where a store is thin,
-* every PEM under :data:`HOST_CA_DIR` and :data:`EXTRA_CA_DIR`,
+* every PEM under :data:`HOST_CA_DIR` and :data:`EXTRA_CA_DIR` that the host trusts for TLS
+  server authentication (see :func:`_server_auth_only`),
 * whatever ``ARES_CA_BUNDLE`` names.
 
 The reason this module exists: httpx does **not** use the OS trust store. Given ``verify=True``
@@ -43,6 +44,14 @@ EXTRA_CA_DIR = Path("/certs")
 
 _PEM_SUFFIXES = frozenset({".crt", ".pem", ".cer"})
 
+# A host does not trust one set of roots; it trusts a set *per purpose*. RHEL-family hosts make
+# that explicit: /etc/pki/ca-trust/extracted/pem - the directory the install command mounts - holds
+# tls-ca-bundle.pem next to email-ca-bundle.pem and objsign-ca-bundle.pem. Loading all three would
+# make a root the host trusts only for S/MIME or code signing a valid issuer for the control
+# plane's certificate, which is an on-path attacker's way in. These two names are how we tell the
+# difference without parsing certificates (see _server_auth_only for why we do not).
+_NON_TLS_BUNDLE_PREFIXES = ("email-ca-bundle", "objsign-ca-bundle")
+
 
 class AgentTrust(BaseModel):
     """The trust the agent ended up with, and where each part of it came from."""
@@ -52,6 +61,7 @@ class AgentTrust(BaseModel):
     context: ssl.SSLContext
     loaded: tuple[Path, ...] = ()
     rejected: tuple[Path, ...] = ()
+    skipped: tuple[Path, ...] = ()  # found, but extracted by the host for a non-TLS purpose
 
     @property
     def verifies(self) -> bool:
@@ -73,6 +83,13 @@ class AgentTrust(BaseModel):
         for directory, count in sorted(Counter(path.parent for path in self.loaded).items()):
             parts.append(f"{directory} ({count} file{'' if count == 1 else 's'})")
         line = ", ".join(parts)
+        # Before "unreadable", which is the clause that needs action, so that one ends the line.
+        # A RHEL mount of three files reporting "(1 file)" is otherwise a mystery worth a ticket.
+        if self.skipped:
+            line += (
+                "; skipped as not TLS server-auth: "
+                + ", ".join(str(path) for path in self.skipped)
+            )
         if self.rejected:
             line += f"; unreadable: {', '.join(str(path) for path in self.rejected)}"
         return line
@@ -86,6 +103,8 @@ def _pems_in(directory: Path) -> list[Path]:
     ``/usr/share/ca-certificates``, and mounting the directory alone leaves every one of those
     dangling inside the container. Warning about each on every start would bury the one line that
     matters.
+
+    Purpose filtering is :func:`_server_auth_only`'s job, not this one's.
     """
     try:
         entries = sorted(directory.iterdir())
@@ -94,16 +113,66 @@ def _pems_in(directory: Path) -> list[Path]:
     return [path for path in entries if path.suffix in _PEM_SUFFIXES and path.is_file()]
 
 
-def _candidate_files(ca_bundle: str) -> list[Path]:
-    """The extra CA files to load on top of the image store and certifi."""
-    paths = _pems_in(HOST_CA_DIR) + _pems_in(EXTRA_CA_DIR)
+def _server_auth_only(paths: list[Path]) -> tuple[list[Path], list[Path]]:
+    """Split one directory's PEMs into (trusted for TLS server auth, extracted for another purpose).
+
+    One rule: decline the two names a host writes for a purpose that is not TLS server auth. Prefix
+    match rather than exact, so ``.trust.crt`` variants go too.
+
+    Deliberately *not* "if this directory holds tls-ca-bundle.pem, take only that file". That reads
+    the RHEL extract layout correctly and every other directory wrongly: a ``/certs`` drop-in that
+    happens to carry a file by that name alongside an operator's own roots would silently lose them
+    on upgrade, and losing a root the operator put there by hand is a worse failure than the one
+    being fixed. On the RHEL directory the two rules select the same file anyway, since the only
+    other things there are the two names declined below (ARES-2327 review).
+
+    This selects **files**, never certificates, which is what keeps TLS inspection working: a
+    corporate root installed the ordinary RHEL way carries no purpose restriction, so
+    ``update-ca-trust`` writes it into all three extracts and it survives in the TLS one.
+
+    Deliberately no per-certificate check. ``ssl``'s decoded certificate dict carries no
+    ``basicConstraints`` and no ``extendedKeyUsage``, so the stdlib cannot answer "is this a CA,
+    and what for"; the alternative is ``cryptography`` in both shipped images for a check that runs
+    once at startup. The residual is bounded: OpenSSL will not anchor a chain at a stray that is
+    not self-signed (it needs ``EXFLAG_SS``, and Python never sets ``X509_V_FLAG_PARTIAL_CHAIN``),
+    so the only stray that could be used as an anchor is a self-signed certificate the host
+    administrator put in their own trust store on purpose.
+
+    Order is preserved and the two lists together are the input, so a caller can report what it
+    declined instead of dropping it silently.
+    """
+    keep: list[Path] = []
+    skipped: list[Path] = []
+    for path in paths:
+        (skipped if path.name.startswith(_NON_TLS_BUNDLE_PREFIXES) else keep).append(path)
+    return keep, skipped
+
+
+def _candidate_files(ca_bundle: str) -> tuple[list[Path], list[Path]]:
+    """The extra CA files to load on top of the image store and certifi, and the ones declined.
+
+    Per directory, because the rule reads one directory's layout to decide what that directory
+    means: a ``/certs`` drop-in is not reinterpreted by what happens to sit in ``/host-ca``.
+    """
+    candidates: list[Path] = []
+    skipped: list[Path] = []
+    for directory in (HOST_CA_DIR, EXTRA_CA_DIR):
+        keep, declined = _server_auth_only(_pems_in(directory))
+        candidates += keep
+        skipped += declined
     if not ca_bundle:
-        return paths
+        return candidates, skipped
     # ARES_CA_BUNDLE takes a file or a directory, because operators reasonably expect both. A
-    # named file is passed through unfiltered, suffix and all: they told us to trust it, and a
-    # path that turns out not to exist should say so rather than vanish.
+    # named FILE is passed through unfiltered, suffix and all: they told us to trust that one
+    # thing, and a path that turns out not to exist should say so rather than vanish. That is the
+    # escape hatch for anyone who genuinely wants a root the host extracts for another purpose, and
+    # it is a file-only escape hatch: a named DIRECTORY is still a directory to look through, so it
+    # is filtered exactly like the mounts above. The README says "name the file" for this reason.
     configured = Path(ca_bundle)
-    return paths + (_pems_in(configured) if configured.is_dir() else [configured])
+    if not configured.is_dir():
+        return candidates + [configured], skipped
+    keep, declined = _server_auth_only(_pems_in(configured))
+    return candidates + keep, skipped + declined
 
 
 @lru_cache(maxsize=None)
@@ -132,9 +201,10 @@ def build_trust(*, insecure: bool, ca_bundle: str) -> AgentTrust:
     # cost us the public roots.
     context.load_verify_locations(cafile=certifi.where())
 
+    candidates, skipped = _candidate_files(ca_bundle)
     loaded: list[Path] = []
     rejected: list[Path] = []
-    for path in _candidate_files(ca_bundle):
+    for path in candidates:
         try:
             context.load_verify_locations(cafile=str(path))
         except OSError as exc:  # ssl.SSLError is an OSError; so is an unreadable file
@@ -144,7 +214,12 @@ def build_trust(*, insecure: bool, ca_bundle: str) -> AgentTrust:
             rejected.append(path)
         else:
             loaded.append(path)
-    return AgentTrust(context=context, loaded=tuple(loaded), rejected=tuple(rejected))
+    return AgentTrust(
+        context=context,
+        loaded=tuple(loaded),
+        rejected=tuple(rejected),
+        skipped=tuple(skipped),
+    )
 
 
 def verification_hint(exc: BaseException, *, insecure: bool, ca_bundle: str) -> str:
