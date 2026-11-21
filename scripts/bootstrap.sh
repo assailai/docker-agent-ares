@@ -599,9 +599,12 @@ main() {
     resolve_token "$@"
     setup_persistence
     setup_rootful_podman
-    reset_state
-    # before start_container, and well before start_updater hands anything the engine socket.
+    # before reset_state, which destroys this host's agent identity, and well before start_updater
+    # hands anything the engine socket. Verification can now fail on a host that cannot reach
+    # ghcr.io, Fulcio or Rekor, and failing *after* ARES_RESET=1 had already deleted the volume
+    # would leave the host with no agent and no identity to go back to.
     verify_images
+    reset_state
     start_container
     start_updater
     wait_until_online

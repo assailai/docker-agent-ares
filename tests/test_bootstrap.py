@@ -572,6 +572,21 @@ def test_the_installer_verifies_both_images_before_anything_starts() -> None:
     assert calls == sorted(calls), "verification does not run before the containers start"
 
 
+def test_nothing_is_destroyed_before_the_images_are_verified() -> None:
+    # Verification is fail-closed and reaches ghcr.io, Fulcio and Rekor, so it is now a step that
+    # can fail on a healthy host behind a strict proxy. reset_state deletes the data volume this
+    # host's agent identity lives in. In that order a blocked install would take the identity with
+    # it and leave nothing running to go back to (ARES-2327 review).
+    main_body = BOOTSTRAP.read_text()
+    main_body = main_body[main_body.rindex("\nmain() {") :]
+    steps = [
+        line.strip()
+        for line in main_body.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert steps.index("verify_images") < steps.index("reset_state")
+
+
 def test_the_installer_runs_the_digest_it_verified() -> None:
     # Verifying a tag and then running that tag is a TOCTOU: the registry can repoint it in
     # between. verify_image prints the digest reference and verify_images writes it back over
