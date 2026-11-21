@@ -228,6 +228,20 @@ def test_the_updater_image_knows_its_own_release_from_the_one_version_source() -
     assert "ARES_UPDATE_RELEASE" not in dockerfile
 
 
+def test_the_build_refuses_a_release_that_is_not_a_plain_version() -> None:
+    # given the step that writes updater/RELEASE
+    dockerfile = _updater_dockerfile()
+
+    # then it also checks the shape. main._floor parses this file with a pattern anchored at both
+    # ends, so a RELEASE of "3.15.0-rc1" reads as "no release", the floor reads as unknown, and
+    # the image ships with the agent's downgrade guard silently switched off. The build is the
+    # only cheap place to catch that (ARES-2327 review)
+    assert "is not a plain x.y.z" in dockerfile
+    assert 'case "${release}" in' in dockerfile
+    assert "*[!0-9.]* | *..* | .* | *. )" in dockerfile
+    assert "tr -cd . | wc -c" in dockerfile
+
+
 @pytest.mark.parametrize("name", ["Dockerfile", "Dockerfile.updater"])
 def test_every_shipped_image_takes_alpines_current_packages(name: str) -> None:
     # given an image whose base, python:3.12-alpine, is rebuilt on its own schedule: on 2026-11-07

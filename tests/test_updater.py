@@ -1241,16 +1241,13 @@ def test_a_handoff_that_returns_waits_before_it_is_tried_again(
     assert backend.plan is None
 
 
-@pytest.mark.parametrize(
-    "target", ["3.13.2", "nightly"], ids=["an-older-release", "no-release-at-all"]
-)
-def test_the_updater_never_moves_itself_backwards(
-    target: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_the_updater_never_moves_itself_backwards(monkeypatch: pytest.MonkeyPatch) -> None:
     # given an updater built as 3.14.0 with the agent's rollback guard opted out of (the only way
-    # the agent moves back at all), and a target older than that, or one it cannot read as a
-    # release. The opt-out is deliberately agent-only: see
-    # test_the_agent_never_moves_back_below_the_updaters_release for the default.
+    # the agent moves back at all), and an older release as the target. The opt-out is
+    # deliberately agent-only: see test_the_agent_never_moves_back_below_the_updaters_release for
+    # the default, and test_the_override_still_refuses_anything_that_is_not_a_release for why a
+    # target that is no release at all never gets this far, for either of them.
+    target = "3.13.2"
     monkeypatch.setattr(main, "settings", _settings(allow_downgrade=True))
     monkeypatch.setattr(main, "_read_target", lambda: target)
     monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
@@ -1282,10 +1279,27 @@ def test_the_updater_moves_forward_past_its_own_release(monkeypatch: pytest.Monk
     assert backend.plan == UpdatePlan(updater=f"{_UPDATER}@sha256:3.15.0")
 
 
+_A_RELEASE_DIGEST = "sha256:" + "ab" * 32
+
+
 @pytest.mark.parametrize(
     "target",
-    ["3.13.2", "latest", "sha-deadbeef"],
-    ids=["an-older-release", "a-floating-tag", "a-branch-build"],
+    [
+        "3.13.2",
+        "latest",
+        "sha-deadbeef",
+        "3.14.1-rc1",
+        f"3.99.0@{_A_RELEASE_DIGEST}",
+        "3.14.0 ",
+    ],
+    ids=[
+        "an-older-release",
+        "a-floating-tag",
+        "a-branch-build",
+        "a-prerelease",
+        "a-newer-name-carrying-an-older-digest",
+        "a-release-with-trailing-space",
+    ],
 )
 def test_the_agent_never_moves_back_below_the_updaters_release(
     target: str, monkeypatch: pytest.MonkeyPatch
@@ -1345,19 +1359,74 @@ def test_the_agent_may_catch_up_to_the_release_the_updater_is_on(
     assert backend.plan.agent == f"docker.io/assailai/ares-agent@sha256:3.14.0"
 
 
-def test_a_prerelease_target_reads_as_its_release(monkeypatch: pytest.MonkeyPatch) -> None:
-    # given a 3.14.1-rc1 target on a 3.14.0 updater: a suffix reads as its release, as it does for
-    # the updater's own guard
+def test_a_version_carrying_a_digest_cannot_walk_past_the_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The way around the floor, if the version pattern is left open at the end.
+
+    ``_resolve`` builds ``f"{repo}:{target}"``, and an OCI reference may carry a tag *and* a
+    digest - where the digest is what is pulled. So ``3.99.0@sha256:<an old release's digest>``
+    reads as 3.99.0 to a floor check that only matches a prefix, clears it, passes cosign (that
+    digest carries a genuine main signature) and lands the old image on the host. Every part of
+    this is legitimate except the first.
+    """
     monkeypatch.setattr(main, "settings", _settings())
-    monkeypatch.setattr(main, "_read_target", lambda: "3.14.1-rc1")
+    monkeypatch.setattr(main, "_read_target", lambda: f"3.99.0@{_A_RELEASE_DIGEST}")
     monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
-    _verify_to_digest(monkeypatch)
+    seen = _verify_to_digest(monkeypatch)
     backend = _FakeBackend(
         running="docker.io/assailai/ares-agent:3.14.0", me=_owner(f"{_UPDATER}:3.14.0")
     )
 
     main._tick(backend)
-    assert backend.plan.agent == f"docker.io/assailai/ares-agent@sha256:3.14.1-rc1"
+
+    assert backend.plan is None
+    assert seen == [], "cosign was asked, so the reference reached the registry"
+
+
+def test_the_override_still_refuses_anything_that_is_not_a_release(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # ARES_UPDATE_ALLOW_DOWNGRADE exists for one thing: a deliberate rollback to an older
+    # RELEASE. What an operator rolls back *to* is a release, so the lever has no reason to admit
+    # `latest`, a branch build or a version with a digest welded on - and admitting them would
+    # make one env var on one host re-open the bypass above.
+    monkeypatch.setattr(main, "settings", _settings(allow_downgrade=True))
+    monkeypatch.setattr(main, "_read_target", lambda: f"3.99.0@{_A_RELEASE_DIGEST}")
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    seen = _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(running="docker.io/assailai/ares-agent:3.14.0")
+
+    with caplog.at_level(logging.WARNING, logger="ares.updater"):
+        main._tick(backend)
+
+    assert backend.plan is None
+    assert seen == []
+    assert "with or without the override" in caplog.text
+
+
+def test_the_updater_also_refuses_to_move_itself_to_a_version_with_a_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # the agent guard returns first, so pin the self guard on its own: _is_backwards reads the
+    # same anchored pattern, and a target it cannot parse is backwards by definition.
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+
+    assert main._is_backwards(f"3.99.0@{_A_RELEASE_DIGEST}")
+    assert main._is_backwards("3.99.0-rc1")
+    assert not main._is_backwards("3.99.0")
+
+
+@pytest.mark.parametrize(
+    "version",
+    ["3.14.0-rc1", "3.14.0@sha256:abc", "3.14", "latest", "v3.14.0.1", "3.14.0 ", " 3.14.0"],
+)
+def test_only_a_plain_release_parses_as_one(version: str) -> None:
+    # the single predicate the floor, the self guard and Dockerfile.updater's build check all
+    # agree on. Anchored at both ends; see _RELEASE.
+    assert main._release_key(version) is None
+    assert main._release_key("3.14.0") == (3, 14, 0)
+    assert main._release_key("v3.14.0") == (3, 14, 0)
 
 
 def test_the_rollback_guard_is_off_without_a_baked_release(
@@ -1435,6 +1504,44 @@ def test_allow_downgrade_never_moves_the_updater_backwards(
 
     assert backend.plan == UpdatePlan(agent=f"docker.io/assailai/ares-agent@sha256:3.13.2")
     assert backend.plan.updater is None
+
+
+def test_the_startup_line_warns_that_the_floor_is_frozen_with_self_update_off(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The gap Saksham found on review, made visible where an operator will meet it.
+
+    The floor is the updater's own release and it only moves when the updater does. With
+    self-update off the agent keeps updating and the floor does not, so the distance between them
+    grows with every release - at 3.15.0 with the agent on 3.18.0, naming 3.16.0 is still
+    believed. Closing it needs the agent's release recorded out of the agent's reach (ARES-2337);
+    until then this says so once, in `docker logs`, rather than only in a docstring.
+    """
+    monkeypatch.setattr(main, "settings", _settings(self_update=False))
+    monkeypatch.setattr(main, "_own_release", lambda: "3.15.0")
+
+    with caplog.at_level(logging.INFO, logger="ares.updater"):
+        main._report_floor()
+
+    assert "self-update is off" in caplog.text
+    assert "3.15.0" in caplog.text
+    assert caplog.records[0].levelno == logging.WARNING
+
+
+def test_the_startup_line_reports_an_unparseable_baked_release_as_an_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Dockerfile.updater refuses to build this, so reaching a host means something upstream went
+    # wrong - and the consequence is the whole downgrade guard off, which is silent otherwise.
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_own_release", lambda: "3.15.0-rc1")
+
+    with caplog.at_level(logging.INFO, logger="ares.updater"):
+        main._report_floor()
+
+    assert main._floor() is None
+    assert caplog.records[0].levelno == logging.ERROR
+    assert "downgrade floor is OFF" in caplog.text
 
 
 def test_the_rollback_guard_does_not_skip_removing_a_predecessor(
@@ -1677,8 +1784,15 @@ def test_the_skipped_extracts_are_named_in_the_log(
         {"ca-certificates.crt": "DEBIAN"},
         {"email-ca-bundle.pem": "MAIL", "corp-root.crt": "CORP"},
         {"corp-root.crt": "CORP", "internal.pem": "INTERNAL"},
+        {"tls-ca-bundle.pem": "TLS", "corp-root.crt": "CORP"},
     ],
-    ids=["rhel-extracts", "debian-bundle", "a-stray-email-extract", "an-ordinary-drop-in"],
+    ids=[
+        "rhel-extracts",
+        "debian-bundle",
+        "a-stray-email-extract",
+        "an-ordinary-drop-in",
+        "a-drop-in-beside-a-tls-bundle",
+    ],
 )
 def test_the_updater_selects_the_same_host_ca_files_as_the_agent(
     tmp_path: Path, layout: dict[str, str]
@@ -1697,7 +1811,6 @@ def test_the_updater_selects_the_same_host_ca_files_as_the_agent(
         agent_tlsconf._pems_in(directory)
     )
     assert tlsconf._PEM_SUFFIXES == agent_tlsconf._PEM_SUFFIXES
-    assert tlsconf._TLS_BUNDLE_NAME == agent_tlsconf._TLS_BUNDLE_NAME
     assert tlsconf._NON_TLS_BUNDLE_PREFIXES == agent_tlsconf._NON_TLS_BUNDLE_PREFIXES
 
 

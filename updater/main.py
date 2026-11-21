@@ -78,7 +78,12 @@ _predecessor_removed = False
 _said_unmanaged = False
 # the release this image was built as (Dockerfile.updater writes it); absent outside an image
 _RELEASE_FILE = Path(__file__).with_name("RELEASE")
-_RELEASE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
+# Anchored at BOTH ends, which is load-bearing rather than tidy. _resolve builds f"{repo}:{target}"
+# and an OCI reference may carry a tag *and* a digest, where the digest wins. Left open at the end,
+# "3.99.0@sha256:<an old release's digest>" read as 3.99.0, cleared the floor, verified (that digest
+# carries a genuine main signature) and pulled the old image: the downgrade this guard exists to
+# stop, wearing a newer release's name. The same opening admitted "3.15.0-rc1" and "3.15.0 ".
+_RELEASE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 _declined_downgrades: set[str] = set()  # the updater's own move
 # the agent's. Separate, because either guard may be off while the other is on.
 _declined_rollbacks: set[str] = set()
@@ -105,9 +110,24 @@ def _resolve(*, running: str, target: str, repo: str, cache: dict[str, str]) -> 
 
 
 def _release_key(version: str) -> tuple[int, int, int] | None:
-    """``3.14.0`` (or ``v3.14.0``, ``3.14.0-rc1``) -> ``(3, 14, 0)``; None when it is no release."""
+    """``3.14.0`` (or ``v3.14.0``) -> ``(3, 14, 0)``; None when it is not a plain release.
+
+    A suffix of any kind makes it None, ``3.15.0-rc1`` and ``3.99.0@sha256:...`` alike. See the
+    anchors on :data:`_RELEASE` for why the second one matters.
+    """
     match = _RELEASE.match(version)
     return (int(match[1]), int(match[2]), int(match[3])) if match else None
+
+
+def _floor() -> tuple[int, int, int] | None:
+    """The release the agent is not taken below, or None when the guard is off entirely.
+
+    None in a checkout and in the tests, where no RELEASE is baked in, which is what lets
+    ``scripts/e2e_updater.sh`` drive the loop with ``3.19`` and ``99.99.99-nope``. It is also None
+    for an image whose RELEASE is not a plain ``x.y.z`` - ``Dockerfile.updater`` refuses to build
+    one, and ``main`` says so at startup if one ever reaches a host anyway.
+    """
+    return _release_key(_own_release() or "")
 
 
 def _own_release() -> str | None:
@@ -121,23 +141,34 @@ def _is_backwards(target: str) -> bool:
     """True when ``target`` is older than this updater's own release, or is no release at all while
     that one is known. The updater never moves itself backwards: marking an older release current
     moves the agent back, but an updater taken below 3.14.0 could never update itself again."""
-    own = _release_key(_own_release() or "")
+    own = _floor()
     if own is None:
         return False  # no release baked in, so nothing to compare against
     wanted = _release_key(target)
     return wanted is None or wanted < own
 
 
-def _rollback_reason(target: str) -> str | None:
-    """Why moving the agent to ``target`` would take it backwards, or None when it is fine."""
-    floor = _release_key(_own_release() or "")
+def _rollback_reason(target: str) -> tuple[str, bool] | None:
+    """Why the agent must not be moved to ``target``, and whether an operator may override it.
+
+    ``(reason, overridable)``, or None when the target is fine. Two refusals, and only one of
+    them is a judgement call:
+
+    * **not a release at all** - ``latest``, ``sha-<...>``, a branch tag, a version carrying a
+      digest. CI signs those too, so the signature gate does not narrow them, and no operator
+      rollback needs them: the thing an operator rolls back *to* is a release. Never overridable,
+      because that is the shape the floor can be walked around with (see :data:`_RELEASE`).
+    * **below the floor** - a genuine older release. This is the one an operator may legitimately
+      want, so ``ARES_UPDATE_ALLOW_DOWNGRADE`` admits it.
+    """
+    floor = _floor()
     if floor is None:
-        return None  # no release baked in (a checkout, the tests): nothing to compare against
+        return None  # the guard is off: see _floor
     wanted = _release_key(target)
     if wanted is None:
-        return f"{target} is not a release version"
+        return (f"{target} is not a release version", False)
     if wanted < floor:
-        return f"{target} is older than {_own_release()}"
+        return (f"{target} is older than {_own_release()}", True)
     return None
 
 
@@ -158,26 +189,33 @@ def _agent_may_move(target: str) -> bool:
     construction and can never exceed the highest release this install reached - which is what
     makes it safe as a floor: it never blocks a forward move.
 
-    It fails open rather than closed in three places, each weakening the guard without ever
-    freezing an install: self-update off or a container the updater cannot prove is its own leaves
-    the floor where it was installed, and a checkout has no baked release at all.
+    It fails open rather than closed, which weakens the guard but can never freeze an install:
+    a checkout has no baked release and the guard is off entirely, and with self-update off (or
+    from a container the updater cannot prove is its own) the floor stays at the release the
+    updater was installed as while the agent moves on without it. That second gap *widens* with
+    every release the agent takes, so ``main`` warns about it once at startup rather than leaving
+    it to this docstring. Closing it needs the agent's own release recorded where the agent cannot
+    write it - a container label, a Deployment annotation - which is ARES-2337.
     """
-    reason = _rollback_reason(target)
-    if reason is None:
+    refusal = _rollback_reason(target)
+    if refusal is None:
         return True
-    if settings.allow_downgrade:
-        if target not in _declined_rollbacks:
+    reason, overridable = refusal
+    said = target in _declined_rollbacks
+    _declined_rollbacks.add(target)
+    if overridable and settings.allow_downgrade:
+        if not said:
             logger.warning("ARES_UPDATE_ALLOW_DOWNGRADE is set; moving the agent back (%s)", reason)
-            _declined_rollbacks.add(target)
         return True
-    if target not in _declined_rollbacks:
+    if not said:
         logger.warning(
-            "refusing to move the agent to %s: %s "
-            "(set ARES_UPDATE_ALLOW_DOWNGRADE=true on this host to override)",
+            "refusing to move the agent to %s: %s%s",
             target,
             reason,
+            " (set ARES_UPDATE_ALLOW_DOWNGRADE=true on this host to override)"
+            if overridable
+            else "; only a plain x.y.z release is ever applied, with or without the override",
         )
-        _declined_rollbacks.add(target)
     return False
 
 
@@ -269,6 +307,36 @@ def _tick(backend: Backend) -> None:
         )
 
 
+def _report_floor() -> None:
+    """Say once, at startup, what the agent's rollback floor is and why it may not advance.
+
+    The floor is this updater's own release, and it only moves when the updater does. An operator
+    who turned self-update off (or whose updater cannot identify its own container) keeps a floor
+    frozen at the installed release while the agent is updated past it, and the gap grows with
+    every release: at 3.15.0 with the agent on 3.18.0, a compromised control plane can still name
+    3.16.0 and be believed. That is worth a line in `docker logs`, not just a docstring.
+    """
+    own = _own_release()
+    if own is None:
+        logger.info("no baked release: the agent's downgrade floor is off (this is a checkout)")
+        return
+    if _floor() is None:
+        logger.error(
+            "RELEASE is %r, which is not a plain x.y.z; the agent's downgrade floor is OFF. "
+            "This image should not have been built - report it.",
+            own,
+        )
+        return
+    if settings.self_update:
+        logger.info("the agent is not moved below release %s", own)
+        return
+    logger.warning(
+        "self-update is off, so the agent's downgrade floor stays at release %s even as the "
+        "agent moves past it. Reinstall the updater at the fleet's release to raise it.",
+        own,
+    )
+
+
 def main() -> None:
     _configure_logging()
     # Before anything reaches out: cosign is a subprocess, so SSL_CERT_FILE is the only way to
@@ -288,6 +356,7 @@ def main() -> None:
         "on" if settings.self_update else "off",
         settings.poll_seconds,
     )
+    _report_floor()
     while True:
         try:
             _tick(backend)
