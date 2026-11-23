@@ -1,11 +1,19 @@
-"""The bootstrap installer, where it makes decisions the agent then depends on.
+"""The install paths, where they make decisions the agent then depends on.
+
+Four files, because the decisions are shared between them: ``scripts/bootstrap.sh``,
+``scripts/verify-images.sh``, ``docker-compose.yml`` and ``deploy/k8s/ares-agent.yaml``. The
+release every path pins, the images each one names, and the cosign block the two scripts both
+carry are things that have to agree ACROSS the files, so the tests for them live together rather
+than one file per script.
 
 Only the CA detection is pinned here, and deliberately: the same candidate list is written a
 second time in the other repo, in the install command the dashboard hands operators
 (``apps/web/src/lib/agent-install.ts``, ``caDetection``). Two copies of one list across two
 repositories is a drift trap, and nothing can fail the build in *both* of them, so each side pins
 its own copy. That does not detect cross-repo drift, but it does mean neither list can change by
-accident: whoever edits one gets a failure telling them the other exists.
+accident: whoever edits one gets a failure telling them the other exists. The parity tests between
+the two shell scripts are here for the same reason, one level down: neither can source the other,
+so the duplicated cosign block is unavoidable and these tests are what fail when it diverges.
 """
 
 from __future__ import annotations
@@ -718,6 +726,23 @@ def test_the_verifier_has_no_way_to_skip_verification() -> None:
     )
 
 
+@pytest.mark.parametrize("name", ["pin_manifest", "write_env"])
+def test_an_empty_grep_result_does_not_end_the_verifier_silently(name: str) -> None:
+    # This one is here because it actually happened. The script runs under `set -o pipefail` and
+    # grep exits 1 when it matches nothing, so `refs="$(grep ... | sort -u)"` inherited that 1 and
+    # `set -e` killed the script - in between the step heading and the error that explains what to
+    # do about it. Pointing it at a file naming no Ares image printed a heading, then stopped.
+
+    # given one of the functions that scans a file
+    greps = [line.strip() for line in _function(name, VERIFY).splitlines() if "grep -" in line]
+
+    # then each grep says what an empty result means, rather than leaving pipefail to decide
+    assert greps, f"{name} no longer greps"
+    assert all("|| true" in line for line in greps), (
+        f"{name} has a grep whose empty result pipefail turns into a silent exit: {greps}"
+    )
+
+
 def test_the_verifier_leaves_a_manifest_alone_when_an_image_does_not_verify() -> None:
     # given the manifest-rewriting half
     body = _function("pin_manifest", VERIFY)
@@ -794,7 +819,10 @@ def test_repo_of_finds_the_repository_in_every_reference_form(ref: str, expected
 
 @pytest.mark.parametrize(
     ("option", "apply_command"),
-    [("### Option B: Docker Compose", "docker compose up -d"), ("### Option D: Kubernetes", "kubectl apply -f ares-agent.yaml")],
+    [
+        ("### Option B: Docker Compose", "docker compose up -d"),
+        ("### Option D: Kubernetes", "kubectl apply -f ares-agent.yaml"),
+    ],
     ids=["compose", "kubernetes"],
 )
 def test_the_documented_install_verifies_before_it_starts_anything(

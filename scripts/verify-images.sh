@@ -55,13 +55,12 @@ COSIGN_ISSUER="https://token.actions.githubusercontent.com"
 ARES_IMAGE_PATTERN='docker\.io/assailai/ares-(agent|updater):[A-Za-z0-9_][A-Za-z0-9._-]*(@sha256:[0-9a-f]{64})?'
 
 if [ -t 1 ]; then
-    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
+    RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
 else
-    RED='' GREEN='' YELLOW='' BLUE='' BOLD='' NC=''
+    RED='' GREEN='' BLUE='' BOLD='' NC=''
 fi
 
 info()  { printf "${GREEN}[INFO]${NC}  %s\n" "$1"; }
-warn()  { printf "${YELLOW}[WARN]${NC}  %s\n" "$1"; }
 error() { printf "${RED}[ERROR]${NC} %s\n" "$1"; }
 step()  { printf "\n${BLUE}${BOLD}==> %s${NC}\n" "$1"; }
 
@@ -248,9 +247,13 @@ write_env() {
 pin_compose_env() {
     step "Verifying the published images"
     local agent updater
-    agent="$(verify_image "$IMAGE")" || cannot_verify "$IMAGE" "$agent"
+    if ! agent="$(verify_image "$IMAGE")"; then
+        cannot_verify "$IMAGE" "$agent"
+    fi
     info "Verified $IMAGE"
-    updater="$(verify_image "$UPDATER_IMAGE")" || cannot_verify "$UPDATER_IMAGE" "$updater"
+    if ! updater="$(verify_image "$UPDATER_IMAGE")"; then
+        cannot_verify "$UPDATER_IMAGE" "$updater"
+    fi
     info "Verified $UPDATER_IMAGE"
 
     write_env ".env" "$agent" "$updater"
@@ -267,8 +270,10 @@ pin_manifest() {
     [ -r "$file" ] || { error "Cannot read $file"; exit 1; }
     step "Verifying the images $file names"
 
+    # `|| true` because grep exits 1 on no match and pipefail would make that kill the script,
+    # taking the explanation below with it.
     local refs
-    refs="$(grep -oE "$ARES_IMAGE_PATTERN" "$file" | sort -u)"
+    refs="$(grep -oE "$ARES_IMAGE_PATTERN" "$file" | sort -u || true)"
     if [ -z "$refs" ]; then
         error "$file names no docker.io/assailai/ares-agent or ares-updater image."
         error "Point this at the manifest you are about to apply, or run it with no argument"
@@ -287,7 +292,9 @@ pin_manifest() {
         [ -n "$ref" ] || continue
         # Verify the reference AS WRITTEN: if it already carries a digest, that digest is what
         # kubelet will pull, so that is what has to be signed - not whatever the tag says today.
-        verified="$(verify_image "$ref")" || cannot_verify "$ref" "$verified"
+        if ! verified="$(verify_image "$ref")"; then
+            cannot_verify "$ref" "$verified"
+        fi
         # verify_image answers in canonical repo@sha256:... form, so compare the DIGEST rather
         # than the whole reference: "repo:tag@sha256:x" and "repo@sha256:x" are the same bytes.
         if [ "${ref##*@}" = "${verified##*@}" ]; then
@@ -296,11 +303,17 @@ pin_manifest() {
         fi
         # repo:tag@sha256:... - kubelet pulls the digest, and the tag stays readable for a human.
         local pinned="${ref%@*}@${verified##*@}"
-        LC_ALL=C sed -i.pinned "s|${ref}|${pinned}|g" "$tmp" && rm -f "${tmp}.pinned"
+        # The reference goes into a sed pattern, where its dots would each match any character.
+        # ARES_IMAGE_PATTERN admits no other metacharacter, and | is the delimiter, so escaping
+        # the dots is the whole job.
+        LC_ALL=C sed -i.pinned "s|${ref//./\\.}|${pinned}|g" "$tmp" && rm -f "${tmp}.pinned"
         info "Verified $ref"
         info "  pinned to ${pinned##*@}"
     done <<< "$refs"
 
+    # Copy the contents back rather than `mv` the temporary over the top: mktemp creates 0600,
+    # and a manifest that silently became owner-only read after being pinned would be a nasty
+    # surprise. This keeps the file's own inode, mode and ownership.
     cat "$tmp" > "$file"
     rm -f "$tmp"
     trap - EXIT
