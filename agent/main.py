@@ -38,6 +38,7 @@ from agent import (
     assessment_artifact,
     assessment_collect,
     assessment_discover,
+    assessment_validate,
     pcap_capture,
     protocols,
     snmp,
@@ -785,7 +786,12 @@ async def _hand_back(token: str, task_id: str) -> None:
 # so the fleet refuses it rather than running it as a sweep (the agent-first invariant during
 # rollout). Dispatch of discover stays control-plane-gated (the module ships dark) regardless.
 _HANDLED_TASK_TYPES = frozenset(
-    {"local_network_scan", "network_assessment_discover_v1", "network_assessment_collect_v1"}
+    {
+        "local_network_scan",
+        "network_assessment_discover_v1",
+        "network_assessment_collect_v1",
+        "controlled_validation_v1",
+    }
 )
 
 
@@ -806,16 +812,23 @@ async def _run_task(token: str, task: dict, *, state: AgentState | None = None) 
             settings, token, task_id, reason=f"unsupported task type: {task_type!r}"
         )
         return
-    if task_type in ("network_assessment_discover_v1", "network_assessment_collect_v1"):
+    if task_type in (
+        "network_assessment_discover_v1",
+        "network_assessment_collect_v1",
+        "controlled_validation_v1",
+    ):
         if state is None:  # defensive: the poll loop always threads state in on this path
             await control_plane.task_failed(
                 settings, token, task_id, reason="internal: agent state unavailable"
             )
             return
         # The signed-job path: verify the control plane's signature BEFORE reading any target field
-        # (agent-first), then act. Discover probes; collect reads a device config with a local cred.
+        # (agent-first), then act. Discover probes; collect reads a device config with a local cred;
+        # controlled validation runs one bounded read-only probe against a single signed endpoint.
         if task_type == "network_assessment_discover_v1":
             await _run_assessment_discover(state, token, task)
+        elif task_type == "controlled_validation_v1":
+            await _run_controlled_validation(state, token, task)
         else:
             await _run_assessment_collect(state, token, task)
         return
@@ -1260,6 +1273,94 @@ async def _run_assessment_discover(state: AgentState, token: str, task: dict) ->
         raise
     except Exception as exc:  # noqa: BLE001 - report any failure rather than dropping the task
         logger.error("Assessment discover %s failed: %s", task_id, exc)
+        await control_plane.task_failed(
+            settings, token, task_id, reason=f"{type(exc).__name__}: {exc}"
+        )
+
+
+async def _run_controlled_validation(state: AgentState, token: str, task: dict) -> None:
+    """Run one control-plane-signed Controlled Validation plan: verify, bounded read-only probe, sign.
+
+    Agent-first and minimal-impact: the inline-signed plan is verified against the control plane's
+    registered keys BEFORE any endpoint field is read or any socket opened, the step's safety and
+    operation classes are checked against the agent's own envelope, and the single probe runs strictly
+    inside the SMALLER of the signed budget and the agent's hard local ceiling. The result is sealed
+    with the agent's own enrolment key; the control plane re-verifies it, binds it to the plan it
+    issued, and seals a receipt. A validator result is an OBSERVATION; it never sets a finding."""
+    task_id = task["id"]
+    plan = (task.get("tool_config") or {}).get("plan")
+    if not assessment_validate.verify_plan(
+        plan, cp_public_keys=state.cp_assessment_public_keys or []
+    ):
+        # Verified BEFORE task_started and BEFORE any socket: a plan the agent cannot trust is refused
+        # with zero target activity. An empty key list fails closed here too.
+        logger.warning("Refused validation plan %s: signature/schema verification failed", task_id)
+        await control_plane.task_failed(
+            settings, token, task_id, reason="signed validation plan failed verification"
+        )
+        return
+    if not state.signing_key_seed:
+        await control_plane.task_failed(
+            settings, token, task_id, reason="agent has no signing key to sign the result"
+        )
+        return
+    step = plan["steps"][0]
+    if not assessment_validate.step_is_runnable(step):
+        logger.warning(
+            "Refused validation plan %s: step outside the minimal-impact envelope", task_id
+        )
+        await control_plane.task_failed(
+            settings,
+            token,
+            task_id,
+            reason="validation step is outside the agent's minimal-impact envelope",
+        )
+        return
+    if assessment_validate.plan_is_expired(plan):
+        await control_plane.task_failed(
+            settings, token, task_id, reason="validation plan has expired"
+        )
+        return
+
+    await control_plane.task_started(settings, token, task_id)
+    try:
+        budget = assessment_validate.effective_budget(step["budget"])
+        started_at = datetime.now(UTC).isoformat()
+        observation = await assessment_validate.probe_endpoint(step["endpoint"], budget)
+        completed_at = datetime.now(UTC).isoformat()
+        evidence_entry, _payload_bytes, _descriptor_bytes = assessment_validate.build_evidence(
+            plan, observation, captured_at=completed_at
+        )
+        result = assessment_validate.build_validation_result(
+            plan,
+            observation=observation,
+            evidence_entry=evidence_entry,
+            started_at=started_at,
+            completed_at=completed_at,
+            budget_used={
+                "requests": observation["requests"],
+                "bytes_sent": observation["sent_bytes"],
+                "bytes_received": observation["received_bytes"],
+            },
+        )
+        sealed = assessment_validate.sign_validation_result(
+            result, seed_b64=state.signing_key_seed
+        )
+        await control_plane.submit_validation_result(
+            settings, token, task_id, result=sealed, completed_at=completed_at
+        )
+        logger.info(
+            "Controlled validation %s: %s on %s:%s (outcome %s)",
+            task_id,
+            step["endpoint"]["protocol"],
+            step["endpoint"]["address"],
+            step["endpoint"]["port"],
+            observation["outcome"],
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - report any failure rather than dropping the task
+        logger.error("Controlled validation %s failed: %s", task_id, exc)
         await control_plane.task_failed(
             settings, token, task_id, reason=f"{type(exc).__name__}: {exc}"
         )
