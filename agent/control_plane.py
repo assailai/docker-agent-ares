@@ -262,6 +262,32 @@ async def submit_validation_result(
     resp.raise_for_status()
 
 
+async def submit_pentest_result(
+    settings: Settings,
+    token: str,
+    task_id: str,
+    *,
+    result: dict,
+    completed_at: str | None = None,
+) -> None:
+    """Submit a signed pentest technique result for a pentest-technique task.
+
+    ``result`` is the agent-sealed ``PentestTechniqueResult`` (inline ``result_signature``). The
+    control plane verifies that signature against the agent's REGISTERED result key, binds the result
+    to the plan it dispatched (and its embedded signed approval), and records it; the agent only
+    delivers, and a non-2xx is raised so the task loop reports the failure."""
+    body: dict[str, object] = {"result": result}
+    if completed_at is not None:
+        body["completed_at"] = completed_at
+    async with _client(settings) as client:
+        resp = await client.post(
+            f"/api/v1/agent/tasks/{task_id}/pentest-result",
+            json=body,
+            headers=_auth(token),
+        )
+    resp.raise_for_status()
+
+
 async def submit_assessment_artifact(
     settings: Settings,
     token: str,

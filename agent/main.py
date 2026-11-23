@@ -40,6 +40,7 @@ from agent import (
     assessment_discover,
     assessment_validate,
     pcap_capture,
+    pentest_execute,
     protocols,
     snmp,
 )
@@ -791,6 +792,7 @@ _HANDLED_TASK_TYPES = frozenset(
         "network_assessment_discover_v1",
         "network_assessment_collect_v1",
         "controlled_validation_v1",
+        "pentest_technique_v1",
     }
 )
 
@@ -816,6 +818,7 @@ async def _run_task(token: str, task: dict, *, state: AgentState | None = None) 
         "network_assessment_discover_v1",
         "network_assessment_collect_v1",
         "controlled_validation_v1",
+        "pentest_technique_v1",
     ):
         if state is None:  # defensive: the poll loop always threads state in on this path
             await control_plane.task_failed(
@@ -824,11 +827,14 @@ async def _run_task(token: str, task: dict, *, state: AgentState | None = None) 
             return
         # The signed-job path: verify the control plane's signature BEFORE reading any target field
         # (agent-first), then act. Discover probes; collect reads a device config with a local cred;
-        # controlled validation runs one bounded read-only probe against a single signed endpoint.
+        # controlled validation runs one bounded read-only probe against a single signed endpoint;
+        # pentest runs one bounded, non-destructive read-only technique against a single signed target.
         if task_type == "network_assessment_discover_v1":
             await _run_assessment_discover(state, token, task)
         elif task_type == "controlled_validation_v1":
             await _run_controlled_validation(state, token, task)
+        elif task_type == "pentest_technique_v1":
+            await _run_pentest_technique(state, token, task)
         else:
             await _run_assessment_collect(state, token, task)
         return
@@ -1361,6 +1367,73 @@ async def _run_controlled_validation(state: AgentState, token: str, task: dict) 
         raise
     except Exception as exc:  # noqa: BLE001 - report any failure rather than dropping the task
         logger.error("Controlled validation %s failed: %s", task_id, exc)
+        await control_plane.task_failed(
+            settings, token, task_id, reason=f"{type(exc).__name__}: {exc}"
+        )
+
+
+async def _run_pentest_technique(state: AgentState, token: str, task: dict) -> None:
+    """Run one control-plane-signed, read-only pentest technique: verify, deny-first gate, probe, sign.
+
+    Agent-first and read-only: the plan's own signature AND its embedded approval's signature are
+    verified against the control plane's keys BEFORE any target field is read; the agent then re-runs
+    its own deny-first gate (a supported read-only technique, an approval bound to the plan, an
+    unexpired plan, a target that passes the immutable safety deny-list and the engagement scope). A
+    gate refusal emits a signed DENIED result with zero target activity; otherwise the one bounded,
+    non-destructive technique runs. The result is sealed with the agent's own key; the control plane
+    re-verifies it, binds it to the plan it dispatched, and records it. Never changes target state."""
+    task_id = task["id"]
+    plan = (task.get("tool_config") or {}).get("plan")
+    if not pentest_execute.verify_plan(plan, cp_public_keys=state.cp_assessment_public_keys or []):
+        logger.warning("Refused pentest plan %s: signature/schema verification failed", task_id)
+        await control_plane.task_failed(
+            settings, token, task_id, reason="signed pentest plan failed verification"
+        )
+        return
+    if not state.signing_key_seed:
+        await control_plane.task_failed(
+            settings, token, task_id, reason="agent has no signing key to sign the result"
+        )
+        return
+
+    await control_plane.task_started(settings, token, task_id)
+    try:
+        started_at = datetime.now(UTC).isoformat()
+        denial = pentest_execute.deny_first_reason(plan)
+        if denial is not None:
+            # Authentic plan, refused by the agent's own gate: record an auditable DENIED result with
+            # zero target activity rather than silently failing.
+            logger.warning("Pentest plan %s denied by the agent gate: %s", task_id, denial)
+            observation = {"outcome": "DENIED", "summary": denial, "attempts": 0}
+            completed_at = datetime.now(UTC).isoformat()
+            result = pentest_execute.build_result(
+                plan,
+                observation,
+                started_at=started_at,
+                completed_at=completed_at,
+                outcome="DENIED",
+            )
+        else:
+            observation = await pentest_execute.run_technique(plan)
+            completed_at = datetime.now(UTC).isoformat()
+            result = pentest_execute.build_result(
+                plan, observation, started_at=started_at, completed_at=completed_at
+            )
+        sealed = pentest_execute.sign_result(result, seed_b64=state.signing_key_seed)
+        await control_plane.submit_pentest_result(
+            settings, token, task_id, result=sealed, completed_at=completed_at
+        )
+        logger.info(
+            "Pentest technique %s: %s on %s (outcome %s)",
+            task_id,
+            plan["technique_id"],
+            plan["target"],
+            result["outcome"],
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - report any failure rather than dropping the task
+        logger.error("Pentest technique %s failed: %s", task_id, exc)
         await control_plane.task_failed(
             settings, token, task_id, reason=f"{type(exc).__name__}: {exc}"
         )
