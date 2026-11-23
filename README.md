@@ -138,15 +138,19 @@ It also accepts the token as an argument or prompts for it interactively. Works 
 and Windows (Git Bash / WSL).
 
 Fetch it from the release tag, not from `main`, so that a command you issued last month still runs
-the script that was reviewed for that release rather than whatever `main` holds today. A git tag is
-movable, and creatable, by default. The `v*` tags on this repository are protected by a ruleset
-that refuses updates, deletions **and creation by anyone but the release workflow**, so `v3.15.1`
-names one commit permanently and only a merge to the protected branch can have put it there.
-Creation was the gap: until 3.15.1 the ruleset blocked only updates and deletions, so an account
-with push access could create the upcoming `v<version>` on a commit of its own and `auto-tag.yml`
-would accept it by name. It now checks that the tag resolves to a commit in `main`'s history that
-cut this exact version, and fails the release if it does not. The dashboard's install command pins
-the current release for you.
+the script that was reviewed for that release rather than whatever `main` holds today. The `v*`
+tags on this repository are protected by a ruleset that refuses updates and deletions, so once
+`v3.15.1` exists it names one commit permanently.
+
+Be precise about what that does and does not cover, because the two halves are not the same.
+A tag is also **creatable** by anyone with push access, and the ruleset does not stop that —
+GitHub will not accept the Actions app as a bypass actor here, so a creation rule would also block
+the release workflow from pushing the tag at all. What covers it instead is `auto-tag.yml`: before
+3.15.1 it accepted a pre-existing `v<version>` by name and skipped the image build, ending green;
+it now checks that the tag resolves to a commit in `main`'s history that cut that exact version,
+and fails the release if it does not. So a forged tag stops the release rather than becoming one —
+and because that release never completes, the version is never marked current, which is what the
+README and the dashboard pin. The dashboard's install command pins the current release for you.
 
 To read the script before running it, fetch it and compare it with the tag in git, which is the
 same object the ruleset protects:
@@ -616,11 +620,9 @@ Notes:
   ```
 
   The identity names `refs/heads/main` and nothing else. `main` is the protected branch, so a
-  release signed under it was reviewed. Tag refs were not, since anyone with push access could
-  create one, so from 3.15.0 they are no longer trusted and no workflow builds release images from
-  a tag push. (From 3.15.1 a ruleset refuses `v*` tag creation to everyone but the release
-  workflow, but the identity stays as it is: what it should name is the ref that is reviewed, and
-  that is the branch.)
+  release signed under it was reviewed. Tag refs are not — anyone with push access can create one,
+  and no ruleset can prevent that without also stopping the release workflow — so from 3.15.0 they
+  are no longer trusted and no workflow builds release images from a tag push.
 
   If this fails while the image is genuinely published, the expected signer identity has drifted from
   what CI signs with — the updater logs both sides of the comparison on failure.
@@ -706,11 +708,11 @@ tag and the GitHub release, and builds, pushes and cosign-signs both images
 
 Two things worth knowing:
 
-- **You cannot push the `v<version>` tag by hand**, and should not want to: a ruleset refuses `v*`
-  tag creation to everyone but the release workflow. Should one exist anyway, `auto-tag.yml` builds
-  its images when it names the commit being released and fails the run when it does not — where it
-  used to accept any tag of the right name and silently skip the build, which left releases tagged
-  but unpublished.
+- **Don't push the `v<version>` tag by hand.** Nothing stops you — the ruleset on `v*` refuses
+  updates and deletions, not creation — but `auto-tag.yml` now judges the commit such a tag names.
+  On the commit being released it builds the images, which is a repair: it used to accept any tag
+  of the right name and silently skip the build, leaving a tag and a release with no images.
+  Anywhere else it fails the run.
 - **A release that changes `updater/` rolls out with the agent** on installs at 3.14.0 or later,
   since the updater updates itself. Installs older than that have to recreate it once: see
   [Auto-update](#auto-update-the-companion-updater).

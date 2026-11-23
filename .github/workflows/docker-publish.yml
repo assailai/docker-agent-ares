@@ -1,11 +1,12 @@
 name: Build and Publish Docker Image
 
-# No `tags: v*` trigger. Anyone with push access could create a tag, and that run would have
+# No `tags: v*` trigger. Anyone with push access can create a tag, and that run would have
 # reached the Docker Hub credentials and signed an image under a release tag with the identity the
 # whole fleet trusts - without the commit ever being reviewed on main. auto-tag.yml is the one
-# producer of release images, and it only runs on a merge to the protected branch. A ruleset now
-# refuses `v*` tag creation to everyone but that workflow too (ARES-2351); this trigger stays
-# absent regardless, since a ruleset is repository configuration and this file is the code.
+# producer of release images, and it only runs on a merge to the protected branch. Tag creation
+# cannot be blocked at the ref: GitHub will not accept the Actions app as a ruleset bypass actor
+# here, so the rule would stop auto-tag.yml pushing the release tag too (ARES-2351). This trigger
+# staying absent is what makes that survivable.
 on:
   push:
     branches:

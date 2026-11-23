@@ -82,9 +82,14 @@ The Ares Agent implements multiple layers of security:
 - Every third-party action is pinned by commit, and so is every container those actions run on the
   signing runner — the QEMU emulator it runs `--privileged` and the BuildKit builder that produces
   the bytes being signed. An action pinned by commit whose image floats pins nothing
-- `v*` tags can be created only by the release workflow. `auto-tag.yml` additionally refuses a
-  pre-existing release tag that does not resolve to a commit in `main`'s history that cut that
-  exact version, rather than trusting the tag's name
+- A ruleset refuses updates and deletions of `v*` tags, so a release tag names one commit
+  permanently once it exists. Creation is not restricted at the ref, and cannot be: GitHub will
+  not accept the Actions app as a bypass actor, so the rule would stop the release workflow
+  pushing the tag as well
+- What covers creation is `auto-tag.yml`, which refuses a pre-existing release tag that does not
+  resolve to a commit in `main`'s history that cut that exact version, rather than trusting the
+  tag's name. A forged tag fails the release instead of becoming one, so that version is never
+  marked current and no install path is ever pointed at it
 
 ### Update Integrity
 - The companion updater applies only an image cosign verifies against this repository's build

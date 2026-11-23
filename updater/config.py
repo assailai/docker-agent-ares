@@ -55,13 +55,15 @@ class UpdaterSettings(BaseSettings):
     #   * the REF is the caller's ref, since docker-build.yml is invoked as a local reusable
     #     workflow. The release path (auto-tag.yml, on a version-bump merge) therefore signs at
     #     refs/heads/main, which is the protected branch: a merge there has been reviewed.
-    # refs/tags/v* used to be accepted too, and must not be. Any account with push access
-    # could create a tag, no ruleset stopped it, and docker-publish.yml built and signed on one
-    # - so an attacker who could not merge to main could still publish an image under release
-    # tags with the identity the whole fleet trusts. docker-publish.yml no longer triggers on
-    # tags, and docker-build.yml refuses to push from any other ref. A ruleset now refuses `v*`
-    # tag creation to everyone but the release workflow as well (ARES-2351), but this stays as
-    # it is: what the identity should name is the ref that gets REVIEWED, and that is a branch.
+    # refs/tags/v* used to be accepted too, and must not be. Any account with push access can
+    # create a tag - and no ruleset can stop that without also stopping auto-tag.yml, since
+    # GitHub will not accept the Actions app as a bypass actor here (ARES-2351) - and
+    # docker-publish.yml built and signed on one, so an attacker who could not merge to main
+    # could still publish an image under release tags with the identity the whole fleet trusts.
+    # docker-publish.yml no longer triggers on tags, docker-build.yml refuses to push from any
+    # other ref, and auto-tag.yml fails the release when a v<version> tag does not name the
+    # reviewed commit that cut it. What this identity should name is the ref that gets REVIEWED,
+    # and that is a branch.
     # So the boundary this enforces is "built and signed from this repo's protected branch by its
     # build workflow, via GitHub OIDC" - branch / latest / sha images on main satisfy it too. The
     # updater only ever pulls <repo>:<target-version> as named by the control plane, and _tick
