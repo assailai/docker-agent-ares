@@ -39,8 +39,8 @@
 set -euo pipefail
 
 # Defaults to the current pinned release; override with ARES_VERSION=X.Y.Z or ARES_IMAGE=<full ref>.
-IMAGE="${ARES_IMAGE:-docker.io/assailai/ares-agent:${ARES_VERSION:-3.15.0}}"
-UPDATER_IMAGE="${ARES_UPDATER_IMAGE:-docker.io/assailai/ares-updater:${ARES_VERSION:-3.15.0}}"
+IMAGE="${ARES_IMAGE:-docker.io/assailai/ares-agent:${ARES_VERSION:-3.15.1}}"
+UPDATER_IMAGE="${ARES_UPDATER_IMAGE:-docker.io/assailai/ares-updater:${ARES_VERSION:-3.15.1}}"
 # cosign, to check both images before either one runs. By DIGEST, and from Sigstore rather than
 # from our own updater image: a substituted ares-updater must not be the thing that vouches for
 # itself. v3.1.4, the version Dockerfile.updater builds from source; the same digest is served from

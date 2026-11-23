@@ -131,7 +131,7 @@ The bootstrap script checks Docker is available, starts the container, and waits
 reports online:
 
 ```bash
-ARES_TOKEN=<your-registration-token> bash <(curl -fsSL https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.0/scripts/bootstrap.sh)
+ARES_TOKEN=<your-registration-token> bash <(curl -fsSL https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.1/scripts/bootstrap.sh)
 ```
 
 It also accepts the token as an argument or prompts for it interactively. Works on macOS, Linux,
@@ -140,7 +140,7 @@ and Windows (Git Bash / WSL).
 Fetch it from the release tag, not from `main`, so that a command you issued last month still runs
 the script that was reviewed for that release rather than whatever `main` holds today. A git tag is
 movable, and creatable, by default. The `v*` tags on this repository are protected by a ruleset
-that refuses updates, deletions **and creation by anyone but the release workflow**, so `v3.15.0`
+that refuses updates, deletions **and creation by anyone but the release workflow**, so `v3.15.1`
 names one commit permanently and only a merge to the protected branch can have put it there.
 Creation was the gap: until 3.15.1 the ruleset blocked only updates and deletions, so an account
 with push access could create the upcoming `v<version>` on a commit of its own and `auto-tag.yml`
@@ -152,10 +152,10 @@ To read the script before running it, fetch it and compare it with the tag in gi
 same object the ruleset protects:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.0/scripts/bootstrap.sh
-git -c advice.detachedHead=false clone --depth 1 --branch v3.15.0 \
-    https://github.com/assailai/docker-agent-ares /tmp/ares-v3.15.0
-diff bootstrap.sh /tmp/ares-v3.15.0/scripts/bootstrap.sh && echo "matches the tag"
+curl -fsSLO https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.1/scripts/bootstrap.sh
+git -c advice.detachedHead=false clone --depth 1 --branch v3.15.1 \
+    https://github.com/assailai/docker-agent-ares /tmp/ares-v3.15.1
+diff bootstrap.sh /tmp/ares-v3.15.1/scripts/bootstrap.sh && echo "matches the tag"
 ```
 
 Before it starts anything, the installer cosign-verifies both images against the Ares publisher
@@ -180,8 +180,8 @@ The `assailai/ares-agent` and `assailai/ares-updater` images are public on Docke
 image pull secret is required.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.0/deploy/k8s/ares-agent.yaml
-curl -fsSLO https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.0/scripts/verify-images.sh
+curl -fsSLO https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.1/deploy/k8s/ares-agent.yaml
+curl -fsSLO https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.1/scripts/verify-images.sh
 # verify both images and rewrite the manifest to the digests cosign checked
 bash verify-images.sh ares-agent.yaml
 # set ARES_TOKEN in the Secret at the top of the file, then:
@@ -609,8 +609,8 @@ Notes:
   need it installed locally):
 
   ```bash
-  docker run --rm --entrypoint cosign docker.io/assailai/ares-updater:3.15.0 \
-    verify docker.io/assailai/ares-agent:3.15.0 \
+  docker run --rm --entrypoint cosign docker.io/assailai/ares-updater:3.15.1 \
+    verify docker.io/assailai/ares-agent:3.15.1 \
     --certificate-identity-regexp '^https://github\.com/assailai/docker-agent-ares/\.github/workflows/docker-build\.yml@refs/heads/main$' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```
@@ -682,7 +682,7 @@ docker volume rm ares-agent-data
 Or let the installer do it, which is the same thing plus a clean re-enrollment:
 
 ```bash
-ARES_RESET=1 ARES_TOKEN=<fresh-token> bash <(curl -fsSL https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.0/scripts/bootstrap.sh)
+ARES_RESET=1 ARES_TOKEN=<fresh-token> bash <(curl -fsSL https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.1/scripts/bootstrap.sh)
 ```
 
 ## Versioning
