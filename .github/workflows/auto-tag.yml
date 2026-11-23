@@ -30,7 +30,10 @@ jobs:
     outputs:
       version: ${{ steps.ver.outputs.version }}
       tag: ${{ steps.ver.outputs.tag }}
-      created: ${{ steps.release.outputs.created }}
+      # not "did I create the tag": a tag this run finds already on this very commit (a hand-pushed
+      # one, or an earlier run that died after tagging) still has no images, and skipping the build
+      # for it is what left releases tagged but unpublished.
+      build: ${{ steps.release.outputs.build }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -48,6 +51,12 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
+      # An existing tag is not proof that the release was already cut from main. This step used to
+      # accept one by NAME alone: it exited green with the image build skipped, so an account with
+      # push access but no right to merge could create the upcoming v<version> on a commit of its
+      # own, and the ruleset then made THAT commit the permanent release tag - the one every
+      # documented install URL fetches bootstrap.sh and the k8s manifest from, before any cosign
+      # check the genuine script would do. So judge the commit, not the name (ARES-2351).
       - name: Create tag and release if new
         id: release
         env:
@@ -55,9 +64,32 @@ jobs:
           TAG: ${{ steps.ver.outputs.tag }}
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
-            echo "Tag ${TAG} already exists; nothing to do."
-            echo "created=false" >> "$GITHUB_OUTPUT"
+          # ^{commit} so an annotated tag and a lightweight one answer the same question.
+          if at="$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}")"; then
+            # 1. it has to name a commit in this branch's reviewed history. Anything else is
+            #    unreviewed code wearing a release name, and the run fails rather than skipping.
+            if ! git merge-base --is-ancestor "${at}" "${GITHUB_SHA}"; then
+              echo "::error::${TAG} points at ${at}, which is not in the history of main at ${GITHUB_SHA}. A release tag must name a reviewed commit: find out who pushed it before deleting it."
+              exit 1
+            fi
+            # 2. and it has to be the commit that cut THIS version. Check 1 on its own would wave
+            #    through a tag parked on any older main commit.
+            tagged="$(git show "${at}:agent/__version__.py" 2>/dev/null | sed -n 's/^__version__ = "\(.*\)"/\1/p' || true)"
+            if [ "${tagged}" != "${VERSION}" ]; then
+              echo "::error::${TAG} points at ${at}, whose agent/__version__.py reads '${tagged:-nothing}' rather than ${VERSION}."
+              exit 1
+            fi
+            # 3. a legitimate tag on THIS commit is a release that was started and may have no
+            #    images: an earlier run that died after tagging, or a dispatch re-run. Build it.
+            #    On an older commit it is a past release, and rebuilding would publish a different
+            #    digest under a semver tag that is supposed to be immutable, so leave it alone.
+            if [ "${at}" = "${GITHUB_SHA}" ]; then
+              echo "Tag ${TAG} already names this commit; building its images."
+              echo "build=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Tag ${TAG} is the earlier release at ${at}; nothing to do."
+              echo "build=false" >> "$GITHUB_OUTPUT"
+            fi
             exit 0
           fi
           git config user.name "github-actions[bot]"
@@ -67,11 +99,11 @@ jobs:
           gh release create "${TAG}" \
             --title "Ares Docker Agent ${VERSION}" \
             --generate-notes
-          echo "created=true" >> "$GITHUB_OUTPUT"
+          echo "build=true" >> "$GITHUB_OUTPUT"
 
   images:
     needs: tag
-    if: needs.tag.outputs.created == 'true'
+    if: needs.tag.outputs.build == 'true'
     permissions:
       contents: read
       id-token: write
