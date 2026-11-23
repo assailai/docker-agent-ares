@@ -25,6 +25,7 @@ import pytest
 _REPO = Path(__file__).resolve().parents[1]
 BOOTSTRAP = _REPO / "scripts" / "bootstrap.sh"
 VERIFY = _REPO / "scripts" / "verify-images.sh"
+README = _REPO / "README.md"
 COMPOSE = _REPO / "docker-compose.yml"
 K8S = _REPO / "deploy" / "k8s" / "ares-agent.yaml"
 VERSION_FILE = _REPO / "agent" / "__version__.py"
@@ -789,3 +790,28 @@ def test_repo_of_finds_the_repository_in_every_reference_form(ref: str, expected
 
     # then it strips the tag and the digest, both together and apart
     assert done.stdout == expected, f"repo_of({ref!r}) = {done.stdout!r}"
+
+
+@pytest.mark.parametrize(
+    ("option", "apply_command"),
+    [("### Option B: Docker Compose", "docker compose up -d"), ("### Option D: Kubernetes", "kubectl apply -f ares-agent.yaml")],
+    ids=["compose", "kubernetes"],
+)
+def test_the_documented_install_verifies_before_it_starts_anything(
+    option: str, apply_command: str
+) -> None:
+    # given the install option's own section of the README
+    readme = README.read_text()
+    start = readme.index(option)
+    end = readme.index("\n### ", start + len(option))
+    section = readme[start:end]
+
+    # then the verify step is in it, and it comes BEFORE the command that starts the containers.
+    # On Kubernetes this ordering is the whole control - kubectl applies a bare tag quite happily -
+    # so a README that lost the step, or printed it afterwards, would leave the k8s path exactly
+    # where ARES-2351 found it.
+    assert "verify-images.sh" in section, f"{option} no longer tells the operator to verify"
+    assert apply_command in section, f"{option} no longer shows {apply_command!r}"
+    assert section.index("verify-images.sh") < section.index(apply_command), (
+        f"{option} starts the containers before verifying them"
+    )

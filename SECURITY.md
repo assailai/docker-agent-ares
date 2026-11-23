@@ -58,6 +58,34 @@ The Ares Agent implements multiple layers of security:
 - Images signed with keyless cosign (Sigstore/OIDC); the companion updater cosign-verifies the target digest before applying an update
 - Regular Docker Scout vulnerability scanning
 
+### Install Integrity
+- Update integrity below begins once an updater is running, so the first image has to establish
+  it. All three documented install paths verify before anything starts: `scripts/bootstrap.sh`
+  does it itself, and Compose and Kubernetes go through `scripts/verify-images.sh`
+- Verification is a digest-pinned cosign from Sigstore, never the `ares-updater` image: one of the
+  two artifacts being checked must not be the thing that vouches for itself
+- What is started is the **digest** that was verified, not the tag it was found under. The
+  `ares-updater` container holds the Docker socket or a ServiceAccount able to patch its own
+  Deployment, so an image substituted at install time is host-equivalent access and would then
+  decide every later verification
+- Compose enforces this: `docker-compose.yml` names no image of its own and refuses to start until
+  the verified digests are in `.env`. Kubernetes cannot — `kubectl` has no variable substitution,
+  so pinning the manifest is a documented step rather than a gate, and an admission policy is what
+  enforces it if you need that
+- Fail-closed, with no skip flag: a host that cannot reach the registry, ghcr.io, Fulcio or Rekor
+  fails the install instead of proceeding unverified
+
+### Release Integrity
+- Release images are built and signed only by `docker-build.yml` on `refs/heads/main`, the
+  protected branch. The job refuses to push from any other ref, and its credentials live in a
+  deployment environment restricted to that branch
+- Every third-party action is pinned by commit, and so is every container those actions run on the
+  signing runner — the QEMU emulator it runs `--privileged` and the BuildKit builder that produces
+  the bytes being signed. An action pinned by commit whose image floats pins nothing
+- `v*` tags can be created only by the release workflow. `auto-tag.yml` additionally refuses a
+  pre-existing release tag that does not resolve to a commit in `main`'s history that cut that
+  exact version, rather than trusting the tag's name
+
 ### Update Integrity
 - The companion updater applies only an image cosign verifies against this repository's build
   workflow at `refs/heads/main`, and applies the digest that was attested rather than re-resolving
