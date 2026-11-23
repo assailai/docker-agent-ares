@@ -733,11 +733,17 @@ def test_an_empty_grep_result_does_not_end_the_verifier_silently(name: str) -> N
     # `set -e` killed the script - in between the step heading and the error that explains what to
     # do about it. Pointing it at a file naming no Ares image printed a heading, then stopped.
 
-    # given one of the functions that scans a file
-    greps = [line.strip() for line in _function(name, VERIFY).splitlines() if "grep -" in line]
+    # given the greps this function runs for their OUTPUT - captured into a variable, or
+    # redirected to a file. A grep used as an `if` or `while` condition is exempt and needs no
+    # guard: the shell is being asked for that status on purpose, so `set -e` leaves it alone.
+    greps = [
+        line.strip()
+        for line in _function(name, VERIFY).splitlines()
+        if "grep " in line and not re.match(r"\s*(if|while|until)\s", line)
+    ]
 
-    # then each grep says what an empty result means, rather than leaving pipefail to decide
-    assert greps, f"{name} no longer greps"
+    # then each says what an empty result means, rather than leaving pipefail to decide
+    assert greps, f"{name} no longer greps for output"
     assert all("|| true" in line for line in greps), (
         f"{name} has a grep whose empty result pipefail turns into a silent exit: {greps}"
     )
@@ -765,7 +771,7 @@ def test_compose_cannot_start_an_image_that_was_never_verified() -> None:
     # kubectl has no substitution, so the manifest can only be pinned by rewriting it.
     assert len(images) == 2, f"expected an agent and an updater image, found {images}"
     for image in images:
-        assert image.startswith("${ARES_") and ":?" in image, (
+        assert image.startswith("${ARES_") and "_DIGEST:?" in image, (
             f"compose would start {image} without checking it"
         )
         assert "verify-images.sh" in image, (

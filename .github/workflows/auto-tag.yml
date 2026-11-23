@@ -69,7 +69,7 @@ jobs:
             # 1. it has to name a commit in this branch's reviewed history. Anything else is
             #    unreviewed code wearing a release name, and the run fails rather than skipping.
             if ! git merge-base --is-ancestor "${at}" "${GITHUB_SHA}"; then
-              echo "::error::${TAG} points at ${at}, which is not in the history of main at ${GITHUB_SHA}. A release tag must name a reviewed commit: find out who pushed it before deleting it."
+              echo "::error::${TAG} points at ${at}, which is not in the history of main at ${GITHUB_SHA}. A release tag must name a reviewed commit. Find out who pushed it; note that the v* ruleset refuses deletion, so clearing it needs someone with ruleset admin to lift that rule, delete the tag, and put it back."
               exit 1
             fi
             # 2. and it has to be the commit that cut THIS version. Check 1 on its own would wave
@@ -83,6 +83,15 @@ jobs:
             #    images: an earlier run that died after tagging, or a dispatch re-run. Build it.
             #    On an older commit it is a past release, and rebuilding would publish a different
             #    digest under a semver tag that is supposed to be immutable, so leave it alone.
+            #
+            #    That cuts both ways, and the limit is deliberate: the repair only works while
+            #    main's HEAD is still the bump commit. Let one unrelated merge land after a
+            #    release that died post-tag and a dispatch reports "earlier release; nothing to
+            #    do", with no way back - the images have to be published by hand. Widening this
+            #    to "the newest commit carrying this version" would fix that and would also let
+            #    an ordinary dispatch republish a release that already has images, under a semver
+            #    tag whose whole promise is one set of bytes. Of the two, a manual repair is the
+            #    cheaper failure, so the limit stays and is written down (ARES-2351, review).
             if [ "${at}" = "${GITHUB_SHA}" ]; then
               echo "Tag ${TAG} already names this commit; building its images."
               echo "build=true" >> "$GITHUB_OUTPUT"

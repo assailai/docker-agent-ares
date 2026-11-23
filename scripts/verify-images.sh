@@ -20,8 +20,8 @@
 #   bash scripts/verify-images.sh                     # writes .env for docker-compose.yml
 #   bash scripts/verify-images.sh ares-agent.yaml     # rewrites a k8s manifest to the digests
 #
-# With no argument it verifies this release's two images and writes ARES_AGENT_IMAGE and
-# ARES_UPDATER_IMAGE into ./.env, which is where docker-compose.yml reads them from - and that file
+# With no argument it verifies this release's two images and writes ARES_AGENT_DIGEST and
+# ARES_UPDATER_DIGEST into ./.env, which is where docker-compose.yml reads them from - and that file
 # names no image of its own, so `docker compose up` stops here rather than pulling something
 # unverified. With a file it verifies every Ares image the file names and rewrites each to
 # <ref>@sha256:..., leaving the file untouched if anything fails. Running it twice is a no-op.
@@ -225,20 +225,25 @@ cannot_verify() {
     exit 1
 }
 
-# Replace the ARES_* image lines in .env and leave every other line alone - an operator's
-# ARES_TOKEN lives in that same file. Written to a temporary file and moved into place, so an
-# interrupted run cannot leave a half-written .env that compose would read.
+# Replace the ARES_*_DIGEST lines in .env, and this function's own header, leaving every other
+# line alone - an operator's ARES_TOKEN lives in that same file. Dropping the header too is what
+# keeps a third run from leaving a third copy of it. Written to a temporary file and moved into
+# place, so an interrupted run cannot leave a half-written .env that compose would read.
+#
+# _DIGEST rather than _IMAGE because ARES_IMAGE / ARES_UPDATER_IMAGE are this script's own INPUTS,
+# and compose prefers the shell environment over .env: one name for both jobs let an exported
+# override outrank the digest just verified (ARES-2351, review).
 write_env() {
     local env_file="$1" agent="$2" updater="$3" tmp
     tmp="$(mktemp "${env_file}.XXXXXX")"
     if [ -f "$env_file" ]; then
-        grep -vE '^[[:space:]]*(ARES_AGENT_IMAGE|ARES_UPDATER_IMAGE)=' "$env_file" > "$tmp" || true
+        grep -vE '^[[:space:]]*(ARES_AGENT_DIGEST|ARES_UPDATER_DIGEST)=|^# Written by scripts/verify-images\.sh|^# release\. Re-run that script' "$env_file" > "$tmp" || true
     fi
     {
         printf '# Written by scripts/verify-images.sh - the digests cosign verified for this\n'
         printf '# release. Re-run that script after a version bump; do not edit these by hand.\n'
-        printf 'ARES_AGENT_IMAGE=%s\n' "$agent"
-        printf 'ARES_UPDATER_IMAGE=%s\n' "$updater"
+        printf 'ARES_AGENT_DIGEST=%s\n' "$agent"
+        printf 'ARES_UPDATER_DIGEST=%s\n' "$updater"
     } >> "$tmp"
     mv "$tmp" "$env_file"
 }
@@ -258,8 +263,8 @@ pin_compose_env() {
 
     write_env ".env" "$agent" "$updater"
     step "Pinned in .env"
-    info "ARES_AGENT_IMAGE=$agent"
-    info "ARES_UPDATER_IMAGE=$updater"
+    info "ARES_AGENT_DIGEST=$agent"
+    info "ARES_UPDATER_DIGEST=$updater"
     printf '\nNow start it with your registration token:\n\n'
     printf '    ARES_TOKEN=<your-registration-token> docker compose up -d\n\n'
 }
@@ -278,6 +283,16 @@ pin_manifest() {
         error "$file names no docker.io/assailai/ares-agent or ares-updater image."
         error "Point this at the manifest you are about to apply, or run it with no argument"
         error "to pin docker-compose.yml's .env instead."
+        exit 1
+    fi
+    # A compose file names its images through ${ARES_*_DIGEST:?...}, and the message inside each
+    # substitution quotes the very reference this scan looks for. So every reference-bearing line
+    # carrying a `${` means the references are all decoration: rewriting them pins nothing an
+    # engine reads and then sends the operator off to `kubectl apply` a compose file.
+    if ! grep -E "$ARES_IMAGE_PATTERN" "$file" | grep -qv '\${'; then
+        error "Every Ares image $file names sits inside a \${...} substitution."
+        error "That is the shape of docker-compose.yml, whose images come from .env. Run this with"
+        error "no argument to verify and write that .env instead of rewriting the file."
         exit 1
     fi
 
@@ -306,7 +321,17 @@ pin_manifest() {
         # The reference goes into a sed pattern, where its dots would each match any character.
         # ARES_IMAGE_PATTERN admits no other metacharacter, and | is the delimiter, so escaping
         # the dots is the whole job.
-        LC_ALL=C sed -i.pinned "s|${ref//./\\.}|${pinned}|g" "$tmp" && rm -f "${tmp}.pinned"
+        local escaped="${ref//./\\.}"
+        # Consume a digest already on the reference, and refuse to match inside a longer tag.
+        # Neither is hypothetical in a hand-edited manifest: without the first, ":3.15.1" written
+        # over ":3.15.1@sha256:old" stacks two digests on one reference; without the second,
+        # ":3.15.1" matches the front of ":3.15.10". sort -u hands the bare form over first, which
+        # is exactly the order that hurts. Two expressions because the boundary is "end of line,
+        # or a character no reference contains", which one portable expression cannot say.
+        LC_ALL=C sed -i.pinned -E \
+            -e "s|${escaped}(@sha256:[0-9a-f]{64})?$|${pinned}|" \
+            -e "s|${escaped}(@sha256:[0-9a-f]{64})?([^A-Za-z0-9._@-])|${pinned}\2|g" \
+            "$tmp" && rm -f "${tmp}.pinned"
         info "Verified $ref"
         info "  pinned to ${pinned##*@}"
     done <<< "$refs"

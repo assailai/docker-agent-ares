@@ -709,10 +709,18 @@ tag and the GitHub release, and builds, pushes and cosign-signs both images
 Two things worth knowing:
 
 - **Don't push the `v<version>` tag by hand.** Nothing stops you — the ruleset on `v*` refuses
-  updates and deletions, not creation — but `auto-tag.yml` now judges the commit such a tag names.
-  On the commit being released it builds the images, which is a repair: it used to accept any tag
-  of the right name and silently skip the build, leaving a tag and a release with no images.
-  Anywhere else it fails the run.
+  updates and deletions, not creation — but `auto-tag.yml` now judges the commit such a tag names,
+  and the consequences of getting it wrong are not symmetric. On a tag outside `main`'s history,
+  or on a commit that did not cut that version, the run fails; and since the ruleset refuses
+  deletion, clearing that tag needs someone with ruleset admin to lift the rule, delete it and put
+  the rule back. Releases of that version stay blocked until they do.
+- **A release tagged but never published can be repaired by re-running `auto-tag.yml`, but only
+  until `main` moves on.** The build it skips when the tag already exists is the thing that used
+  to leave you a tag and a release with no images; it now runs when the tag names the commit being
+  released. That test is against `main`'s current HEAD, so one unrelated merge after a release that
+  died post-tag and the repair is gone — publish those images by hand. Widening it would let an
+  ordinary re-run republish a release that already has images, under a semver tag whose whole
+  promise is one set of bytes, which is the worse of the two.
 - **A release that changes `updater/` rolls out with the agent** on installs at 3.14.0 or later,
   since the updater updates itself. Installs older than that have to recreate it once: see
   [Auto-update](#auto-update-the-companion-updater).

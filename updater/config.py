@@ -88,14 +88,19 @@ class UpdaterSettings(BaseSettings):
 
 
 def _split_ref(image_ref: str) -> tuple[str, str]:
-    """Split an image ref into (repo, tag). A digest ref (``repo@sha256:...``) has no tag. A
-    trailing ``:`` is a tag only when what follows has no ``/`` (otherwise it is a registry
-    port, e.g. ``reg:5000/img``)."""
-    repo, at, _digest = image_ref.partition("@")
-    if at:
-        return (repo, "")
-    head, sep, tail = image_ref.rpartition(":")
-    return (head, tail) if (sep and "/" not in tail) else (image_ref, "")
+    """Split an image ref into (repo, tag). A trailing ``:`` is a tag only when what follows has no
+    ``/`` (otherwise it is a registry port, e.g. ``reg:5000/img``).
+
+    A reference may carry a tag AND a digest - ``repo:tag@sha256:...`` is legal OCI, and it is what
+    a pinned Kubernetes manifest holds. So take the digest off first and read the tag from what is
+    left. Returning at the digest, as this did until ARES-2351, handed back ``repo:tag`` as the
+    repository, and ``_resolve`` then asked cosign about ``repo:tag:target``: verification failed,
+    the move was refused fail-closed, and auto-update was off for good with nothing logged as
+    wrong. ``repo_of`` in ``scripts/verify-images.sh`` had the same bug, for the same reason.
+    """
+    ref, _at, _digest = image_ref.partition("@")
+    head, sep, tail = ref.rpartition(":")
+    return (head, tail) if (sep and "/" not in tail) else (ref, "")
 
 
 def tag_of(image_ref: str) -> str:
