@@ -7,6 +7,7 @@ unless ``ARES_INSECURE`` is set (local dev against plain http / self-signed).
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import socket
@@ -230,6 +231,33 @@ async def submit_assessment_result(
         resp = await client.post(
             f"/api/v1/agent/tasks/{task_id}/assessment-result",
             json=body,
+            headers=_auth(token),
+        )
+    resp.raise_for_status()
+
+
+async def submit_assessment_artifact(
+    settings: Settings,
+    token: str,
+    task_id: str,
+    *,
+    descriptor_envelope: dict,
+    body: bytes,
+    content_type: str = "application/octet-stream",
+    filename: str = "artifact.bin",
+) -> None:
+    """Upload one signed raw-evidence artifact (e.g. a packet capture) for a task, as multipart.
+
+    ``body`` is the raw bytes (the ``file`` part); ``descriptor_envelope`` is the agent-sealed
+    ``SignedEnvelope`` over an artifact descriptor (the ``descriptor`` part, as JSON). The control
+    plane verifies the signature against the agent's registered key, checks the bytes hash to the
+    sealed ``content_sha256`` and match ``byte_size``, and binds them to the frozen snapshot before
+    storing; the agent only delivers, and a non-2xx is raised so the caller can report it."""
+    async with _client(settings) as client:
+        resp = await client.post(
+            f"/api/v1/agent/tasks/{task_id}/assessment-artifact",
+            data={"descriptor": json.dumps(descriptor_envelope)},
+            files={"file": (filename, body, content_type)},
             headers=_auth(token),
         )
     resp.raise_for_status()
