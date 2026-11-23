@@ -33,7 +33,15 @@ from agent.hostpins import HostPins
 from agent.identify import IdentityProbe
 from agent.kubeinfo import KubeApi, KubeConfigError, KubernetesEvidence, safe_collect
 from agent.progress import ProgressReporter
-from agent import assessment, assessment_collect, assessment_discover, protocols, snmp
+from agent import (
+    assessment,
+    assessment_artifact,
+    assessment_collect,
+    assessment_discover,
+    pcap_capture,
+    protocols,
+    snmp,
+)
 from agent.collectors import ssh_collect, vendor
 from agent.credential_vault import CredentialVault
 from agent.state import AgentState, fingerprint, load_state, save_state
@@ -1398,7 +1406,13 @@ async def _run_assessment_collect(state: AgentState, token: str, task: dict) -> 
     credential = CredentialVault(settings.credential_vault_path).resolve(job["credential_ref"])
     await control_plane.task_started(settings, token, task_id)
     try:
-        controls, coverage, neighbours = await _collect_controls(job, control_ids, credential)
+        capture = await pcap_capture.start([job["target_address"]])
+        try:
+            controls, coverage, neighbours = await _collect_controls(
+                job, control_ids, credential
+            )
+        finally:
+            pcap_bytes = (await capture.stop()) if capture is not None else None
         completed_at = datetime.now(UTC).isoformat()
         result = assessment_collect.build_collect_result(
             job, controls=controls, coverage=coverage, neighbours=neighbours,
@@ -1414,6 +1428,9 @@ async def _run_assessment_collect(state: AgentState, token: str, task: dict) -> 
         await control_plane.submit_assessment_result(
             settings, token, task_id, sealed, completed_at=completed_at
         )
+        await _upload_assessment_pcap(
+            state, token, task_id, job, pcap_bytes=pcap_bytes, captured_at=completed_at
+        )
         logger.info(
             "Assessment collect %s: %d control(s), %d coverage gap(s), %d neighbour(s) on %s",
             task_id, len(controls), len(coverage), len(neighbours), job["target_address"],
@@ -1424,6 +1441,58 @@ async def _run_assessment_collect(state: AgentState, token: str, task: dict) -> 
         logger.error("Assessment collect %s failed: %s", task_id, exc)
         await control_plane.task_failed(
             settings, token, task_id, reason=f"{type(exc).__name__}: {exc}"
+        )
+
+
+async def _upload_assessment_pcap(
+    state: AgentState,
+    token: str,
+    task_id: str,
+    job: dict,
+    *,
+    pcap_bytes: bytes | None,
+    captured_at: str,
+) -> None:
+    """Best-effort: seal and upload a captured pcap as a ``packet_capture`` artifact.
+
+    Never raises, so a capture or upload hiccup cannot fail an assessment that already reported its
+    result. Does nothing when capture was disabled or produced no bytes (the common path)."""
+    if not pcap_bytes or not state.signing_key_seed:
+        return
+    try:
+        descriptor = assessment_artifact.build_artifact_descriptor(
+            job,
+            kind=assessment_artifact.KIND_PACKET_CAPTURE,
+            body=pcap_bytes,
+            captured_at=captured_at,
+        )
+        sealed = assessment.seal_result(
+            descriptor,
+            schema=assessment_artifact.ARTIFACT_SCHEMA,
+            seed_b64=state.signing_key_seed,
+            domain=assessment_artifact.ARTIFACT_DOMAIN,
+            signer_key_id=assessment.public_key_b64_from_seed(state.signing_key_seed),
+        )
+        await control_plane.submit_assessment_artifact(
+            settings,
+            token,
+            task_id,
+            descriptor_envelope=sealed,
+            body=pcap_bytes,
+            content_type="application/vnd.tcpdump.pcap",
+        )
+        logger.info(
+            "Assessment collect %s: uploaded a %d-byte agent-origin packet capture",
+            task_id,
+            len(pcap_bytes),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - the pcap is best-effort evidence, never the assessment
+        logger.warning(
+            "Assessment collect %s: pcap upload failed (%s); continuing",
+            task_id,
+            type(exc).__name__,
         )
 
 

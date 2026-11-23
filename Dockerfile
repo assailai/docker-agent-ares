@@ -59,7 +59,7 @@ LABEL org.opencontainers.image.vendor="Assail AI"
 # every arch from one sweep. The copy left in the image records the index this build upgraded from.
 ADD https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/APKINDEX.tar.gz /usr/share/ares/apkindex.tar.gz
 RUN apk upgrade --no-cache \
-    && apk add --no-cache iproute2 dash openssl ca-certificates \
+    && apk add --no-cache iproute2 dash openssl ca-certificates tcpdump \
     && rm -rf /var/cache/apk/* \
     && { find /usr -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true; }
 

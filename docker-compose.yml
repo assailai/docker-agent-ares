@@ -16,7 +16,7 @@
 
 services:
   ares-agent:
-    image: docker.io/assailai/ares-agent:3.14.3  # pin to a version (see Settings -> Agents); avoid :latest
+    image: docker.io/assailai/ares-agent:3.15.0  # pin to a version (see Settings -> Agents); avoid :latest
     container_name: ares-agent
     hostname: ares-agent
     volumes:
@@ -31,11 +31,16 @@ services:
       # network_mode: host, so without this a name pinned on the machine never reaches the agent.
       # Re-read when it changes, so adding a pin later needs no recreate.
       - /etc/hosts:/host-hosts:ro
-    # Headroom for the concurrent-connect scanner (still non-root, no added capabilities).
+    # Headroom for the concurrent-connect scanner (still non-root).
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
+    # Raw-socket capability for the OPT-IN agent-origin packet capture
+    # (ARES_ASSESSMENT_PCAP=1, off by default; see agent/pcap_capture.py). Without it tcpdump
+    # cannot bind and capture fails soft, leaving the agent otherwise unchanged and non-root.
+    cap_add:
+      - NET_RAW
     # A bridge-networked container only sees its own namespace, so it cannot reach the host's
     # localhost services and auto-detection sees the container bridge, not the LAN. To scan the
     # host localhost + the LAN + the docker networks, run on the host network (Linux only) and set
@@ -64,7 +69,7 @@ services:
     restart: unless-stopped
 
   ares-updater:
-    image: docker.io/assailai/ares-updater:3.14.3
+    image: docker.io/assailai/ares-updater:3.15.0
     container_name: ares-updater
     volumes:
       - ares-agent-data:/data:ro                  # reads the agent's update-target.json
