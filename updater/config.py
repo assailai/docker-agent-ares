@@ -56,10 +56,14 @@ class UpdaterSettings(BaseSettings):
     #     workflow. The release path (auto-tag.yml, on a version-bump merge) therefore signs at
     #     refs/heads/main, which is the protected branch: a merge there has been reviewed.
     # refs/tags/v* used to be accepted too, and must not be. Any account with push access can
-    # create a tag, no ruleset stopped it, and docker-publish.yml built and signed on one - so an
-    # attacker who could not merge to main could still publish an image under release tags with
-    # the identity the whole fleet trusts. docker-publish.yml no longer triggers on tags, and
-    # docker-build.yml refuses to push from any other ref.
+    # create a tag - and no ruleset can stop that without also stopping auto-tag.yml, since
+    # GitHub will not accept the Actions app as a bypass actor here (ARES-2351) - and
+    # docker-publish.yml built and signed on one, so an attacker who could not merge to main
+    # could still publish an image under release tags with the identity the whole fleet trusts.
+    # docker-publish.yml no longer triggers on tags, docker-build.yml refuses to push from any
+    # other ref, and auto-tag.yml fails the release when a v<version> tag does not name the
+    # reviewed commit that cut it. What this identity should name is the ref that gets REVIEWED,
+    # and that is a branch.
     # So the boundary this enforces is "built and signed from this repo's protected branch by its
     # build workflow, via GitHub OIDC" - branch / latest / sha images on main satisfy it too. The
     # updater only ever pulls <repo>:<target-version> as named by the control plane, and _tick
@@ -84,14 +88,19 @@ class UpdaterSettings(BaseSettings):
 
 
 def _split_ref(image_ref: str) -> tuple[str, str]:
-    """Split an image ref into (repo, tag). A digest ref (``repo@sha256:...``) has no tag. A
-    trailing ``:`` is a tag only when what follows has no ``/`` (otherwise it is a registry
-    port, e.g. ``reg:5000/img``)."""
-    repo, at, _digest = image_ref.partition("@")
-    if at:
-        return (repo, "")
-    head, sep, tail = image_ref.rpartition(":")
-    return (head, tail) if (sep and "/" not in tail) else (image_ref, "")
+    """Split an image ref into (repo, tag). A trailing ``:`` is a tag only when what follows has no
+    ``/`` (otherwise it is a registry port, e.g. ``reg:5000/img``).
+
+    A reference may carry a tag AND a digest - ``repo:tag@sha256:...`` is legal OCI, and it is what
+    a pinned Kubernetes manifest holds. So take the digest off first and read the tag from what is
+    left. Returning at the digest, as this did until ARES-2351, handed back ``repo:tag`` as the
+    repository, and ``_resolve`` then asked cosign about ``repo:tag:target``: verification failed,
+    the move was refused fail-closed, and auto-update was off for good with nothing logged as
+    wrong. ``repo_of`` in ``scripts/verify-images.sh`` had the same bug, for the same reason.
+    """
+    ref, _at, _digest = image_ref.partition("@")
+    head, sep, tail = ref.rpartition(":")
+    return (head, tail) if (sep and "/" not in tail) else (ref, "")
 
 
 def tag_of(image_ref: str) -> str:

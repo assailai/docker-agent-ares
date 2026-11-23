@@ -1,11 +1,19 @@
-"""The bootstrap installer, where it makes decisions the agent then depends on.
+"""The install paths, where they make decisions the agent then depends on.
+
+Four files, because the decisions are shared between them: ``scripts/bootstrap.sh``,
+``scripts/verify-images.sh``, ``docker-compose.yml`` and ``deploy/k8s/ares-agent.yaml``. The
+release every path pins, the images each one names, and the cosign block the two scripts both
+carry are things that have to agree ACROSS the files, so the tests for them live together rather
+than one file per script.
 
 Only the CA detection is pinned here, and deliberately: the same candidate list is written a
 second time in the other repo, in the install command the dashboard hands operators
 (``apps/web/src/lib/agent-install.ts``, ``caDetection``). Two copies of one list across two
 repositories is a drift trap, and nothing can fail the build in *both* of them, so each side pins
 its own copy. That does not detect cross-repo drift, but it does mean neither list can change by
-accident: whoever edits one gets a failure telling them the other exists.
+accident: whoever edits one gets a failure telling them the other exists. The parity tests between
+the two shell scripts are here for the same reason, one level down: neither can source the other,
+so the duplicated cosign block is unavoidable and these tests are what fail when it diverges.
 """
 
 from __future__ import annotations
@@ -24,6 +32,8 @@ import pytest
 
 _REPO = Path(__file__).resolve().parents[1]
 BOOTSTRAP = _REPO / "scripts" / "bootstrap.sh"
+VERIFY = _REPO / "scripts" / "verify-images.sh"
+README = _REPO / "README.md"
 COMPOSE = _REPO / "docker-compose.yml"
 K8S = _REPO / "deploy" / "k8s" / "ares-agent.yaml"
 VERSION_FILE = _REPO / "agent" / "__version__.py"
@@ -118,11 +128,11 @@ def test_the_reset_is_opt_in() -> None:
 BASH = shutil.which("bash") or "/bin/bash"
 
 
-def _function(name: str) -> str:
+def _function(name: str, script: Path = BOOTSTRAP) -> str:
     match = re.search(
-        rf"^{name}\(\) \{{\n.*?^\}}\n", BOOTSTRAP.read_text(), re.DOTALL | re.MULTILINE
+        rf"^{name}\(\) \{{\n.*?^\}}\n", script.read_text(), re.DOTALL | re.MULTILINE
     )
-    assert match, f"bootstrap.sh no longer defines {name}"
+    assert match, f"{script.name} no longer defines {name}"
     return match.group(0)
 
 
@@ -522,7 +532,7 @@ def test_the_updater_may_use_the_engine_socket_under_selinux() -> None:
 def test_every_install_path_names_its_images_fully_qualified() -> None:
     # RHEL's Podman (and OpenShift's CRI-O) enforce short-name resolution: "assailai/ares-agent"
     # stops at an interactive registry prompt and, with no terminal, fails the install outright.
-    for path in (BOOTSTRAP, COMPOSE, K8S):
+    for path in (BOOTSTRAP, VERIFY, COMPOSE, K8S):
         # an image reference is followed by its tag; the GitHub script URLs are followed by "/"
         refs = re.findall(r"(?:docker\.io/)?assailai/ares-(?:agent|updater)(?=:)", path.read_text())
         assert refs, f"{path.name} names no agent image"
@@ -540,6 +550,7 @@ def test_every_install_path_pins_the_release_being_cut() -> None:
     image_pin = r"ares-(?:agent|updater):(\d+\.\d+\.\d+)"
     pins = {
         "scripts/bootstrap.sh": re.findall(r":-(\d+\.\d+\.\d+)\}", BOOTSTRAP.read_text()),
+        "scripts/verify-images.sh": re.findall(r":-(\d+\.\d+\.\d+)\}", VERIFY.read_text()),
         "docker-compose.yml": re.findall(image_pin, COMPOSE.read_text()),
         "deploy/k8s/ares-agent.yaml": re.findall(image_pin, K8S.read_text()),
     }
@@ -644,3 +655,197 @@ def test_the_installer_gives_cosign_the_host_cas_without_narrowing_its_trust() -
     assert "SSL_CERT_DIR=/etc/ssl/certs" in helper, "the image's own roots are dropped"
     # and the same purpose rule the agent and updater use: only the TLS extract on RHEL
     assert "tls-ca-bundle.pem" in helper
+
+
+# --- the standalone verifier: the compose and Kubernetes paths' half of the same job ------------
+#
+# bootstrap.sh establishes the digest-pinning defence for the `docker run` install. The compose and
+# Kubernetes paths named the host-privileged updater by mutable tag and started it unchecked, so
+# write access to the Docker Hub repositories was still write access to the next host that
+# installed that way (ARES-2351). scripts/verify-images.sh is what closes that, and because it is
+# fetched standalone it carries its own copy of the installer's cosign block.
+
+_SHARED_WITH_THE_INSTALLER = [
+    "detect_platform",
+    "check_runtime",
+    "host_ca_dir",
+    "repo_of",
+    "cosign_ca_args",
+    "verify_image",
+]
+
+
+@pytest.mark.parametrize("name", _SHARED_WITH_THE_INSTALLER)
+def test_the_verifier_checks_an_image_exactly_as_the_installer_does(name: str) -> None:
+    # given one of the functions both scripts need
+
+    # then the two copies are identical, character for character. Neither script can source the
+    # other: both are fetched on their own through `bash <(curl ...)`, so there is no shared file
+    # to put this in. A second copy of security-critical logic is a drift trap - the same one
+    # agent/tlsconf.py and updater/tlsconf.py live with - and this is the only thing that fails
+    # when the two answers start to differ.
+    assert _function(name, VERIFY) == _function(name, BOOTSTRAP), (
+        f"{name} has drifted between bootstrap.sh and verify-images.sh"
+    )
+
+
+def test_the_verifier_trusts_the_same_signer_and_the_same_cosign() -> None:
+    # given the constants that decide what counts as genuine
+    wanted = re.findall(
+        r"^(COSIGN_(?:IMAGE|IDENTITY|ISSUER)=.*)$", BOOTSTRAP.read_text(), re.M
+    )
+    found = re.findall(r"^(COSIGN_(?:IMAGE|IDENTITY|ISSUER)=.*)$", VERIFY.read_text(), re.M)
+
+    # then both scripts pin the same signer, the same OIDC issuer and the same cosign build. A
+    # verifier that accepted something the installer refuses (or the reverse) would mean the
+    # install path you happened to pick decided whether an image was acceptable.
+    assert len(wanted) == 3, f"bootstrap.sh no longer pins three cosign constants: {wanted}"
+    assert found == wanted, "verify-images.sh pins a different signer, issuer or cosign"
+
+
+def test_the_verifier_pins_the_digest_it_checked_rather_than_the_tag() -> None:
+    # given the script
+    script = VERIFY.read_text()
+
+    # then what it writes out is verify_image's answer, never the reference it was asked about.
+    # Verifying a tag and then recording that tag is a TOCTOU: the registry can repoint it in
+    # between, which is the whole attack.
+    assert 'agent="$(verify_image "$IMAGE")"' in script
+    assert 'updater="$(verify_image "$UPDATER_IMAGE")"' in script
+    assert 'write_env ".env" "$agent" "$updater"' in script
+    assert 'pinned="${ref%@*}@${verified##*@}"' in script, (
+        "the manifest is not rewritten to the digest that was verified"
+    )
+
+
+def test_the_verifier_has_no_way_to_skip_verification() -> None:
+    # Fail-closed, for the same reason the installer is: an override would be read by exactly the
+    # install this protects - an automated one, on a host where nobody reads the warning.
+    assert not re.search(r"ARES_(SKIP|NO|DISABLE)_(IMAGE_)?VERIF", VERIFY.read_text()), (
+        "verify-images.sh has a flag that skips signature verification"
+    )
+
+
+@pytest.mark.parametrize("name", ["pin_manifest", "write_env"])
+def test_an_empty_grep_result_does_not_end_the_verifier_silently(name: str) -> None:
+    # This one is here because it actually happened. The script runs under `set -o pipefail` and
+    # grep exits 1 when it matches nothing, so `refs="$(grep ... | sort -u)"` inherited that 1 and
+    # `set -e` killed the script - in between the step heading and the error that explains what to
+    # do about it. Pointing it at a file naming no Ares image printed a heading, then stopped.
+
+    # given the greps this function runs for their OUTPUT - captured into a variable, or
+    # redirected to a file. A grep used as an `if` or `while` condition is exempt and needs no
+    # guard: the shell is being asked for that status on purpose, so `set -e` leaves it alone.
+    greps = [
+        line.strip()
+        for line in _function(name, VERIFY).splitlines()
+        if "grep " in line and not re.match(r"\s*(if|while|until)\s", line)
+    ]
+
+    # then each says what an empty result means, rather than leaving pipefail to decide
+    assert greps, f"{name} no longer greps for output"
+    assert all("|| true" in line for line in greps), (
+        f"{name} has a grep whose empty result pipefail turns into a silent exit: {greps}"
+    )
+
+
+def test_the_verifier_leaves_a_manifest_alone_when_an_image_does_not_verify() -> None:
+    # given the manifest-rewriting half
+    body = _function("pin_manifest", VERIFY)
+
+    # then it edits a copy and moves it over the original only at the end. Rewriting in place
+    # would leave a half-pinned manifest behind when the second image fails to verify - and a
+    # half-pinned manifest still applies, which is the worst of both.
+    assert 'tmp="$(mktemp "${file}.XXXXXX")"' in body
+    assert body.index('cat "$file" > "$tmp"') < body.index('verified="$(verify_image "$ref")"')
+    assert body.index('verified="$(verify_image "$ref")"') < body.index('cat "$tmp" > "$file"')
+
+
+def test_compose_cannot_start_an_image_that_was_never_verified() -> None:
+    # given the compose file's image references
+    images = re.findall(r"^\s+image:\s*(.+)$", COMPOSE.read_text(), re.M)
+
+    # then neither names an image directly: both read a variable with no default, so `docker
+    # compose up` stops with the message below until verify-images.sh has written .env. This is
+    # the one install path where the check can actually be ENFORCED rather than documented -
+    # kubectl has no substitution, so the manifest can only be pinned by rewriting it.
+    assert len(images) == 2, f"expected an agent and an updater image, found {images}"
+    for image in images:
+        assert image.startswith("${ARES_") and "_DIGEST:?" in image, (
+            f"compose would start {image} without checking it"
+        )
+        assert "verify-images.sh" in image, (
+            f"the error an operator sees does not say what to run: {image}"
+        )
+
+
+def test_the_release_a_bare_compose_up_would_have_used_is_still_named() -> None:
+    # given the messages compose prints when the variables are unset
+    messages = re.findall(r"^\s+image: \$\{ARES_\w+:\?(.+)\}$", COMPOSE.read_text(), re.M)
+
+    # then each still names the fully qualified, version-pinned reference it is about to verify.
+    # An operator reading docker-compose.yml has to be able to see WHICH release this file
+    # installs, and test_every_install_path_pins_the_release_being_cut reads it from here.
+    assert len(messages) == 2, f"expected two required-variable messages, found {messages}"
+    for message in messages:
+        assert re.search(r"docker\.io/assailai/ares-(agent|updater):\d+\.\d+\.\d+", message), (
+            f"the message does not say which image is being pinned: {message}"
+        )
+
+
+@pytest.mark.parametrize(
+    ("ref", "expected"),
+    [
+        ("docker.io/assailai/ares-agent", "docker.io/assailai/ares-agent"),
+        ("docker.io/assailai/ares-agent:3.15.0", "docker.io/assailai/ares-agent"),
+        ("docker.io/assailai/ares-agent@sha256:ab", "docker.io/assailai/ares-agent"),
+        # the form verify-images.sh writes into a manifest, and a legal ARES_IMAGE override. Until
+        # ARES-2351 repo_of stopped at the digest and returned the tag glued on, so verify_image
+        # then hunted for a RepoDigest beginning "...ares-agent:3.15.0@sha256:" - which no engine
+        # ever reports, and the install failed with "could not resolve a digest".
+        ("docker.io/assailai/ares-agent:3.15.0@sha256:ab", "docker.io/assailai/ares-agent"),
+        # a registry:port is all repository, and must not be mistaken for a tag
+        ("localhost:5000/team/agent", "localhost:5000/team/agent"),
+        ("localhost:5000/team/agent:1.2", "localhost:5000/team/agent"),
+    ],
+)
+def test_repo_of_finds_the_repository_in_every_reference_form(ref: str, expected: str) -> None:
+    # given the installer's own repo_of, executed rather than read
+    done = subprocess.run(
+        [BASH, "-c", f'{_function("repo_of")}\nrepo_of "$1"', "_", ref],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+
+    # then it strips the tag and the digest, both together and apart
+    assert done.stdout == expected, f"repo_of({ref!r}) = {done.stdout!r}"
+
+
+@pytest.mark.parametrize(
+    ("option", "apply_command"),
+    [
+        ("### Option B: Docker Compose", "docker compose up -d"),
+        ("### Option D: Kubernetes", "kubectl apply -f ares-agent.yaml"),
+    ],
+    ids=["compose", "kubernetes"],
+)
+def test_the_documented_install_verifies_before_it_starts_anything(
+    option: str, apply_command: str
+) -> None:
+    # given the install option's own section of the README
+    readme = README.read_text()
+    start = readme.index(option)
+    end = readme.index("\n### ", start + len(option))
+    section = readme[start:end]
+
+    # then the verify step is in it, and it comes BEFORE the command that starts the containers.
+    # On Kubernetes this ordering is the whole control - kubectl applies a bare tag quite happily -
+    # so a README that lost the step, or printed it afterwards, would leave the k8s path exactly
+    # where ARES-2351 found it.
+    assert "verify-images.sh" in section, f"{option} no longer tells the operator to verify"
+    assert apply_command in section, f"{option} no longer shows {apply_command!r}"
+    assert section.index("verify-images.sh") < section.index(apply_command), (
+        f"{option} starts the containers before verifying them"
+    )

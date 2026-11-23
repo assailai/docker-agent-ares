@@ -106,9 +106,22 @@ Images are published to Docker Hub: `assailai/ares-agent` and `assailai/ares-upd
 ### Option B: Docker Compose
 
 ```bash
+bash scripts/verify-images.sh        # cosign-verifies both images, writes their digests to .env
 ARES_TOKEN=<your-registration-token> docker compose up -d
 docker compose logs -f
 ```
+
+The first command is not optional. [docker-compose.yml](docker-compose.yml) names no image of its
+own: both `image:` values read a variable with no default, so compose stops and tells you to run
+the script rather than pulling something it has not checked. What it writes to `.env` is the
+**digest** cosign verified, not the tag it verified it under — a tag can be repointed by anyone who
+can write to the Docker Hub repositories, and the `ares-updater` service is handed the Docker
+socket, so an image substituted there is root on the host. A digest cannot be repointed at all.
+
+Re-run it after a version bump, or point it at another release with `ARES_VERSION=X.Y.Z`. It is
+fail-closed, exactly like the bootstrap script below: a host that cannot reach ghcr.io (for
+cosign), Fulcio or Rekor fails here rather than starting a container it could not verify. Point
+`ARES_COSIGN_IMAGE` at an internal mirror if that is your situation.
 
 See [docker-compose.yml](docker-compose.yml) for the full configuration.
 
@@ -118,26 +131,35 @@ The bootstrap script checks Docker is available, starts the container, and waits
 reports online:
 
 ```bash
-ARES_TOKEN=<your-registration-token> bash <(curl -fsSL https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.0/scripts/bootstrap.sh)
+ARES_TOKEN=<your-registration-token> bash <(curl -fsSL https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.1/scripts/bootstrap.sh)
 ```
 
 It also accepts the token as an argument or prompts for it interactively. Works on macOS, Linux,
 and Windows (Git Bash / WSL).
 
 Fetch it from the release tag, not from `main`, so that a command you issued last month still runs
-the script that was reviewed for that release rather than whatever `main` holds today. A git tag is
-movable by default; the `v*` tags on this repository are protected by a ruleset that refuses
-updates and deletions, so `v3.15.0` names one commit permanently. The dashboard's install command
-pins the current release for you.
+the script that was reviewed for that release rather than whatever `main` holds today. The `v*`
+tags on this repository are protected by a ruleset that refuses updates and deletions, so once
+`v3.15.1` exists it names one commit permanently.
+
+Be precise about what that does and does not cover, because the two halves are not the same.
+A tag is also **creatable** by anyone with push access, and the ruleset does not stop that —
+GitHub will not accept the Actions app as a bypass actor here, so a creation rule would also block
+the release workflow from pushing the tag at all. What covers it instead is `auto-tag.yml`: before
+3.15.1 it accepted a pre-existing `v<version>` by name and skipped the image build, ending green;
+it now checks that the tag resolves to a commit in `main`'s history that cut that exact version,
+and fails the release if it does not. So a forged tag stops the release rather than becoming one —
+and because that release never completes, the version is never marked current, which is what the
+README and the dashboard pin. The dashboard's install command pins the current release for you.
 
 To read the script before running it, fetch it and compare it with the tag in git, which is the
 same object the ruleset protects:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.0/scripts/bootstrap.sh
-git -c advice.detachedHead=false clone --depth 1 --branch v3.15.0 \
-    https://github.com/assailai/docker-agent-ares /tmp/ares-v3.15.0
-diff bootstrap.sh /tmp/ares-v3.15.0/scripts/bootstrap.sh && echo "matches the tag"
+curl -fsSLO https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.1/scripts/bootstrap.sh
+git -c advice.detachedHead=false clone --depth 1 --branch v3.15.1 \
+    https://github.com/assailai/docker-agent-ares /tmp/ares-v3.15.1
+diff bootstrap.sh /tmp/ares-v3.15.1/scripts/bootstrap.sh && echo "matches the tag"
 ```
 
 Before it starts anything, the installer cosign-verifies both images against the Ares publisher
@@ -162,11 +184,25 @@ The `assailai/ares-agent` and `assailai/ares-updater` images are public on Docke
 image pull secret is required.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.0/deploy/k8s/ares-agent.yaml
-# set ARES_TOKEN in the Secret at the top of the file (and pin the image to a release), then:
+curl -fsSLO https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.1/deploy/k8s/ares-agent.yaml
+curl -fsSLO https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.1/scripts/verify-images.sh
+# verify both images and rewrite the manifest to the digests cosign checked
+bash verify-images.sh ares-agent.yaml
+# set ARES_TOKEN in the Secret at the top of the file, then:
 kubectl apply -f ares-agent.yaml
 kubectl rollout status deploy/ares-agent
 ```
+
+`verify-images.sh` reads the images the manifest names, checks the Ares publisher signed exactly
+those bytes, and rewrites each reference to `repo:tag@sha256:...` so the kubelet pulls the artifact
+that was verified rather than whatever the tag points at when a node happens to pull it. It leaves
+the file untouched if anything fails to verify, and running it twice changes nothing.
+
+Be clear about what this is: unlike Compose above, **nothing enforces it**. `kubectl` has no
+variable substitution, so the manifest cannot refuse to apply without the digests — applying the
+bare tag works, and the `ares-updater` container it starts holds a ServiceAccount that can patch
+this Deployment. It is a step in the documented install, not a gate. If you need it enforced, that
+is what an admission policy (Kyverno, Sigstore's policy-controller) is for.
 
 To opt out of auto-update, delete the `ares-updater` container plus its ServiceAccount, Role, and
 RoleBinding, and update the image through your own pipeline instead.
@@ -517,7 +553,8 @@ docker pull docker.io/assailai/ares-agent:<new-version>
 # re-run the docker run command from Getting started with the new tag (the volume is reused)
 ```
 
-Or with Compose: bump the pinned `image:` tag, then `docker compose pull && docker compose up -d`.
+Or with Compose: re-run `ARES_VERSION=<new-version> bash scripts/verify-images.sh` to verify that
+release and rewrite `.env`, then `docker compose pull && docker compose up -d`.
 
 ### Re-installing over an existing agent
 
@@ -576,16 +613,16 @@ Notes:
   need it installed locally):
 
   ```bash
-  docker run --rm --entrypoint cosign docker.io/assailai/ares-updater:3.15.0 \
-    verify docker.io/assailai/ares-agent:3.15.0 \
+  docker run --rm --entrypoint cosign docker.io/assailai/ares-updater:3.15.1 \
+    verify docker.io/assailai/ares-agent:3.15.1 \
     --certificate-identity-regexp '^https://github\.com/assailai/docker-agent-ares/\.github/workflows/docker-build\.yml@refs/heads/main$' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```
 
   The identity names `refs/heads/main` and nothing else. `main` is the protected branch, so a
-  release signed under it was reviewed. Tag refs are not protected, since anyone with push access
-  can create one, so from 3.15.0 they are no longer trusted and no workflow builds release images
-  from a tag push.
+  release signed under it was reviewed. Tag refs are not — anyone with push access can create one,
+  and no ruleset can prevent that without also stopping the release workflow — so from 3.15.0 they
+  are no longer trusted and no workflow builds release images from a tag push.
 
   If this fails while the image is genuinely published, the expected signer identity has drifted from
   what CI signs with — the updater logs both sides of the comparison on failure.
@@ -647,7 +684,7 @@ docker volume rm ares-agent-data
 Or let the installer do it, which is the same thing plus a clean re-enrollment:
 
 ```bash
-ARES_RESET=1 ARES_TOKEN=<fresh-token> bash <(curl -fsSL https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.0/scripts/bootstrap.sh)
+ARES_RESET=1 ARES_TOKEN=<fresh-token> bash <(curl -fsSL https://raw.githubusercontent.com/assailai/docker-agent-ares/v3.15.1/scripts/bootstrap.sh)
 ```
 
 ## Versioning
@@ -662,15 +699,28 @@ the direct pins, and the `*-lock.txt` beside each is generated from it. Regenera
 command in the lock's own header, or the build fails on a hash it was not given.
 
 `agent/__version__.py` is the trigger. Bump it, move the pins that name the old version
-(`scripts/bootstrap.sh`, `docker-compose.yml`, `deploy/k8s/ares-agent.yaml`), and merge to `main`.
-`auto-tag.yml` then creates the `v<version>` tag and the GitHub release, and builds, pushes and
-cosign-signs both images (`assailai/ares-agent` and `assailai/ares-updater`) as
-`<version>`, `<major>.<minor>` and `<major>`.
+(`scripts/bootstrap.sh`, `scripts/verify-images.sh`, `docker-compose.yml`,
+`deploy/k8s/ares-agent.yaml`), and merge to `main`. `auto-tag.yml` then creates the `v<version>`
+tag and the GitHub release, and builds, pushes and cosign-signs both images
+(`assailai/ares-agent` and `assailai/ares-updater`) as `<version>`, `<major>.<minor>` and
+`<major>`. `tests/test_bootstrap.py` fails if any of those pins disagrees with
+`agent/__version__.py`, which is what catches a half-moved release before it ships.
 
-Two things that are easy to get wrong:
+Two things worth knowing:
 
-- **Don't push the `v<version>` tag by hand.** `auto-tag.yml` skips its image build when the tag
-  already exists, so a hand-pushed tag leaves you with a tag and a release but **no images**.
+- **Don't push the `v<version>` tag by hand.** Nothing stops you — the ruleset on `v*` refuses
+  updates and deletions, not creation — but `auto-tag.yml` now judges the commit such a tag names,
+  and the consequences of getting it wrong are not symmetric. On a tag outside `main`'s history,
+  or on a commit that did not cut that version, the run fails; and since the ruleset refuses
+  deletion, clearing that tag needs someone with ruleset admin to lift the rule, delete it and put
+  the rule back. Releases of that version stay blocked until they do.
+- **A release tagged but never published can be repaired by re-running `auto-tag.yml`, but only
+  until `main` moves on.** The build it skips when the tag already exists is the thing that used
+  to leave you a tag and a release with no images; it now runs when the tag names the commit being
+  released. That test is against `main`'s current HEAD, so one unrelated merge after a release that
+  died post-tag and the repair is gone — publish those images by hand. Widening it would let an
+  ordinary re-run republish a release that already has images, under a semver tag whose whole
+  promise is one set of bytes, which is the worse of the two.
 - **A release that changes `updater/` rolls out with the agent** on installs at 3.14.0 or later,
   since the updater updates itself. Installs older than that have to recreate it once: see
   [Auto-update](#auto-update-the-companion-updater).

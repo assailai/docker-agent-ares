@@ -11,6 +11,7 @@ only place it fails.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -61,12 +62,31 @@ def test_every_pinned_action_records_the_version_it_is(workflow: Path) -> None:
     assert not missing, f"{workflow.name}: pinned without a version comment: {missing}"
 
 
+def _driver_opts_image(step: dict) -> str | None:
+    """The builder image inside setup-buildx-action's `driver-opts`, if it names one.
+
+    That value is a newline-separated list of driver-specific `key=value` settings, of which
+    `image=` is the one deciding which BuildKit container the job starts.
+    """
+    opts = (step.get("with") or {}).get("driver-opts")
+    if isinstance(opts, str):
+        opts = opts.splitlines()
+    if not isinstance(opts, list):
+        return None
+    for opt in opts:
+        key, sep, value = str(opt).strip().partition("=")
+        if sep and key == "image":
+            return value
+    return None
+
+
 def _images_run(workflow: Path) -> list[str]:
     """Every image reference a workflow asks a runner to *execute*, with where it came from.
 
-    Three places: a job `container:`, a `services:` entry, and the `image:` input of a step. Not
-    the matrix entries that name what is being built - those are push destinations, and a digest
-    is the output of that build rather than an input to it.
+    Four places: a job `container:`, a `services:` entry, the `image:` input of a step, and the
+    `image=` setting inside a step's `driver-opts` - buildx's builder is named there rather than in
+    a plain `image:`. Not the matrix entries that name what is being built - those are push
+    destinations, and a digest is the output of that build rather than an input to it.
     """
     document = yaml.safe_load(workflow.read_text())
     found: list[str] = []
@@ -82,6 +102,9 @@ def _images_run(workflow: Path) -> list[str]:
             image = (step.get("with") or {}).get("image")
             if isinstance(image, str):
                 found.append(image)
+            driver_image = _driver_opts_image(step)
+            if driver_image:
+                found.append(driver_image)
     return [ref for ref in found if "${{" not in ref]
 
 
@@ -99,24 +122,52 @@ def test_every_container_image_a_workflow_runs_is_pinned_by_digest(workflow: Pat
     assert not floating, f"{workflow.name}: image(s) not pinned by digest: {floating}"
 
 
-def test_the_signing_job_pins_the_emulator_it_runs_privileged() -> None:
-    # the companion to the test above, which passes a workflow that never says `image:` at all -
-    # and setup-qemu-action's DEFAULT is the floating tag. So assert the value is actually there,
-    # wherever the action is used.
-    used = False
-    for workflow in WORKFLOWS:
-        document = yaml.safe_load(workflow.read_text())
-        for job in (document.get("jobs") or {}).values():
-            for step in (isinstance(job, dict) and job.get("steps")) or []:
-                if not str(step.get("uses", "")).startswith("docker/setup-qemu-action@"):
-                    continue
-                used = True
-                image = (step.get("with") or {}).get("image", "")
-                assert re.fullmatch(r"\S+@sha256:[0-9a-f]{64}", image), (
-                    f"{workflow.name}: setup-qemu-action runs its default "
-                    f"tonistiigi/binfmt:latest, not a pinned image (got {image!r})"
-                )
-    assert used, "no workflow sets up QEMU any more; drop this test with the step"
+# Actions that start a container of their own and name the image to run only if told to. Leaving
+# the value out is NOT neutral: each one then runs the upstream tag below, which is precisely what
+# whoever can move that tag wants. The test above cannot see any of these, because there is nothing
+# in the workflow file to see - which is what this table is for.
+_IMPLICIT_IMAGE_ACTIONS = [
+    # action, how to read the image out of one of its steps, what it runs when that is left unset
+    (
+        "docker/setup-qemu-action",
+        lambda step: (step.get("with") or {}).get("image"),
+        "tonistiigi/binfmt:latest",
+    ),
+    ("docker/setup-buildx-action", _driver_opts_image, "moby/buildkit:buildx-stable-1"),
+]
+
+
+def _steps_using(action: str) -> list[tuple[Path, dict]]:
+    return [
+        (workflow, step)
+        for workflow in WORKFLOWS
+        for job in (yaml.safe_load(workflow.read_text()).get("jobs") or {}).values()
+        for step in (isinstance(job, dict) and job.get("steps")) or []
+        if str(step.get("uses", "")).startswith(f"{action}@")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("action", "read_image", "upstream_default"),
+    _IMPLICIT_IMAGE_ACTIONS,
+    ids=[action for action, _, _ in _IMPLICIT_IMAGE_ACTIONS],
+)
+def test_the_signing_job_pins_every_image_an_action_runs_for_it(
+    action: str, read_image: Callable[[dict], str | None], upstream_default: str
+) -> None:
+    # given every step that loads this action
+    steps = _steps_using(action)
+
+    # then each says which image to run, by digest. Both of these start a container in the job
+    # holding the Docker Hub token and id-token: write - the emulator --privileged, and the builder
+    # as the thing that actually produces the bytes `cosign sign` signs (ARES-2351)
+    assert steps, f"no workflow uses {action} any more; drop its row from _IMPLICIT_IMAGE_ACTIONS"
+    for workflow, step in steps:
+        image = read_image(step) or ""
+        assert re.fullmatch(r"\S+@sha256:[0-9a-f]{64}", image), (
+            f"{workflow.name}: {action} runs its default {upstream_default}, "
+            f"not a pinned image (got {image!r})"
+        )
 
 
 @pytest.mark.parametrize("workflow", WORKFLOWS, ids=lambda p: p.name)

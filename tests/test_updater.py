@@ -54,6 +54,37 @@ def test_image_ref_parsing() -> None:
     assert repo_of("reg:5000/ares-agent") == "reg:5000/ares-agent"  # the ":" is a registry port
     assert repo_of("assailai/ares-agent@sha256:abc123") == "assailai/ares-agent"  # digest ref
     assert tag_of("assailai/ares-agent@sha256:abc123") == ""  # a digest is not a tag
+    # tag AND digest together, which is legal OCI and what a pinned k8s manifest holds. Reading
+    # this as repo="assailai/ares-agent:2.5.0" made _resolve ask cosign about a doubly-tagged
+    # reference, which fails, which turns auto-update off silently and for good (ARES-2351).
+    assert repo_of("assailai/ares-agent:2.5.0@sha256:abc123") == "assailai/ares-agent"
+    assert tag_of("assailai/ares-agent:2.5.0@sha256:abc123") == "2.5.0"
+    assert repo_of("reg:5000/ares-agent:2.5.0@sha256:abc") == "reg:5000/ares-agent"
+
+
+def test_a_pinned_manifest_is_read_as_current_not_as_a_double_tag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`repo:tag@sha256:...` is what `scripts/verify-images.sh` writes into a k8s manifest, and
+    `kube._image_in` reads the spec string back verbatim, so this is the reference the updater
+    actually sees on every pinned install.
+
+    Read wrongly it was poison: repo came back as `repo:tag`, `_resolve` asked cosign about
+    `repo:tag:target`, verification failed, and `_tick` returned at `if not agent.current and
+    agent.pinned is None`. Auto-update off, permanently, with nothing logged as an error - and a
+    cosign subprocess burned every poll, since the agent path has no backoff (ARES-2351).
+    """
+    pinned = "docker.io/assailai/ares-agent:3.15.1@sha256:" + "ab" * 32
+    asked: list[str] = []
+    monkeypatch.setattr(main.verify, "verify", lambda image, _s: asked.append(image) or None)
+
+    resolution = main._resolve(
+        running=pinned, target="3.15.1", repo=repo_of(pinned), cache={}
+    )
+
+    # already on the target: its tag is right there in the reference, so there is nothing to ask
+    assert resolution.current is True
+    assert asked == [], f"cosign was asked about {asked}"
 
 
 def test_read_target(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
