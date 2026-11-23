@@ -1,10 +1,15 @@
 # =============================================================================
 # Ares Docker Agent - Docker Compose (production)
 # =============================================================================
-# Zero-touch: set ARES_TOKEN (a registration token from the Ares dashboard) and run.
+# Two steps: pin the images this release publishes, then set ARES_TOKEN (a registration token
+# from the Ares dashboard) and run.
 #
+#   bash scripts/verify-images.sh     # cosign-verifies both images, writes their digests to .env
 #   ARES_TOKEN=ares_agt_... docker compose up -d
 #   docker compose logs -f            # watch it enroll and come online
+#
+# The first step is not optional: the services below name no image of their own, so compose
+# refuses to start until .env holds the digests it checked (ARES-2351).
 #
 # Outbound-only (HTTPS + WebSocket to ares); no published ports, no extra capabilities.
 # The ares-updater companion keeps the agent, and then itself, on the version the dashboard
@@ -16,7 +21,12 @@
 
 services:
   ares-agent:
-    image: docker.io/assailai/ares-agent:3.15.0  # pin to a version (see Settings -> Agents); avoid :latest
+    # Named through .env with no default, so compose stops here rather than starting something
+    # unverified: scripts/verify-images.sh cosign-verifies this release's agent image and writes
+    # the DIGEST it checked into .env. Whoever can write to the Docker Hub repositories can
+    # repoint a tag; they cannot forge that signature, and a digest cannot be repointed at all.
+    # For another release run that script with ARES_VERSION=X.Y.Z (see Settings -> Agents).
+    image: ${ARES_AGENT_IMAGE:?run scripts/verify-images.sh first - it verifies docker.io/assailai/ares-agent:3.15.0 and writes the digest it checked to .env}
     container_name: ares-agent
     hostname: ares-agent
     volumes:
@@ -66,7 +76,10 @@ services:
     restart: unless-stopped
 
   ares-updater:
-    image: docker.io/assailai/ares-updater:3.15.0
+    # Same as the agent, and this is the container it matters most for: it is the one handed
+    # the Docker socket below, so an image substituted here is root on this host - and it would
+    # then be the thing deciding every later verification.
+    image: ${ARES_UPDATER_IMAGE:?run scripts/verify-images.sh first - it verifies docker.io/assailai/ares-updater:3.15.0 and writes the digest it checked to .env}
     container_name: ares-updater
     volumes:
       - ares-agent-data:/data:ro                  # reads the agent's update-target.json

@@ -283,11 +283,13 @@ host_ca_dir() {
 
 # The repository half of an image reference, i.e. everything but the :tag or @digest. A tag only
 # counts as one when what follows the last colon has no slash in it, or a registry:port would eat
-# the hostname.
+# the hostname. Both can be present at once - "repo:tag@sha256:..." is legal, and is what
+# verify-images.sh writes into a Kubernetes manifest - so take the digest off first and the tag
+# second. Stopping at the digest, as this did until ARES-2351, left the tag glued to the
+# repository and verify_image then looked for a RepoDigest that can never exist.
 repo_of() {
-    local ref="$1"
+    local ref="${1%%@*}"
     case "$ref" in
-        *@*) printf '%s' "${ref%%@*}"; return ;;
         *:*) ;;
         *)   printf '%s' "$ref"; return ;;
     esac

@@ -97,6 +97,13 @@ spec:
         fsGroup: 10001
       containers:
         - name: ares-agent          # the patched container; ARES_UPDATE_CONTAINER matches this
+          # A tag rather than a digest, because kubectl has no variable substitution and a
+          # release's digest does not exist until that release has been built. So run
+          # `bash scripts/verify-images.sh <this file>` before applying it: that cosign-verifies
+          # both images and rewrites these two lines to repo:tag@sha256:..., which is what the
+          # kubelet then pulls. Be clear about what that is and is not - unlike the compose path,
+          # nothing here *enforces* it. kubectl will apply the bare tag quite happily. It is a
+          # step in the documented install, not a gate (ARES-2351).
           image: docker.io/assailai/ares-agent:3.15.0   # pinned; the updater rolls this forward
           envFrom:
             - secretRef:
@@ -134,6 +141,8 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 3
         - name: ares-updater         # companion; keeps ares-agent, then itself, on the marked version
+          # Pin this one with the agent above, and mind the order of operations: this is the
+          # container that gets the ServiceAccount able to patch this Deployment.
           image: docker.io/assailai/ares-updater:3.15.0
           env:
             - name: ARES_UPDATE_CONTAINER
