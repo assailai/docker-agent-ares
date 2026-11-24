@@ -1544,6 +1544,7 @@ async def _collect_network_controls(
 _HOST_SOURCE_COLLECTOR_NAMES = {
     linux_host.SOURCE_SSHD: "collect_sshd_effective_config",
     linux_host.SOURCE_SYSCTL: "collect_sysctl_config",
+    linux_host.SOURCE_PASSWD: "collect_passwd_database",
 }
 
 

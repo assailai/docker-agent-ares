@@ -27,6 +27,9 @@ _LLDP_COMMAND = "show lldp neighbors detail"
 _SSHD_EFFECTIVE_COMMAND = "sshd -T"
 # The kernel's RUNNING network-stack settings. Read-only (``-a`` lists, it does not set).
 _SYSCTL_COMMAND = "sysctl -a"
+# The account database (name:passwd:uid:gid:gecos:home:shell). Read-only enumeration; getent reads
+# the resolved database (files + any directory source) without the shadow hashes.
+_PASSWD_COMMAND = "getent passwd"
 
 
 async def _run_show(
@@ -121,4 +124,21 @@ async def collect_sysctl_config(
     ``sysctl`` and the read simply fails, recorded as honest UNAVAILABLE coverage."""
     return await _run_show(
         host, credential, _SYSCTL_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
+    )
+
+
+async def collect_passwd_database(
+    host: str,
+    credential: Credential,
+    *,
+    port: int = 22,
+    timeout: float = 20.0,
+    max_bytes: int = 500_000,
+) -> str:
+    """The Linux host's account database (``getent passwd``), truncated. Read-only enumeration; it
+    returns no password hashes (those live in shadow). Used for the host tier (``server.account.*``
+    controls); a network device has no ``getent`` and the read simply fails, recorded as honest
+    UNAVAILABLE coverage."""
+    return await _run_show(
+        host, credential, _PASSWD_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
     )

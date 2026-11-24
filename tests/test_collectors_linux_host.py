@@ -105,18 +105,51 @@ def test_text_that_is_not_a_sysctl_dump_abstains() -> None:
     assert linux_host.parse_ip_forwarding_enabled("sysctl: command not found\n") is None
 
 
+# ── getent passwd ───────────────────────────────────────────────────────────────────────────────
+_PASSWD_PLANTED = (
+    "root:x:0:0:root:/root:/bin/bash\n"
+    "backdoor:x:0:0::/root:/bin/bash\n"  # a second uid-0 account: a root-equivalent backdoor
+    "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
+    "alice:x:1000:1000::/home/alice:/bin/bash\n"
+    "bob:x:1000:1001::/home/bob:/bin/bash\n"  # shares uid 1000 with alice
+)
+_PASSWD_CLEAN = (
+    "root:x:0:0:root:/root:/bin/bash\n"
+    "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
+    "alice:x:1000:1000::/home/alice:/bin/bash\n"
+    "bob:x:1001:1001::/home/bob:/bin/bash\n"
+)
+
+
+def test_planted_passwd_flags_extra_root_and_duplicate_uid() -> None:
+    assert linux_host.parse_extra_root_account(_PASSWD_PLANTED) is True
+    assert linux_host.parse_duplicate_uid(_PASSWD_PLANTED) is True
+
+
+def test_clean_passwd_has_one_root_and_unique_uids() -> None:
+    assert linux_host.parse_extra_root_account(_PASSWD_CLEAN) is False
+    assert linux_host.parse_duplicate_uid(_PASSWD_CLEAN) is False
+
+
+def test_passwd_without_a_root_line_abstains() -> None:
+    # Not a real passwd dump (no uid-0 root line): abstain rather than read accounts out of it.
+    assert linux_host.parse_extra_root_account("getent: command not found\n") is None
+    assert linux_host.parse_duplicate_uid("alice:x:1000:1000::/home/alice:/bin/bash\n") is None
+
+
 # ── routing + collection ───────────────────────────────────────────────────────────────────────────
 def test_source_routing_maps_each_control_to_one_source() -> None:
     assert linux_host.source_for("server.ssh.password") == linux_host.SOURCE_SSHD
     assert linux_host.source_for("server.sysctl.ip_forwarding") == linux_host.SOURCE_SYSCTL
+    assert linux_host.source_for("server.account.extra_root") == linux_host.SOURCE_PASSWD
     assert linux_host.source_for("net.management.telnet") is None
 
 
 def test_sources_for_collects_each_needed_source_once() -> None:
     needed = linux_host.sources_for(
-        ["server.ssh.password", "server.ssh.root_login", "server.sysctl.ip_forwarding"]
+        ["server.ssh.password", "server.sysctl.ip_forwarding", "server.account.extra_root"]
     )
-    assert needed == {linux_host.SOURCE_SSHD, linux_host.SOURCE_SYSCTL}
+    assert needed == {linux_host.SOURCE_SSHD, linux_host.SOURCE_SYSCTL, linux_host.SOURCE_PASSWD}
     assert linux_host.sources_for(["net.management.telnet"]) == set()
 
 

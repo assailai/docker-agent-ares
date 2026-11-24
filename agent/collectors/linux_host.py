@@ -28,6 +28,7 @@ from __future__ import annotations
 # runs (the command itself lives with the SSH transport, so this module stays pure and testable).
 SOURCE_SSHD = "sshd"
 SOURCE_SYSCTL = "sysctl"
+SOURCE_PASSWD = "passwd"
 
 
 # ── sshd -T (effective SSH daemon configuration) ──────────────────────────────────────────────────
@@ -158,6 +159,44 @@ def parse_icmp_redirects_accepted(sysctl_output: str) -> bool | None:
     return _sysctl_flag_enabled(sysctl_output, "net.ipv4.conf.all.accept_redirects")
 
 
+# ── getent passwd (the account database) ──────────────────────────────────────────────────────────
+# A standard passwd line is seven colon-separated fields: name:passwd:uid:gid:gecos:home:shell. A real
+# account database always carries the superuser as `root:...:0:...`; its absence means the text is not
+# a passwd dump, so the parser abstains rather than read accounts out of unrelated bytes.
+def _passwd_rows(passwd_output: str) -> list[list[str]]:
+    """The passwd dump as a list of field-lists, keeping only well-formed 7+-field lines whose uid is
+    numeric. Returns an empty list when no ``root`` superuser (uid 0) line is present, which marks the
+    text as not a passwd dump and makes every field abstain."""
+    rows = [
+        parts
+        for line in passwd_output.splitlines()
+        if len(parts := line.split(":")) >= 7 and parts[2].isdigit()
+    ]
+    if not any(r[0] == "root" and r[2] == "0" for r in rows):
+        return []
+    return rows
+
+
+def parse_extra_root_account(passwd_output: str) -> bool | None:
+    """Whether any account OTHER than ``root`` has uid 0 (a root-equivalent backdoor), or ``None`` to
+    abstain. Unambiguous and effective: a uid-0 account is superuser regardless of PAM or sudo policy,
+    so this has none of the file-vs-effective gap a config-file read would."""
+    rows = _passwd_rows(passwd_output)
+    if not rows:
+        return None
+    return any(r[2] == "0" and r[0] != "root" for r in rows)
+
+
+def parse_duplicate_uid(passwd_output: str) -> bool | None:
+    """Whether two accounts share one uid (so the system cannot attribute an action to one of them),
+    or ``None`` to abstain. A CIS/NIST accountability weakness, read straight from the database."""
+    rows = _passwd_rows(passwd_output)
+    if not rows:
+        return None
+    uids = [r[2] for r in rows]
+    return len(set(uids)) != len(uids)
+
+
 # One entry per (control_id, field): the evidence source it reads and the extractor. A control whose
 # extractor abstains (returns None) is omitted from the collected fields, so the control plane
 # evaluates it NOT_ASSESSED rather than on a guess.
@@ -187,6 +226,14 @@ _FIELD_EXTRACTORS = {
     ("server.sysctl.icmp_redirects", "sysctl_icmp_redirects_accepted"): (
         SOURCE_SYSCTL,
         parse_icmp_redirects_accepted,
+    ),
+    ("server.account.extra_root", "account_extra_root_present"): (
+        SOURCE_PASSWD,
+        parse_extra_root_account,
+    ),
+    ("server.account.duplicate_uid", "account_duplicate_uid_present"): (
+        SOURCE_PASSWD,
+        parse_duplicate_uid,
     ),
 }
 
