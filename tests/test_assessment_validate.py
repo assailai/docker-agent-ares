@@ -344,3 +344,36 @@ def test_an_expired_plan_is_detected() -> None:
     plan["expires_at"] = "2000-01-01T00:00:00+00:00"
     assert assessment_validate.plan_is_expired(plan) is True
     assert assessment_validate.plan_is_expired(_unsigned_plan()) is False
+
+
+async def test_an_smtp_probe_reads_ehlo_capabilities_without_sending_mail() -> None:
+    seen: list[bytes] = []
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        writer.write(b"220 mail.test ESMTP ready\r\n")
+        await writer.drain()
+        seen.append(await reader.readline())  # EHLO
+        writer.write(
+            b"250-mail.test\r\n250-STARTTLS\r\n250-SIZE 10240000\r\n250 8BITMIME\r\n"
+        )
+        await writer.drain()
+        seen.append(await reader.readline())  # QUIT
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        obs = await assessment_validate.probe_endpoint(
+            _endpoint(address="127.0.0.1", port=port, protocol="smtp"), _budget()
+        )
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert obs["outcome"] == "CONFIRMED"
+    caps = obs["protocol_metadata"].get("smtp_capabilities", [])
+    assert "STARTTLS" in caps and "8BITMIME" in caps
+    # it sent EHLO (+ QUIT) but never MAIL/RCPT/DATA: no mail is ever sent
+    assert seen and seen[0].startswith(b"EHLO")
+    assert not any(b"MAIL" in line or b"DATA" in line for line in seen)

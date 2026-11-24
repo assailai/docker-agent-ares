@@ -29,6 +29,7 @@ control plane); the cross-repo fixture round trip is the standing guard that the
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import ssl
@@ -67,6 +68,10 @@ _LOCAL_TIMEOUT_SECONDS = 15.0
 # read-only HTTP request. Everything else is a connect/banner observation.
 _TLS_PROTOCOLS = frozenset({"tls", "https", "smtps", "ldaps", "ftps", "imaps", "pop3s"})
 _HTTP_PROTOCOLS = frozenset({"http", "https"})
+# SMTP: a bounded, read-only capability probe (greet + EHLO, read the advertised extensions, then
+# QUIT). It never sends mail, so it is a NON_CONSEQUENTIAL handshake that stops at the proof boundary
+# "the service speaks SMTP and advertises these extensions".
+_SMTP_PROTOCOLS = frozenset({"smtp", "smtps", "submission"})
 
 _MAX_SUMMARY = 1024
 _BANNER_READ_CAP = 512
@@ -269,6 +274,18 @@ async def probe_endpoint(
                 metadata=metadata,
             )
 
+        if protocol in _SMTP_PROTOCOLS and max_requests >= 1:
+            return await _probe_smtp(
+                reader=reader,
+                writer=writer,
+                address=address,
+                port=port,
+                max_sent=max_sent,
+                max_recv=max_recv,
+                timeout=timeout,
+                metadata=metadata,
+            )
+
         received, banner = await _read_banner(
             reader, cap=min(max_recv, _BANNER_READ_CAP), timeout=timeout
         )
@@ -342,6 +359,25 @@ async def _read_banner(
     return len(data), printable[:_BANNER_READ_CAP]
 
 
+async def _read_lines(
+    reader: asyncio.StreamReader, *, cap: int, timeout: float
+) -> tuple[int, str]:
+    """Read at most ``cap`` bytes and return (bytes_read, text with CR/LF preserved).
+
+    Unlike ``_read_banner`` this keeps the ``\\r``/``\\n`` line breaks so a multi-line reply (an SMTP
+    EHLO capability list is ``250-<CAP>`` continuation lines then a final ``250 <CAP>``) can be split
+    per line. It still drops the other control characters so the text stays printable for metadata."""
+    if cap <= 0:
+        return 0, ""
+    try:
+        data = await asyncio.wait_for(reader.read(cap), timeout=min(timeout, 5.0))
+    except (TimeoutError, OSError, ssl.SSLError):
+        return 0, ""
+    text = data.decode("latin-1", errors="replace")
+    kept = "".join(ch for ch in text if ch in "\r\n\t" or ord(ch) >= 0x20)
+    return len(data), kept[:_BANNER_READ_CAP]
+
+
 async def _probe_http(
     *,
     reader: asyncio.StreamReader,
@@ -392,6 +428,64 @@ async def _probe_http(
         requests=1,
         protocol_metadata=metadata,
         terminal_reason="NONE" if status_line else "INCONCLUSIVE",
+    )
+
+
+async def _probe_smtp(
+    *,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    address: str,
+    port: int,
+    max_sent: int,
+    max_recv: int,
+    timeout: float,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Read the SMTP greeting, send ONE EHLO, record the advertised extensions, then QUIT. It never
+    sends mail (no MAIL/RCPT/DATA), so it is a bounded, non-consequential capability handshake."""
+    received, greeting = await _read_banner(
+        reader, cap=min(max_recv, _BANNER_READ_CAP), timeout=timeout
+    )
+    greet_line = greeting.splitlines()[0] if greeting else ""
+    if not greet_line.startswith("220"):
+        return _observation(
+            outcome="INCONCLUSIVE",
+            summary=f"{address}:{port} did not greet as SMTP: {greet_line[:80]}",
+            sent_bytes=0,
+            received_bytes=received,
+            requests=1,
+            protocol_metadata=metadata,
+            terminal_reason="REFUSED",
+        )
+    ehlo = b"EHLO probe.invalid\r\n"
+    sent = 0
+    capabilities: list[str] = []
+    if len(ehlo) <= max_sent:
+        writer.write(ehlo)
+        await asyncio.wait_for(writer.drain(), timeout=timeout)
+        sent = len(ehlo)
+        _got, reply = await _read_lines(
+            reader, cap=min(max_recv, _BANNER_READ_CAP), timeout=timeout
+        )
+        received += _got
+        for raw_line in reply.splitlines():
+            # EHLO replies are `250-<CAP>` continuation lines then a final `250 <CAP>`.
+            line = raw_line.strip()
+            if line.startswith("250") and len(line) > 4:
+                capabilities.append(line[4:].strip().split(" ", 1)[0].upper())
+        metadata["smtp_capabilities"] = sorted({c for c in capabilities if c})
+    metadata["smtp_greeting"] = greet_line[:120]
+    with contextlib.suppress(OSError, TimeoutError, ssl.SSLError):
+        writer.write(b"QUIT\r\n")
+        await asyncio.wait_for(writer.drain(), timeout=2.0)
+    return _observation(
+        outcome="CONFIRMED",
+        summary=f"smtp endpoint {address}:{port} greeted and advertised {len(metadata.get('smtp_capabilities', []))} extension(s)",
+        sent_bytes=sent,
+        received_bytes=received,
+        requests=1,
+        protocol_metadata=metadata,
     )
 
 
