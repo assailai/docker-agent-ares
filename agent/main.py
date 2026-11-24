@@ -1414,7 +1414,15 @@ async def _run_pentest_technique(state: AgentState, token: str, task: dict) -> N
                 outcome="DENIED",
             )
         else:
-            observation = await pentest_execute.run_technique(plan)
+            # A lateral-reach technique authenticates with an engagement-approved credential the agent
+            # resolves from its LOCAL vault (the secret never leaves the box); every other technique
+            # resolves no credential. A credential_ref the vault does not hold leaves it None, and the
+            # technique then reports DENIED rather than reaching with nothing.
+            credential = None
+            credential_ref = plan.get("credential_ref")
+            if credential_ref:
+                credential = CredentialVault(settings.credential_vault_path).resolve(credential_ref)
+            observation = await pentest_execute.run_technique(plan, credential=credential)
             completed_at = datetime.now(UTC).isoformat()
             result = pentest_execute.build_result(
                 plan, observation, started_at=started_at, completed_at=completed_at
