@@ -21,6 +21,10 @@ from agent.credential_vault import Credential
 
 _DEFAULT_COMMAND = "show running-config"
 _LLDP_COMMAND = "show lldp neighbors detail"
+# OpenSSH's own dump of its EFFECTIVE configuration (defaults, Include and Match already resolved).
+# Read-only like every other command here: it prints config, it changes none. The host tier of the
+# credentialed collector reads this instead of a network device's running-config.
+_SSHD_EFFECTIVE_COMMAND = "sshd -T"
 
 
 async def _run_show(
@@ -82,4 +86,21 @@ async def collect_lldp_output(
     called for a grammar that exposes LLDP (Arista), so an FRR device is never asked."""
     return await _run_show(
         host, credential, _LLDP_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
+    )
+
+
+async def collect_sshd_effective_config(
+    host: str,
+    credential: Credential,
+    *,
+    port: int = 22,
+    timeout: float = 20.0,
+    max_bytes: int = 500_000,
+) -> str:
+    """The Linux host's EFFECTIVE SSH daemon configuration (``sshd -T``), truncated. Same read-only
+    single-command path as the device reads: it dumps config and changes nothing. Used for the host
+    tier (``server.ssh.*`` controls); a network device has no ``sshd`` and the read simply fails,
+    which the caller records as honest UNAVAILABLE coverage rather than a guessed fact."""
+    return await _run_show(
+        host, credential, _SSHD_EFFECTIVE_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
     )

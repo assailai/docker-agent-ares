@@ -44,7 +44,7 @@ from agent import (
     protocols,
     snmp,
 )
-from agent.collectors import ssh_collect, vendor
+from agent.collectors import linux_host, ssh_collect, vendor
 from agent.credential_vault import CredentialVault
 from agent.state import AgentState, fingerprint, load_state, save_state
 from agent.tunnel import (
@@ -1495,44 +1495,31 @@ async def _collect_neighbours(job: dict, credential, config: str, timeout_s: flo
     ]
 
 
-async def _collect_controls(
-    job: dict, control_ids: list[str], credential
-) -> tuple[list[dict], list[dict], list[dict]]:
-    """Read the device config ONCE, normalise it per control, and read its LLDP neighbours. Returns
-    (controls, coverage, neighbours).
-
-    No local credential, or a failed read, makes every requested control UNAVAILABLE (honest
-    coverage), never a guessed fact, and yields no neighbours. A control this agent's parser does not
-    support is UNSUPPORTED."""
-    target = job["target_address"]
-    if credential is None:
-        return (
-            [],
-            [
-                assessment_collect.coverage_entry(
-                    scope=f"{target}:{cid}", state="unavailable", reason_code="no_local_credential"
-                )
-                for cid in control_ids
-            ],
-            [],
+def _unavailable_coverage(target: str, control_ids: list[str], reason_code: str) -> list[dict]:
+    """One UNAVAILABLE coverage entry per control, so an unreadable source records an honest gap
+    rather than a guessed fact for every control it was asked to collect."""
+    return [
+        assessment_collect.coverage_entry(
+            scope=f"{target}:{cid}", state="unavailable", reason_code=reason_code
         )
-    timeout_s, max_bytes = _effective_collect_budget(job)
+        for cid in control_ids
+    ]
+
+
+async def _collect_network_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float, max_bytes: int
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """The network-device tier: read ``show running-config`` ONCE, normalise each requested control
+    via the vendor grammar, and read LLDP neighbours. A failed read makes every requested control
+    UNAVAILABLE and yields no neighbours; a control no vendor parser supports is UNSUPPORTED."""
+    target = job["target_address"]
     try:
         config = await ssh_collect.collect_running_config(
             target, credential, timeout=timeout_s, max_bytes=max_bytes
         )
     except Exception as exc:  # noqa: BLE001 - any connect/auth/read failure is honest UNAVAILABLE
         reason = f"collect_failed:{type(exc).__name__}"
-        return (
-            [],
-            [
-                assessment_collect.coverage_entry(
-                    scope=f"{target}:{cid}", state="unavailable", reason_code=reason
-                )
-                for cid in control_ids
-            ],
-            [],
-        )
+        return [], _unavailable_coverage(target, control_ids, reason), []
     controls: list[dict] = []
     coverage: list[dict] = []
     for control_id in control_ids:
@@ -1548,6 +1535,73 @@ async def _collect_controls(
             assessment_collect.control_facts(control_id, fields, collection_complete=True)
         )
     neighbours = await _collect_neighbours(job, credential, config, timeout_s, max_bytes)
+    return controls, coverage, neighbours
+
+
+async def _collect_host_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float, max_bytes: int
+) -> tuple[list[dict], list[dict]]:
+    """The Linux-host tier: read ``sshd -T`` (the daemon's effective config) ONCE and normalise each
+    requested ``server.ssh.*`` control via the host parser. A failed read (a network device has no
+    ``sshd``) makes every requested control UNAVAILABLE; a control the host parser does not support
+    is UNSUPPORTED. No neighbours: LLDP is a device grammar, not a host one."""
+    target = job["target_address"]
+    try:
+        sshd_effective = await ssh_collect.collect_sshd_effective_config(
+            target, credential, timeout=timeout_s, max_bytes=max_bytes
+        )
+    except Exception as exc:  # noqa: BLE001 - any connect/auth/read failure is honest UNAVAILABLE
+        reason = f"collect_failed:{type(exc).__name__}"
+        return [], _unavailable_coverage(target, control_ids, reason)
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    for control_id in control_ids:
+        fields = linux_host.collect_control_fields(sshd_effective, control_id)
+        if fields is None:
+            coverage.append(
+                assessment_collect.coverage_entry(
+                    scope=f"{target}:{control_id}", state="unsupported", reason_code="no_parser"
+                )
+            )
+            continue
+        controls.append(
+            assessment_collect.control_facts(control_id, fields, collection_complete=True)
+        )
+    return controls, coverage
+
+
+async def _collect_controls(
+    job: dict, control_ids: list[str], credential
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Normalise each requested control from its evidence source, and read the device's neighbours.
+    Returns (controls, coverage, neighbours).
+
+    A collect job's controls are partitioned by evidence source: a ``server.ssh.*`` control is read
+    from the host's ``sshd -T`` effective config, every other control from the device running-config.
+    Each source is opened at most once and only when a control needs it, so a host-only job never
+    dials for a running-config it would not use and a device-only job behaves exactly as before. No
+    local credential makes every requested control UNAVAILABLE (honest coverage), never a guess."""
+    target = job["target_address"]
+    if credential is None:
+        return [], _unavailable_coverage(target, control_ids, "no_local_credential"), []
+    timeout_s, max_bytes = _effective_collect_budget(job)
+    host_ids = [cid for cid in control_ids if linux_host.serves(cid)]
+    network_ids = [cid for cid in control_ids if not linux_host.serves(cid)]
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    neighbours: list[dict] = []
+    if network_ids:
+        net_controls, net_coverage, neighbours = await _collect_network_controls(
+            job, network_ids, credential, timeout_s, max_bytes
+        )
+        controls += net_controls
+        coverage += net_coverage
+    if host_ids:
+        host_controls, host_coverage = await _collect_host_controls(
+            job, host_ids, credential, timeout_s, max_bytes
+        )
+        controls += host_controls
+        coverage += host_coverage
     return controls, coverage, neighbours
 
 

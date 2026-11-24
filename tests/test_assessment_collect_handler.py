@@ -21,7 +21,9 @@ from agent.state import AgentState
 _FIX = Path(__file__).with_name("fixtures")
 
 
-def _job_payload(cp_seed: str, *, credential_ref: str = "cred-1") -> dict:
+def _job_payload(
+    cp_seed: str, *, credential_ref: str = "cred-1", control_ids: list[str] | None = None
+) -> dict:
     return {
         "tenant_id": "11111111-1111-1111-1111-111111111111",
         "environment": "production",
@@ -34,7 +36,7 @@ def _job_payload(cp_seed: str, *, credential_ref: str = "cred-1") -> dict:
         "nonce": "n",
         "target_address": "10.0.0.11",
         "credential_ref": credential_ref,
-        "control_ids": ["net.management.telnet"],
+        "control_ids": control_ids if control_ids is not None else ["net.management.telnet"],
     }
 
 
@@ -65,12 +67,16 @@ def _env(tmp_path, monkeypatch):
         "collect_lldp": AsyncMock(
             return_value=(_FIX / "ceos_lldp_neighbors_detail.txt").read_text()
         ),
+        "collect_sshd": AsyncMock(
+            return_value=(_FIX / "sshd_effective_planted.txt").read_text()
+        ),
     }
     monkeypatch.setattr(main.control_plane, "task_started", mocks["task_started"])
     monkeypatch.setattr(main.control_plane, "task_failed", mocks["task_failed"])
     monkeypatch.setattr(main.control_plane, "submit_assessment_result", mocks["submit"])
     monkeypatch.setattr(main.ssh_collect, "collect_running_config", mocks["collect"])
     monkeypatch.setattr(main.ssh_collect, "collect_lldp_output", mocks["collect_lldp"])
+    monkeypatch.setattr(main.ssh_collect, "collect_sshd_effective_config", mocks["collect_sshd"])
     state = AgentState(
         agent_id="a",
         agent_token="t",
@@ -139,6 +145,38 @@ async def test_collect_reads_config_and_signs_control_facts(_env) -> None:
         set(n) == {"local_interface", "neighbour_id", "neighbour_interface", "neighbour_address"}
         for n in result["neighbours"]
     )
+
+
+async def test_host_controls_are_read_from_sshd_effective_config(_env) -> None:
+    # A server.ssh.* job routes to the host tier: sshd -T, not show running-config, and no LLDP.
+    task = {
+        "id": "task-host",
+        "task_type": "network_assessment_collect_v1",
+        "tool_config": {
+            "envelope": _signed_job(
+                _env["cp_seed"],
+                control_ids=["server.ssh.password", "server.ssh.root_login", "server.ssh.max_auth_tries"],
+            )
+        },
+    }
+    await main._run_task("tok", task, state=_env["state"])
+
+    _env["mocks"]["collect_sshd"].assert_awaited_once()
+    _env["mocks"]["collect"].assert_not_called()  # the running-config path is never opened
+    _env["mocks"]["collect_lldp"].assert_not_called()  # LLDP is a device grammar, not a host one
+    _env["mocks"]["submit"].assert_awaited_once()
+
+    result = assessment.open_signed_job(
+        _env["mocks"]["submit"].await_args.args[3],
+        public_keys=[_env["agent_public"]],
+        domain=assessment_collect.RESULT_DOMAIN,
+        expected_schema=assessment_collect.RESULT_SCHEMA,
+    )
+    by_id = {c["control_id"]: c for c in result["controls"]}
+    assert by_id["server.ssh.password"]["facts"]["ssh_password_authentication"]["value"] is True
+    assert by_id["server.ssh.root_login"]["facts"]["ssh_root_login_permitted"]["value"] is True
+    assert by_id["server.ssh.max_auth_tries"]["facts"]["ssh_max_auth_tries"]["value"] == 6
+    assert result["neighbours"] == []
 
 
 async def test_missing_credential_yields_unavailable_coverage(_env) -> None:
