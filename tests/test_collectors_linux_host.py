@@ -78,6 +78,41 @@ def test_directive_names_are_case_insensitive() -> None:
     )
 
 
+def test_weak_ssh_algorithms_are_flagged_and_modern_ones_pass() -> None:
+    assert linux_host.parse_weak_macs_offered("macs hmac-sha1,hmac-sha2-256\nmaxauthtries 6\n") is True
+    assert (
+        linux_host.parse_weak_macs_offered(
+            "macs hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com\npermitrootlogin no\n"
+        )
+        is False
+    )
+    assert linux_host.parse_weak_ciphers_offered("ciphers aes128-cbc,aes256-ctr\nmaxauthtries 6\n") is True
+    assert (
+        linux_host.parse_weak_ciphers_offered(
+            "ciphers aes256-gcm@openssh.com,chacha20-poly1305@openssh.com\npermitrootlogin no\n"
+        )
+        is False
+    )
+    assert (
+        linux_host.parse_weak_kex_offered(
+            "kexalgorithms diffie-hellman-group14-sha1,curve25519-sha256\nmaxauthtries 6\n"
+        )
+        is True
+    )
+    assert (
+        linux_host.parse_weak_kex_offered(
+            "kexalgorithms curve25519-sha256,ecdh-sha2-nistp256\npermitrootlogin no\n"
+        )
+        is False
+    )
+
+
+def test_weak_algorithm_directive_absent_abstains() -> None:
+    # A real dump (marker present) that omits the algorithm directive abstains rather than guessing.
+    assert linux_host.parse_weak_macs_offered("permitrootlogin no\nmaxauthtries 6\n") is None
+    assert linux_host.parse_weak_kex_offered("permitrootlogin no\nmaxauthtries 6\n") is None
+
+
 # ── sysctl -a ─────────────────────────────────────────────────────────────────────────────────────
 def test_planted_sysctl_reads_every_weak_setting() -> None:
     cfg = _sysctl_planted()

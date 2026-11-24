@@ -104,6 +104,43 @@ def parse_max_auth_tries(sshd_effective: str) -> int | None:
     return int(value)
 
 
+# Substrings that mark a legacy/deprecated SSH algorithm in the comma-separated effective lists. These
+# are the primitives a hardened baseline drops: SHA1 and MD5 MACs, CBC/arcfour/3DES/DES ciphers, and
+# SHA1 / group1 key exchanges. Matching a substring keeps the check robust to the many vendor-suffixed
+# spellings (`hmac-sha1`, `hmac-sha1-etm@openssh.com`, ...).
+_WEAK_MAC_MARKERS = ("sha1", "md5", "-96", "ripemd")
+_WEAK_CIPHER_MARKERS = ("cbc", "arcfour", "3des", "blowfish", "cast128", "rc4")
+_WEAK_KEX_MARKERS = ("sha1", "group1-", "gss-group1")
+
+
+def _list_has_weak(sshd_effective: str, directive: str, markers: tuple[str, ...]) -> bool | None:
+    """Whether the comma-separated algorithm list for ``directive`` contains any token matching a weak
+    marker, or ``None`` to abstain when the directive is absent. The effective list is what the daemon
+    offers, so a weak entry means the daemon will negotiate it."""
+    value = _directives(sshd_effective).get(directive)
+    if value is None:
+        return None
+    tokens = [t.strip().lower() for t in value.split(",") if t.strip()]
+    return any(marker in token for token in tokens for marker in markers)
+
+
+def parse_weak_macs_offered(sshd_effective: str) -> bool | None:
+    """Whether the SSH MAC list offers a SHA1/MD5/64-bit MAC a hardened baseline drops, or abstain."""
+    return _list_has_weak(sshd_effective, "macs", _WEAK_MAC_MARKERS)
+
+
+def parse_weak_ciphers_offered(sshd_effective: str) -> bool | None:
+    """Whether the SSH cipher list offers a CBC/arcfour/3DES cipher a hardened baseline drops, or
+    abstain."""
+    return _list_has_weak(sshd_effective, "ciphers", _WEAK_CIPHER_MARKERS)
+
+
+def parse_weak_kex_offered(sshd_effective: str) -> bool | None:
+    """Whether the SSH key-exchange list offers a SHA1/group1 exchange a hardened baseline drops, or
+    abstain."""
+    return _list_has_weak(sshd_effective, "kexalgorithms", _WEAK_KEX_MARKERS)
+
+
 # ── sysctl -a (running kernel network-stack settings) ─────────────────────────────────────────────
 # A handful of keys every real ``sysctl -a`` dump carries. If none appear, the text is not a sysctl
 # dump, so the parser abstains rather than read a field out of unrelated bytes.
@@ -215,6 +252,12 @@ _FIELD_EXTRACTORS = {
         parse_x11_forwarding_enabled,
     ),
     ("server.ssh.max_auth_tries", "ssh_max_auth_tries"): (SOURCE_SSHD, parse_max_auth_tries),
+    ("server.ssh.weak_macs", "ssh_weak_macs_offered"): (SOURCE_SSHD, parse_weak_macs_offered),
+    ("server.ssh.weak_ciphers", "ssh_weak_ciphers_offered"): (
+        SOURCE_SSHD,
+        parse_weak_ciphers_offered,
+    ),
+    ("server.ssh.weak_kex", "ssh_weak_kex_offered"): (SOURCE_SSHD, parse_weak_kex_offered),
     ("server.sysctl.ip_forwarding", "sysctl_ip_forwarding_enabled"): (
         SOURCE_SYSCTL,
         parse_ip_forwarding_enabled,
