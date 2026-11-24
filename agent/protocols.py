@@ -9,7 +9,7 @@ OPEN service with no ``protocol_id`` rather than a guess.
 ``identify_protocol`` is pure: bytes in, a protocol id or ``None`` out. The bounded read that
 produces those bytes lives in the agent's discover handler, so this stays trivially testable from
 fixtures and carries no network or timing behaviour. Only the passive, server-speaks-first
-protocols are here (telnet, SSH, FTP, SMTP, rsync); the active follow-ups the §29.8 fixtures also
+protocols are here (telnet, SSH, FTP, SMTP, rsync, POP3, IMAP); the active follow-ups the §29.8 fixtures also
 name (SMTP EHLO, FTP FEAT/SYST, a bounded DNS query) are a later refinement.
 """
 
@@ -41,6 +41,13 @@ def identify_protocol(banner: bytes) -> str | None:
         return "ssh"
     if head.startswith(b"@RSYNCD:"):
         return "rsync"
+    # POP3 and IMAP greet in the clear BEFORE any TLS: a cleartext greeting on the plain port is a
+    # cleartext mail-retrieval transport (POP3S/IMAPS would answer with a TLS handshake, not this).
+    # POP3's status line opens with "+OK"; IMAP's untagged greeting opens with "* OK" or "* PREAUTH".
+    if head.startswith(b"+OK"):
+        return "pop3"
+    if head.startswith((b"* OK", b"* PREAUTH")):
+        return "imap"
     # SMTP and FTP both greet with a 3-digit "220 ..." line, so the code alone cannot tell them
     # apart: disambiguate on the greeting's own words, and abstain if it names neither.
     if head[:3] == b"220" and head[3:4] in (b" ", b"-"):

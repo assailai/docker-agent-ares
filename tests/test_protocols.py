@@ -24,15 +24,44 @@ from agent.protocols import (
         (b"220 FileZilla Server 1.2 FTP ready\r\n", "ftp"),
         (b"220-smtp greeting continues\r\n", "smtp"),  # multiline 220- form
         (b"@RSYNCD: 31.0\n", "rsync"),
-        (b"", None),  # nothing read: abstain (an OPEN-but-silent port, e.g. a quiet TCP/119)
+        (
+            b"",
+            None,
+        ),  # nothing read: abstain (an OPEN-but-silent port, e.g. a quiet TCP/119)
         (b"HTTP/1.1 200 OK\r\n", None),  # not a passive management protocol here
-        (b"220 just a welcome with no protocol word\r\n", None),  # ambiguous 220: abstain
+        (
+            b"220 just a welcome with no protocol word\r\n",
+            None,
+        ),  # ambiguous 220: abstain
         (b"\x00\x01\x02", None),  # binary noise
         # §29.8 regression fixtures, locked at the classifier:
-        (b"220 (vsFTPd 3.0.5)\r\n", "ftp"),  # anonymous-FTP greeting (vsFTPd contains "FTP")
+        (
+            b"220 (vsFTPd 3.0.5)\r\n",
+            "ftp",
+        ),  # anonymous-FTP greeting (vsFTPd contains "FTP")
         (b"220 ProFTPD 1.3.8 Server ready\r\n", "ftp"),
-        (b"200 news.example.com NNTP Service Ready\r\n", None),  # NNTP: not a passive specialist, abstain
-        (b"+OK POP3 ready\r\n", None),  # POP3 200-class greeting is not a 220: abstain, do not guess
+        (
+            b"200 news.example.com NNTP Service Ready\r\n",
+            None,
+        ),  # NNTP: not a passive specialist, abstain
+        # POP3/IMAP greet in the clear before any TLS, so the greeting identifies a cleartext transport:
+        (b"+OK Dovecot ready.\r\n", "pop3"),  # POP3 status line opens with "+OK"
+        (
+            b"+OK POP3 server ready <1896.697@x>\r\n",
+            "pop3",
+        ),  # APOP challenge form still opens "+OK"
+        (
+            b"* OK [CAPABILITY IMAP4rev1] Dovecot ready\r\n",
+            "imap",
+        ),  # IMAP untagged "* OK" greeting
+        (
+            b"* PREAUTH IMAP4rev1 server logged in as ares\r\n",
+            "imap",
+        ),  # pre-authenticated IMAP greeting
+        (
+            b"* BYE autologout; idle for too long\r\n",
+            None,
+        ),  # "* BYE" is not a greeting: abstain
         (b"SSH-2.0-OpenSSH_9.6", "ssh"),  # SSH identification with no trailing CRLF yet
     ],
 )
@@ -82,7 +111,10 @@ def test_smtp_ehlo_reports_starttls_when_advertised() -> None:
 def test_smtp_ehlo_without_starttls_is_a_read_negative_not_an_abstention() -> None:
     reply = b"250-mail.example.com\r\n250-PIPELINING\r\n250 AUTH PLAIN LOGIN\r\n"
     caps = smtp_ehlo_capabilities(reply)
-    assert caps == {"PIPELINING", "AUTH"}  # a reply WAS read and parsed, greeting excluded
+    assert caps == {
+        "PIPELINING",
+        "AUTH",
+    }  # a reply WAS read and parsed, greeting excluded
     assert "STARTTLS" not in caps
     assert smtp_supports_starttls(reply) is False
 
@@ -91,8 +123,13 @@ def test_smtp_ehlo_greeting_line_is_not_a_capability() -> None:
     # The first 250 line is the server host/greeting, never a capability: a real EHLO reply opens
     # with "250-<host>". This was caught by a live aiosmtpd reply that capability-only fixtures had
     # masked (the earlier subset assertions let the host name slip into the set unnoticed).
-    assert smtp_ehlo_capabilities(b"250 mail.example.com at your service\r\n") == frozenset()
-    caps = smtp_ehlo_capabilities(b"250-mail.example.com\r\n250-8BITMIME\r\n250 HELP\r\n")
+    assert (
+        smtp_ehlo_capabilities(b"250 mail.example.com at your service\r\n")
+        == frozenset()
+    )
+    caps = smtp_ehlo_capabilities(
+        b"250-mail.example.com\r\n250-8BITMIME\r\n250 HELP\r\n"
+    )
     assert caps == {"8BITMIME", "HELP"}
     assert "MAIL.EXAMPLE.COM" not in caps
 
@@ -106,13 +143,7 @@ def test_smtp_ehlo_abstains_on_an_unreadable_or_error_reply() -> None:
 
 
 def test_ftp_feat_reports_auth_tls_when_advertised() -> None:
-    reply = (
-        b"211-Features:\r\n"
-        b" AUTH TLS\r\n"
-        b" EPSV\r\n"
-        b" UTF8\r\n"
-        b"211 End\r\n"
-    )
+    reply = b"211-Features:\r\n AUTH TLS\r\n EPSV\r\n UTF8\r\n211 End\r\n"
     features = ftp_feat_features(reply)
     assert "AUTH TLS" in features
     assert "UTF8" in features
