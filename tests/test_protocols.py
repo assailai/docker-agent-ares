@@ -62,6 +62,15 @@ from agent.protocols import (
             b"* BYE autologout; idle for too long\r\n",
             None,
         ),  # "* BYE" is not a greeting: abstain
+        (
+            b"RFB 003.008\n",
+            "vnc",
+        ),  # VNC ProtocolVersion handshake: unencrypted remote access
+        (b"RFB 004.001\n", "vnc"),  # a later RFB version still identifies as vnc
+        (
+            b"RFB WARNING\n",
+            None,
+        ),  # "RFB " not followed by a version number: abstain, do not guess
         (b"SSH-2.0-OpenSSH_9.6", "ssh"),  # SSH identification with no trailing CRLF yet
     ],
 )

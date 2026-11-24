@@ -9,7 +9,7 @@ OPEN service with no ``protocol_id`` rather than a guess.
 ``identify_protocol`` is pure: bytes in, a protocol id or ``None`` out. The bounded read that
 produces those bytes lives in the agent's discover handler, so this stays trivially testable from
 fixtures and carries no network or timing behaviour. Only the passive, server-speaks-first
-protocols are here (telnet, SSH, FTP, SMTP, rsync, POP3, IMAP); the active follow-ups the §29.8 fixtures also
+protocols are here (telnet, SSH, FTP, SMTP, rsync, POP3, IMAP, VNC); the active follow-ups the §29.8 fixtures also
 name (SMTP EHLO, FTP FEAT/SYST, a bounded DNS query) are a later refinement.
 """
 
@@ -48,6 +48,11 @@ def identify_protocol(banner: bytes) -> str | None:
         return "pop3"
     if head.startswith((b"* OK", b"* PREAUTH")):
         return "imap"
+    # VNC/RFB: the server opens with its "RFB 003.00x\n" ProtocolVersion handshake the instant a
+    # client connects. RFB has no transport encryption of its own, so a reachable RFB server is an
+    # unencrypted remote-access service; TLS-wrapped VNC would not answer with a cleartext RFB line.
+    if head[:4] == b"RFB " and head[4:7].isdigit():
+        return "vnc"
     # SMTP and FTP both greet with a 3-digit "220 ..." line, so the code alone cannot tell them
     # apart: disambiguate on the greeting's own words, and abstain if it names neither.
     if head[:3] == b"220" and head[3:4] in (b" ", b"-"):
