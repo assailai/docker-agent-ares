@@ -1538,25 +1538,47 @@ async def _collect_network_controls(
     return controls, coverage, neighbours
 
 
+# The ssh_collect function that reads each host evidence source, named (not bound) so a test that
+# monkeypatches ssh_collect still reaches it: it is resolved off the module at call time. A new host
+# source is one entry here plus its collect function; the parser decides which source a control reads.
+_HOST_SOURCE_COLLECTOR_NAMES = {
+    linux_host.SOURCE_SSHD: "collect_sshd_effective_config",
+    linux_host.SOURCE_SYSCTL: "collect_sysctl_config",
+}
+
+
 async def _collect_host_controls(
     job: dict, control_ids: list[str], credential, timeout_s: float, max_bytes: int
 ) -> tuple[list[dict], list[dict]]:
-    """The Linux-host tier: read ``sshd -T`` (the daemon's effective config) ONCE and normalise each
-    requested ``server.ssh.*`` control via the host parser. A failed read (a network device has no
-    ``sshd``) makes every requested control UNAVAILABLE; a control the host parser does not support
-    is UNSUPPORTED. No neighbours: LLDP is a device grammar, not a host one."""
+    """The Linux-host tier: read each host evidence source a requested control needs (``sshd -T`` for
+    ``server.ssh.*``, ``sysctl -a`` for ``server.sysctl.*``) at most ONCE, then normalise each control
+    from its source via the host parser. A source whose read fails (a network device has no ``sshd`` /
+    ``sysctl``) makes every control reading it UNAVAILABLE, while the controls on a source that did
+    read are still assessed; a control the host parser does not support is UNSUPPORTED. No neighbours:
+    LLDP is a device grammar, not a host one."""
     target = job["target_address"]
-    try:
-        sshd_effective = await ssh_collect.collect_sshd_effective_config(
-            target, credential, timeout=timeout_s, max_bytes=max_bytes
-        )
-    except Exception as exc:  # noqa: BLE001 - any connect/auth/read failure is honest UNAVAILABLE
-        reason = f"collect_failed:{type(exc).__name__}"
-        return [], _unavailable_coverage(target, control_ids, reason)
+    sources: dict[str, str] = {}
+    failed: dict[str, str] = {}
+    for source in linux_host.sources_for(control_ids):
+        collect = getattr(ssh_collect, _HOST_SOURCE_COLLECTOR_NAMES[source])
+        try:
+            sources[source] = await collect(
+                target, credential, timeout=timeout_s, max_bytes=max_bytes
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed read is honest UNAVAILABLE, not a crash
+            failed[source] = f"collect_failed:{type(exc).__name__}"
     controls: list[dict] = []
     coverage: list[dict] = []
     for control_id in control_ids:
-        fields = linux_host.collect_control_fields(sshd_effective, control_id)
+        source = linux_host.source_for(control_id)
+        if source in failed:
+            coverage.append(
+                assessment_collect.coverage_entry(
+                    scope=f"{target}:{control_id}", state="unavailable", reason_code=failed[source]
+                )
+            )
+            continue
+        fields = linux_host.collect_control_fields(sources, control_id)
         if fields is None:
             coverage.append(
                 assessment_collect.coverage_entry(

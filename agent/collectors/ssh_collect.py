@@ -25,6 +25,8 @@ _LLDP_COMMAND = "show lldp neighbors detail"
 # Read-only like every other command here: it prints config, it changes none. The host tier of the
 # credentialed collector reads this instead of a network device's running-config.
 _SSHD_EFFECTIVE_COMMAND = "sshd -T"
+# The kernel's RUNNING network-stack settings. Read-only (``-a`` lists, it does not set).
+_SYSCTL_COMMAND = "sysctl -a"
 
 
 async def _run_show(
@@ -103,4 +105,20 @@ async def collect_sshd_effective_config(
     which the caller records as honest UNAVAILABLE coverage rather than a guessed fact."""
     return await _run_show(
         host, credential, _SSHD_EFFECTIVE_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
+    )
+
+
+async def collect_sysctl_config(
+    host: str,
+    credential: Credential,
+    *,
+    port: int = 22,
+    timeout: float = 20.0,
+    max_bytes: int = 500_000,
+) -> str:
+    """The Linux host's RUNNING kernel settings (``sysctl -a``), truncated. Read-only (``-a`` lists,
+    it does not set). Used for the host tier (``server.sysctl.*`` controls); a network device has no
+    ``sysctl`` and the read simply fails, recorded as honest UNAVAILABLE coverage."""
+    return await _run_show(
+        host, credential, _SYSCTL_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
     )

@@ -70,6 +70,9 @@ def _env(tmp_path, monkeypatch):
         "collect_sshd": AsyncMock(
             return_value=(_FIX / "sshd_effective_planted.txt").read_text()
         ),
+        "collect_sysctl": AsyncMock(
+            return_value=(_FIX / "sysctl_planted.txt").read_text()
+        ),
     }
     monkeypatch.setattr(main.control_plane, "task_started", mocks["task_started"])
     monkeypatch.setattr(main.control_plane, "task_failed", mocks["task_failed"])
@@ -77,6 +80,7 @@ def _env(tmp_path, monkeypatch):
     monkeypatch.setattr(main.ssh_collect, "collect_running_config", mocks["collect"])
     monkeypatch.setattr(main.ssh_collect, "collect_lldp_output", mocks["collect_lldp"])
     monkeypatch.setattr(main.ssh_collect, "collect_sshd_effective_config", mocks["collect_sshd"])
+    monkeypatch.setattr(main.ssh_collect, "collect_sysctl_config", mocks["collect_sysctl"])
     state = AgentState(
         agent_id="a",
         agent_token="t",
@@ -177,6 +181,34 @@ async def test_host_controls_are_read_from_sshd_effective_config(_env) -> None:
     assert by_id["server.ssh.root_login"]["facts"]["ssh_root_login_permitted"]["value"] is True
     assert by_id["server.ssh.max_auth_tries"]["facts"]["ssh_max_auth_tries"]["value"] == 6
     assert result["neighbours"] == []
+
+
+async def test_a_host_job_reads_sshd_and_sysctl_each_once(_env) -> None:
+    # A job mixing server.ssh.* and server.sysctl.* reads BOTH host sources, each exactly once.
+    task = {
+        "id": "task-host2",
+        "task_type": "network_assessment_collect_v1",
+        "tool_config": {
+            "envelope": _signed_job(
+                _env["cp_seed"],
+                control_ids=["server.ssh.password", "server.sysctl.ip_forwarding", "server.sysctl.source_route"],
+            )
+        },
+    }
+    await main._run_task("tok", task, state=_env["state"])
+
+    _env["mocks"]["collect_sshd"].assert_awaited_once()
+    _env["mocks"]["collect_sysctl"].assert_awaited_once()
+    _env["mocks"]["collect"].assert_not_called()
+    result = assessment.open_signed_job(
+        _env["mocks"]["submit"].await_args.args[3],
+        public_keys=[_env["agent_public"]],
+        domain=assessment_collect.RESULT_DOMAIN,
+        expected_schema=assessment_collect.RESULT_SCHEMA,
+    )
+    by_id = {c["control_id"]: c for c in result["controls"]}
+    assert by_id["server.sysctl.ip_forwarding"]["facts"]["sysctl_ip_forwarding_enabled"]["value"] is True
+    assert by_id["server.sysctl.source_route"]["facts"]["sysctl_source_route_accepted"]["value"] is True
 
 
 async def test_missing_credential_yields_unavailable_coverage(_env) -> None:
