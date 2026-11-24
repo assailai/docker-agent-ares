@@ -88,10 +88,16 @@ def test_build_result_carries_the_job_binding_and_exact_shape() -> None:
     job = _job()
     services = [
         assessment_discover.service_observation(
-            address="10.0.0.9", port=23, transport="tcp", outcome="open", protocol_id="telnet"
+            address="10.0.0.9",
+            port=23,
+            transport="tcp",
+            outcome="open",
+            protocol_id="telnet",
         )
     ]
-    coverage = [assessment_discover.coverage_entry(scope="10.0.0.0/24:22-443", state="assessed")]
+    coverage = [
+        assessment_discover.coverage_entry(scope="10.0.0.0/24:22-443", state="assessed")
+    ]
     result = assessment_discover.build_discover_result(
         job, services=services, coverage=coverage, completed_at="2026-11-18T13:00:00Z"
     )
@@ -108,6 +114,57 @@ def test_build_result_carries_the_job_binding_and_exact_shape() -> None:
         "banner_sha256",
         "capabilities",
     }
+
+
+def _tcp(address: str, port: int, outcome: str) -> dict:
+    return assessment_discover.service_observation(
+        address=address, port=port, transport="tcp", outcome=outcome
+    )
+
+
+def test_a_saturated_host_has_its_open_inventory_suppressed_as_inconclusive() -> None:
+    # 200 probed TCP ports, 150 "open": an intermediary is answering, not the host. The open list is
+    # a measurement artifact and must not ship as a 150-port inventory.
+    services = [_tcp("10.0.0.5", p, "open") for p in range(1, 151)]
+    services += [_tcp("10.0.0.5", p, "refused") for p in range(151, 201)]
+    kept, coverage = assessment_discover.guard_saturated_inventory(services, [])
+    assert all(
+        not (s["outcome"] == "open") for s in kept
+    )  # every artifact open dropped
+    assert len(kept) == 50 and all(
+        s["outcome"] == "refused" for s in kept
+    )  # honest refused kept
+    assert coverage == [
+        {
+            "scope": "10.0.0.5",
+            "state": "inconclusive",
+            "reason_code": "tcp_port_inventory_saturated",
+        }
+    ]
+
+
+def test_a_small_targeted_sweep_with_every_port_open_is_not_saturated() -> None:
+    # 3 requested ports all answering is an ordinary result, not a path artifact: below the minimum.
+    services = [_tcp("10.0.0.9", p, "open") for p in (22, 23, 443)]
+    kept, coverage = assessment_discover.guard_saturated_inventory(services, [])
+    assert kept == services and coverage == []
+
+
+def test_saturation_guard_leaves_udp_and_other_hosts_untouched() -> None:
+    saturated = [_tcp("10.0.0.5", p, "open") for p in range(1, 201)]
+    udp = [
+        assessment_discover.service_observation(
+            address="10.0.0.5", port=161, transport="udp", outcome="open"
+        )
+    ]
+    other_host = [_tcp("10.0.0.6", 22, "open")]
+    kept, coverage = assessment_discover.guard_saturated_inventory(
+        saturated + udp + other_host, []
+    )
+    # the UDP observation on the saturated host and the open port on the unsaturated host both survive
+    assert udp[0] in kept and other_host[0] in kept
+    assert not any(s["transport"] == "tcp" and s["address"] == "10.0.0.5" for s in kept)
+    assert [c["scope"] for c in coverage] == ["10.0.0.5"]
 
 
 def test_sealed_result_verifies_under_the_registered_public_key() -> None:
@@ -141,7 +198,9 @@ def test_sealed_result_verifies_under_the_registered_public_key() -> None:
 
 def test_sealed_result_is_refused_under_a_different_key() -> None:
     seed = assessment.generate_signing_seed()
-    other_public = assessment.public_key_b64_from_seed(assessment.generate_signing_seed())
+    other_public = assessment.public_key_b64_from_seed(
+        assessment.generate_signing_seed()
+    )
     envelope = assessment.seal_result(
         assessment_discover.build_discover_result(
             _job(), services=[], coverage=[], completed_at="2026-11-18T13:00:00Z"
@@ -176,7 +235,9 @@ def test_sealed_result_payload_bytes_are_canonical() -> None:
 
 
 def test_derive_scope_parses_udp_operations() -> None:
-    scope = assessment_discover.derive_scope(_job(udp_operations=["snmp_default_community"]))
+    scope = assessment_discover.derive_scope(
+        _job(udp_operations=["snmp_default_community"])
+    )
     assert scope.udp_operations == ("snmp_default_community",)
 
 

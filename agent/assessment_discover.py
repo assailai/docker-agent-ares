@@ -135,15 +135,22 @@ def derive_scope(job: dict) -> DiscoverScope:
     """
     missing = [field for field in _REQUIRED_JOB_FIELDS if field not in job]
     if missing:
-        raise ValueError(f"verified job missing required field(s): {', '.join(missing)}")
-    networks = tuple(ipaddress.ip_network(cidr, strict=False) for cidr in job["target_cidrs"])
+        raise ValueError(
+            f"verified job missing required field(s): {', '.join(missing)}"
+        )
+    networks = tuple(
+        ipaddress.ip_network(cidr, strict=False) for cidr in job["target_cidrs"]
+    )
     excludes = tuple(
-        ipaddress.ip_network(cidr, strict=False) for cidr in job.get("exclude_cidrs", [])
+        ipaddress.ip_network(cidr, strict=False)
+        for cidr in job.get("exclude_cidrs", [])
     )
     if not networks:
         raise ValueError("verified job has no target networks")
     ports = tuple(parse_port_spec(job["tcp_ports"]))
-    udp_operations = tuple(op for op in job.get("udp_operations", []) if isinstance(op, str) and op)
+    udp_operations = tuple(
+        op for op in job.get("udp_operations", []) if isinstance(op, str) and op
+    )
     return DiscoverScope(
         networks=networks, excludes=excludes, ports=ports, udp_operations=udp_operations
     )
@@ -189,6 +196,57 @@ def coverage_entry(*, scope: str, state: str, reason_code: str | None = None) ->
     return {"scope": scope, "state": state, "reason_code": reason_code}
 
 
+# A real host exposes a handful of ports; when nearly every probed TCP port on one address answers
+# OPEN, the cause is an intermediary completing the handshake (a SYN-proxying NAT, a load balancer, a
+# tarpit firewall) in front of the host, not the host, so the "open" list is a measurement artifact.
+# This mirrors the recon port-sweep's saturation guard (ares/agents/recon/port_sweep.py): reporting
+# nothing is far better than a false inventory of thousands of open ports, which reads as a
+# catastrophic exposure rather than an artifact. The minimum probe count keeps a small, targeted
+# sweep (where every requested port legitimately answering is ordinary) from ever tripping it.
+_SATURATION_RATIO = 0.5
+_SATURATION_MIN_TCP_PROBES = 100
+
+
+def guard_saturated_inventory(
+    services: list[dict], coverage: list[dict]
+) -> tuple[list[dict], list[dict]]:
+    """Drop the OPEN TCP observations of any address whose open fraction is implausibly high (a path
+    answering, not the host), replacing them with one INCONCLUSIVE coverage entry per such address.
+    Refused/filtered observations and every UDP observation pass through unchanged, as does a host
+    below the minimum probe count. Pure: the same input always yields the same output."""
+    by_address_tcp: dict[str, list[dict]] = {}
+    for svc in services:
+        if svc.get("transport") == "tcp":
+            by_address_tcp.setdefault(svc["address"], []).append(svc)
+    saturated = {
+        address
+        for address, tcp in by_address_tcp.items()
+        if len(tcp) >= _SATURATION_MIN_TCP_PROBES
+        and sum(1 for s in tcp if s.get("outcome") == "open")
+        > len(tcp) * _SATURATION_RATIO
+    }
+    if not saturated:
+        return services, coverage
+    kept = [
+        svc
+        for svc in services
+        if not (
+            svc.get("address") in saturated
+            and svc.get("transport") == "tcp"
+            and svc.get("outcome") == "open"
+        )
+    ]
+    extra = [
+        coverage_entry(
+            scope=address,
+            state="inconclusive",
+            reason_code="tcp_port_inventory_saturated",
+        )
+        for address in sorted(saturated)
+    ]
+    return kept, coverage + extra
+
+
 def build_discover_result(
     job: dict,
     *,
@@ -202,8 +260,10 @@ def build_discover_result(
     The binding (tenant / assessment / snapshot / scope revision / agent / job / nonce) is carried
     straight through from the job the control plane dispatched, so ingestion can check the result
     names the exact job and snapshot it signed. ``partial`` is True when a budget or cancellation
-    ended the job before every planned probe ran; its coverage then records the gap.
+    ended the job before every planned probe ran; its coverage then records the gap. The saturation
+    guard runs here so no caller can assemble a result that reports a path-answering false inventory.
     """
+    services, coverage = guard_saturated_inventory(services, coverage)
     return {
         "tenant_id": job["tenant_id"],
         "assessment_id": job["assessment_id"],
