@@ -30,6 +30,9 @@ fresh_agent() {  # $1 = starting image
 tick() {  # caller sets ARES_UPDATE_* in the environment; runs one updater tick
   # this ticks from the host, not from an updater container: never let it reach for an
   # ares-updater container of the machine's own (scripts/e2e_self_update.sh covers self-update)
+  # Ticked from the checkout, not from an image, so updater/RELEASE does not exist and the
+  # agent's downgrade floor is off (main._rollback_reason). That is what lets the non-release
+  # targets below through; bake a RELEASE into this path and Test 1 starts failing.
   ( cd "$REPO_DIR" && ARES_UPDATE_SELF_UPDATE=false uv run --no-project --with httpx --with pydantic-settings python -c "
 from updater import main
 from updater.dockerd import DockerBackend

@@ -81,11 +81,12 @@ class DockerBackend:
             # predecessor is already removing itself
             docker.delete(f"/containers/{old_name}", params={"force": "true"})
 
-    def apply(self, settings: UpdaterSettings, plan: UpdatePlan) -> None:
+    def apply(self, settings: UpdaterSettings, plan: UpdatePlan) -> bool:
         if plan.agent and not self._swap_agent(settings, plan.agent):
-            return  # the updater waits until the agent is on the target
+            return False  # the updater waits until the agent is on the target
         if plan.updater:
             self._hand_over(settings, plan.updater)
+        return True
 
     def _swap_agent(self, settings: UpdaterSettings, image_ref: str) -> bool:
         name = settings.container_name

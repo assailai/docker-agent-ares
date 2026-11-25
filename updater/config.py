@@ -31,6 +31,12 @@ class UpdaterSettings(BaseSettings):
     # off for a host whose updater is managed some other way (GitOps, change control): the agent
     # still updates, the updater stays on what was installed.
     self_update: bool = True
+    # The updater refuses to move the AGENT to a release older than its own, or to a target that is
+    # no release at all. A signed-but-old image is still a downgrade attack: the signature is
+    # genuine, and the version handoff is not. Set this only for a deliberate, operator-driven
+    # rollback on a host you control. It never lets the updater move ITSELF backwards - that guard
+    # has no override, because an updater taken below 3.14.0 could never update itself again.
+    allow_downgrade: bool = False
     # never set by hand. An updater stamps it onto the successor it starts, so that while both run
     # during a handoff each can tell which container is its own (dockerd.inspect_self).
     instance: str = ""
@@ -48,12 +54,21 @@ class UpdaterSettings(BaseSettings):
     #     that calls it. Naming the caller (docker-publish.yml) is a regexp that can never match.
     #   * the REF is the caller's ref, since docker-build.yml is invoked as a local reusable
     #     workflow. The release path (auto-tag.yml, on a version-bump merge) therefore signs at
-    #     refs/heads/main; refs/tags/v* only appears when a human pushes a v* tag directly, because
-    #     a GITHUB_TOKEN tag push cannot re-trigger a workflow. Both are accepted below.
-    # So the boundary this enforces is "built and signed by this repo's build workflow via GitHub
-    # OIDC" - branch / latest / sha images satisfy it too. That is fine: the updater only ever pulls
-    # <repo>:<target-version> as named by the control plane (see main._tick), so it cannot drift onto
-    # a floating tag, and it applies the exact digest cosign attested rather than re-resolving.
+    #     refs/heads/main, which is the protected branch: a merge there has been reviewed.
+    # refs/tags/v* used to be accepted too, and must not be. Any account with push access can
+    # create a tag - and no ruleset can stop that without also stopping auto-tag.yml, since
+    # GitHub will not accept the Actions app as a bypass actor here (ARES-2351) - and
+    # docker-publish.yml built and signed on one, so an attacker who could not merge to main
+    # could still publish an image under release tags with the identity the whole fleet trusts.
+    # docker-publish.yml no longer triggers on tags, docker-build.yml refuses to push from any
+    # other ref, and auto-tag.yml fails the release when a v<version> tag does not name the
+    # reviewed commit that cut it. What this identity should name is the ref that gets REVIEWED,
+    # and that is a branch.
+    # So the boundary this enforces is "built and signed from this repo's protected branch by its
+    # build workflow, via GitHub OIDC" - branch / latest / sha images on main satisfy it too. The
+    # updater only ever pulls <repo>:<target-version> as named by the control plane, and _tick
+    # refuses a target that is not a release version, so it cannot drift onto one of those; it
+    # applies the exact digest cosign attested rather than re-resolving.
     #
     # Defaulted to this image's own publishing workflow so every deploy shape (docker run, compose,
     # k8s) verifies out of the box without spelling the regexp out in each install command; override
@@ -61,7 +76,7 @@ class UpdaterSettings(BaseSettings):
     cosign_identity: str = (
         r"^https://github\.com/assailai/docker-agent-ares/"
         r"\.github/workflows/docker-build\.yml@"
-        r"refs/(heads/main|tags/v.*)$"
+        r"refs/heads/main$"
     )
     cosign_issuer: str = "https://token.actions.githubusercontent.com"
     # cosign key-based verification (alternative): path to a cosign public key.
@@ -73,14 +88,19 @@ class UpdaterSettings(BaseSettings):
 
 
 def _split_ref(image_ref: str) -> tuple[str, str]:
-    """Split an image ref into (repo, tag). A digest ref (``repo@sha256:...``) has no tag. A
-    trailing ``:`` is a tag only when what follows has no ``/`` (otherwise it is a registry
-    port, e.g. ``reg:5000/img``)."""
-    repo, at, _digest = image_ref.partition("@")
-    if at:
-        return (repo, "")
-    head, sep, tail = image_ref.rpartition(":")
-    return (head, tail) if (sep and "/" not in tail) else (image_ref, "")
+    """Split an image ref into (repo, tag). A trailing ``:`` is a tag only when what follows has no
+    ``/`` (otherwise it is a registry port, e.g. ``reg:5000/img``).
+
+    A reference may carry a tag AND a digest - ``repo:tag@sha256:...`` is legal OCI, and it is what
+    a pinned Kubernetes manifest holds. So take the digest off first and read the tag from what is
+    left. Returning at the digest, as this did until ARES-2351, handed back ``repo:tag`` as the
+    repository, and ``_resolve`` then asked cosign about ``repo:tag:target``: verification failed,
+    the move was refused fail-closed, and auto-update was off for good with nothing logged as
+    wrong. ``repo_of`` in ``scripts/verify-images.sh`` had the same bug, for the same reason.
+    """
+    ref, _at, _digest = image_ref.partition("@")
+    head, sep, tail = ref.rpartition(":")
+    return (head, tail) if (sep and "/" not in tail) else (ref, "")
 
 
 def tag_of(image_ref: str) -> str:

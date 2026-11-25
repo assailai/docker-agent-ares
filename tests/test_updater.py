@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import types
@@ -23,13 +24,19 @@ def _settings(**over) -> UpdaterSettings:
 
 
 @pytest.fixture(autouse=True)
-def _clear_verified_cache(monkeypatch: pytest.MonkeyPatch):
+def _clear_verified_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # the verified-digest caches and the retry clock are module globals; isolate them between tests.
     main._verified.clear()
     main._verified_self.clear()
     main._self_retry_after.clear()
+    main._apply_retry_after.clear()
     main._declined_downgrades.clear()
+    main._declined_rollbacks.clear()
     monkeypatch.setattr(main, "_predecessor_removed", False)
+    # Dockerfile.updater writes updater/RELEASE into the image; a checkout has none, and the whole
+    # suite quietly depends on that (targets here are older than the repo's own version). Pin it
+    # rather than leave it to whether someone built in the working tree.
+    monkeypatch.setattr(main, "_RELEASE_FILE", tmp_path / "no-release")
     yield
 
 
@@ -47,6 +54,37 @@ def test_image_ref_parsing() -> None:
     assert repo_of("reg:5000/ares-agent") == "reg:5000/ares-agent"  # the ":" is a registry port
     assert repo_of("assailai/ares-agent@sha256:abc123") == "assailai/ares-agent"  # digest ref
     assert tag_of("assailai/ares-agent@sha256:abc123") == ""  # a digest is not a tag
+    # tag AND digest together, which is legal OCI and what a pinned k8s manifest holds. Reading
+    # this as repo="assailai/ares-agent:2.5.0" made _resolve ask cosign about a doubly-tagged
+    # reference, which fails, which turns auto-update off silently and for good (ARES-2351).
+    assert repo_of("assailai/ares-agent:2.5.0@sha256:abc123") == "assailai/ares-agent"
+    assert tag_of("assailai/ares-agent:2.5.0@sha256:abc123") == "2.5.0"
+    assert repo_of("reg:5000/ares-agent:2.5.0@sha256:abc") == "reg:5000/ares-agent"
+
+
+def test_a_pinned_manifest_is_read_as_current_not_as_a_double_tag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`repo:tag@sha256:...` is what `scripts/verify-images.sh` writes into a k8s manifest, and
+    `kube._image_in` reads the spec string back verbatim, so this is the reference the updater
+    actually sees on every pinned install.
+
+    Read wrongly it was poison: repo came back as `repo:tag`, `_resolve` asked cosign about
+    `repo:tag:target`, verification failed, and `_tick` returned at `if not agent.current and
+    agent.pinned is None`. Auto-update off, permanently, with nothing logged as an error - and a
+    cosign subprocess burned every poll, since the agent path has no backoff (ARES-2351).
+    """
+    pinned = "docker.io/assailai/ares-agent:3.15.1@sha256:" + "ab" * 32
+    asked: list[str] = []
+    monkeypatch.setattr(main.verify, "verify", lambda image, _s: asked.append(image) or None)
+
+    resolution = main._resolve(
+        running=pinned, target="3.15.1", repo=repo_of(pinned), cache={}
+    )
+
+    # already on the target: its tag is right there in the reference, so there is nothing to ask
+    assert resolution.current is True
+    assert asked == [], f"cosign was asked about {asked}"
 
 
 def test_read_target(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -83,10 +121,16 @@ def test_default_signer_identity_matches_what_ci_actually_signs_with() -> None:
     assert settings.cosign_issuer == "https://token.actions.githubusercontent.com"
 
     identity = re.compile(settings.cosign_identity)
-    # the release path (auto-tag.yml -> docker-build.yml) signs at the caller's ref, refs/heads/main;
-    # a hand-pushed v* tag signs at the tag ref. Both are ours.
+    # the release path (auto-tag.yml -> docker-build.yml) signs at the caller's ref, refs/heads/main.
+    # That is the protected branch, so a merge there has been reviewed.
     assert identity.search(_san("docker-build.yml", "refs/heads/main"))
-    assert identity.search(_san("docker-build.yml", "refs/tags/v3.3.1"))
+    # a TAG ref is not ours, whatever it is named. Anyone with push access can create a tag, and
+    # nothing in GitHub stopped it, so a v* build would have been an unreviewed commit signed
+    # under the identity the whole fleet trusts (ARES-2327).
+    assert not identity.search(_san("docker-build.yml", "refs/tags/v3.3.1"))
+    assert not identity.search(_san("docker-build.yml", "refs/tags/v99.0.0"))
+    # nor is another branch, for the same reason: only main is protected.
+    assert not identity.search(_san("docker-build.yml", "refs/heads/feature"))
     # not ours, or not a signer: another owner/repo, the caller workflow that holds no cosign step,
     # and an unmerged PR build (which does not push or sign at all).
     assert not identity.search(_san("docker-build.yml", "refs/heads/main", repo="attacker/evil"))
@@ -95,6 +139,35 @@ def test_default_signer_identity_matches_what_ci_actually_signs_with() -> None:
     # cosign's -regexp flags are substring matches, so the anchors have to hold on both ends.
     assert not identity.search(_san("docker-build.yml", "refs/heads/main") + ".evil.example")
     assert not identity.search("https://evil.example/" + _san("docker-build.yml", "refs/heads/main"))
+
+
+def test_the_readme_publishes_the_identity_the_updater_actually_uses() -> None:
+    # customers verify images by hand with the regexp README.md prints, so a drift between the two
+    # sends them chasing a failure that is not there. It has drifted once already.
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    assert UpdaterSettings().cosign_identity in readme, (
+        "README.md does not publish the updater's current --certificate-identity-regexp"
+    )
+
+
+def test_only_main_can_reach_the_signing_step() -> None:
+    # the identity above is only worth what CI will produce. If any workflow can push and sign
+    # from another ref, narrowing the regexp just moves the hole rather than closing it.
+    workflows = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+    if not workflows.is_dir():
+        pytest.skip("no .github/workflows checkout (e.g. running inside the built image)")
+
+    build = (workflows / "docker-build.yml").read_text()
+    assert "github.ref != 'refs/heads/main'" in build, "no ref guard in front of the push and sign"
+    assert "environment:" in build, "the Docker Hub credentials are not held in an environment"
+
+    # no entry workflow may build release images off a tag push: any pusher can create a tag.
+    for name in ("docker-publish.yml", "auto-tag.yml"):
+        triggers = (workflows / name).read_text().split("\njobs:")[0]
+        live = [line for line in triggers.splitlines() if not line.lstrip().startswith("#")]
+        assert not [line for line in live if re.match(r"\s*tags:", line)], (
+            f"{name} still triggers on a tag push"
+        )
 
 
 def test_default_signer_identity_names_the_workflow_that_signs() -> None:
@@ -366,31 +439,27 @@ def test_docker_apply_drops_labels_when_the_old_image_is_unreadable(
 
 
 def test_k8s_apply_patches_the_deployment_image(monkeypatch: pytest.MonkeyPatch) -> None:
-    seen: dict = {}
+    deployment = _FakeDeployment().install(monkeypatch)
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "PATCH":
-            seen["body"] = request.read().decode()
-        return httpx.Response(200, json={})
-
-    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://k8s")
-    monkeypatch.setattr(kube, "_client", lambda: client)
-    monkeypatch.setattr(kube, "_namespace", lambda _s: "default")
-
-    K8sBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent:2.5.0"))
-    container = json.loads(seen["body"])["spec"]["template"]["spec"]["containers"][0]
-    assert container == {"name": "ares-agent", "image": "assailai/ares-agent:2.5.0"}
+    assert K8sBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent:2.5.0")) is True
+    assert deployment.patched(0)[0] == {"name": "ares-agent", "image": "assailai/ares-agent:2.5.0"}
 
 
 class _FakeBackend:
     """Stand-in backend that records what it was asked to apply. Unmanaged by default, so a test
     about the agent sees only the agent."""
 
-    def __init__(self, running: str | None, me: SelfInspection | None = None) -> None:
+    def __init__(
+        self,
+        running: str | None,
+        me: SelfInspection | None = None,
+        apply_result: bool = True,
+    ) -> None:
         self.running = running
         self.me = me or SelfInspection(role=Role.UNMANAGED)
         self.plan: UpdatePlan | None = None
         self.predecessor_removals = 0
+        self.apply_result = apply_result  # False = the agent was left where it was
 
     @property
     def applied(self) -> str | None:
@@ -408,8 +477,9 @@ class _FakeBackend:
     def remove_predecessor(self, settings: UpdaterSettings) -> None:
         self.predecessor_removals += 1
 
-    def apply(self, settings: UpdaterSettings, plan: UpdatePlan) -> None:
+    def apply(self, settings: UpdaterSettings, plan: UpdatePlan) -> bool:
         self.plan = plan
+        return self.apply_result
 
 
 def test_tick_derives_repo_from_the_running_image(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -658,6 +728,21 @@ def test_docker_keeps_the_old_agent_when_the_new_one_is_crash_looping(
     assert ("DELETE", "/containers/new1", "") in engine.calls
 
 
+def test_docker_apply_reports_whether_the_agent_moved(monkeypatch: pytest.MonkeyPatch) -> None:
+    # _tick keys its backoff off this answer, so the backend has to give a real one rather than
+    # let a crash-looping image be retried every poll_seconds forever
+    healthy = _FakeEngine(me=_updater_container())
+    healthy.install(monkeypatch)
+    moved = DockerBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent@sha256:a"))
+
+    crash_looping = _FakeEngine(me=_updater_container(), successor_restarts=3)
+    crash_looping.install(monkeypatch)
+    left = DockerBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent@sha256:a"))
+
+    assert moved is True
+    assert left is False
+
+
 def test_docker_takes_its_name_back_when_the_successor_cannot_take_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -719,36 +804,128 @@ def test_docker_removes_a_predecessor_that_failed_to_remove_itself(
     assert engine.calls == [("DELETE", "/containers/ares-updater-old", "")]
 
 
-def _k8s_deployment(monkeypatch: pytest.MonkeyPatch, containers: list[dict]) -> list[dict]:
-    """Serve a Deployment with ``containers``; return the patches the backend sends."""
-    patches: list[dict] = []
+class _FakeDeployment:
+    """The agent Deployment as the API server reports it.
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    PATCHes mutate the pod template and bump metadata.generation, the way the apiserver does
+    synchronously; GETs return that spec plus the status the test drives. ``ready_after`` is how
+    many polls the rollout takes to report itself up, and ``ready_for`` how long it stays that way
+    before falling over again (a crash loop is Ready between restarts).
+    """
+
+    def __init__(
+        self,
+        *,
+        containers: list[dict] | None = None,
+        replicas: int = 1,
+        ready_after: int = 0,
+        ready_for: int | None = None,
+        observes_after: int = 0,
+        rollback_status: int = 200,
+    ) -> None:
+        self.containers = containers if containers is not None else [
+            {"name": "ares-agent", "image": "assailai/ares-agent:2.4.0"},
+            {"name": "ares-updater", "image": f"{_UPDATER}:2.4.0"},
+        ]
+        self.replicas = replicas
+        self.ready_after = ready_after
+        self.ready_for = ready_for
+        self.observes_after = observes_after
+        self.rollback_status = rollback_status
+        self.generation = 1
+        self.observed = 1
+        self.patches: list[dict] = []
+        self.polls = 0
+
+    def _status(self) -> dict:
+        # before the first patch the Deployment is simply up; afterwards the test drives it.
+        if not self.patches:
+            return {
+                "observedGeneration": self.generation,
+                "updatedReplicas": self.replicas,
+                "readyReplicas": self.replicas,
+                "availableReplicas": self.replicas,
+            }
+        observed = self.generation if self.polls >= self.observes_after else self.generation - 1
+        up = self.polls >= self.ready_after
+        if up and self.ready_for is not None and self.polls >= self.ready_after + self.ready_for:
+            up = False  # came up, then fell over: CrashLoopBackOff
+        return {
+            "observedGeneration": observed,
+            "updatedReplicas": self.replicas if up else 0,
+            "readyReplicas": self.replicas if up else 0,
+            "availableReplicas": self.replicas if up else 0,
+        }
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
         if request.method == "PATCH":
-            patches.append(json.loads(request.read()))
+            body = json.loads(request.read())
+            self.patches.append(body)
+            if len(self.patches) > 1 and self.rollback_status != 200:
+                return httpx.Response(self.rollback_status, json={})
+            wanted = {c["name"]: c["image"] for c in body["spec"]["template"]["spec"]["containers"]}
+            for container in self.containers:
+                if container["name"] in wanted:
+                    container["image"] = wanted[container["name"]]
+            self.generation += 1
+            self.polls = 0
             return httpx.Response(200, json={})
-        deployment = {"spec": {"template": {"spec": {"containers": containers}}}}
-        return httpx.Response(200, json=deployment)
+        self.polls += 1
+        return httpx.Response(
+            200,
+            json={
+                "metadata": {"generation": self.generation},
+                "spec": {"replicas": self.replicas, "template": {"spec": {"containers": self.containers}}},
+                "status": self._status(),
+            },
+        )
 
-    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://k8s")
-    monkeypatch.setattr(kube, "_client", lambda: client)
-    monkeypatch.setattr(kube, "_namespace", lambda _s: "default")
-    return patches
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> _FakeDeployment:
+        # a fresh client per call, as the real _client() is: it reads the SA token each time, and
+        # an httpx.Client cannot be reopened once a `with` block has closed it.
+        monkeypatch.setattr(
+            kube,
+            "_client",
+            lambda: httpx.Client(transport=httpx.MockTransport(self.handler), base_url="https://k8s"),
+        )
+        monkeypatch.setattr(kube, "_namespace", lambda _s: "default")
+        # A fake clock advanced by sleep, not a no-op sleep: the gate polls against a wall-clock
+        # deadline, so a no-op would spin forever, and patching the deadline down to 1 would stop
+        # the tests exercising the real constant.
+        clock = types.SimpleNamespace(now=1000.0)
+        self.clock = clock
+        monkeypatch.setattr(kube.time, "sleep", lambda s: setattr(clock, "now", clock.now + s))
+        monkeypatch.setattr(kube.time, "monotonic", lambda: clock.now)
+        monkeypatch.setattr(kube, "_said_not_rolled_out", False)
+        return self
+
+    def patched(self, index: int) -> list[dict]:
+        return self.patches[index]["spec"]["template"]["spec"]["containers"]
+
+    @property
+    def images(self) -> dict[str, str]:
+        return {c["name"]: c["image"] for c in self.containers}
+
+
+def _k8s_deployment(monkeypatch: pytest.MonkeyPatch, containers: list[dict]) -> list[dict]:
+    """Serve a healthy Deployment with ``containers``; return the patches the backend sends."""
+    return _FakeDeployment(containers=containers).install(monkeypatch).patches
 
 
 def test_k8s_moves_the_agent_and_the_updater_in_one_rollout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # given the agent Deployment, with the updater as its sidecar
-    patches = _k8s_deployment(monkeypatch, containers=[])
+    deployment = _FakeDeployment().install(monkeypatch)
 
     # when both are behind
     plan = UpdatePlan(agent="assailai/ares-agent@sha256:a", updater=f"{_UPDATER}@sha256:u")
-    K8sBackend().apply(_settings(), plan)
+    assert K8sBackend().apply(_settings(), plan) is True
 
-    # then one patch sets both images, so the pod rolls once rather than twice
-    (patch,) = patches
-    assert patch["spec"]["template"]["spec"]["containers"] == [
+    # then one patch sets both images, so the pod rolls once rather than twice, and the rollback
+    # never ran
+    assert len(deployment.patches) == 1
+    assert deployment.patched(0) == [
         {"name": "ares-agent", "image": plan.agent},
         {"name": "ares-updater", "image": plan.updater},
     ]
@@ -758,16 +935,166 @@ def test_k8s_moves_only_the_updater_when_the_agent_is_current(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # given an agent already on the target
-    patches = _k8s_deployment(monkeypatch, containers=[])
+    deployment = _FakeDeployment().install(monkeypatch)
 
     # when only the updater moves
-    K8sBackend().apply(_settings(), UpdatePlan(updater=f"{_UPDATER}@sha256:u"))
+    assert K8sBackend().apply(_settings(), UpdatePlan(updater=f"{_UPDATER}@sha256:u")) is True
 
     # then the patch names the updater container alone
-    (patch,) = patches
-    assert patch["spec"]["template"]["spec"]["containers"] == [
-        {"name": "ares-updater", "image": f"{_UPDATER}@sha256:u"}
+    assert len(deployment.patches) == 1
+    assert deployment.patched(0) == [{"name": "ares-updater", "image": f"{_UPDATER}@sha256:u"}]
+
+
+def test_k8s_apply_waits_for_the_rollout_before_reporting_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given a rollout that comes up straight away
+    deployment = _FakeDeployment().install(monkeypatch)
+
+    # when the agent is moved
+    assert K8sBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent@sha256:a")) is True
+
+    # then it did not take the first Ready as proof: a crash-looping container is Ready between
+    # restarts, so the condition has to hold across consecutive polls (as dockerd's _stays_up does)
+    assert deployment.polls >= kube._ROLLOUT_SETTLE_CHECKS
+    assert len(deployment.patches) == 1
+
+
+def test_k8s_apply_does_not_read_the_pre_patch_status_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given a controller that takes four polls to notice the patch at all. Until it does, status
+    # is the one from BEFORE the patch - which says Ready.
+    deployment = _FakeDeployment(observes_after=4).install(monkeypatch)
+
+    # when the agent is moved
+    assert K8sBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent@sha256:a")) is True
+
+    # then observedGeneration held it back. Without that check the first three polls would have
+    # settled it, because the status they carry is the pre-patch one and it says Ready - which is
+    # how every failed rollout used to read as a success.
+    assert deployment.polls > kube._ROLLOUT_SETTLE_CHECKS
+
+
+def test_k8s_apply_rolls_back_the_agent_when_the_new_pod_never_becomes_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given a signed image that cannot run here at all (a wrong-architecture platform digest, or
+    # any signed build that dies at startup): the pod never reports Ready
+    deployment = _FakeDeployment(ready_after=10**6).install(monkeypatch)
+    started = deployment.clock.now
+
+    # when the agent is moved to it
+    moved = K8sBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent@sha256:broken"))
+
+    # then the previous image is put back, and the caller is told the agent did not move. k8s does
+    # not do this by itself: progressDeadlineSeconds only writes a status condition.
+    assert moved is False
+    assert deployment.patched(1) == [{"name": "ares-agent", "image": "assailai/ares-agent:2.4.0"}]
+    assert deployment.images["ares-agent"] == "assailai/ares-agent:2.4.0"
+    assert deployment.clock.now - started >= kube._ROLLOUT_DEADLINE
+
+
+def test_k8s_apply_rolls_back_the_agent_when_it_does_not_stay_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given a pod that comes up and then falls over before the settle window closes: the k8s twin
+    # of test_docker_keeps_the_old_agent_when_the_new_one_is_crash_looping
+    deployment = _FakeDeployment(ready_after=1, ready_for=1).install(monkeypatch)
+
+    moved = K8sBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent@sha256:flaky"))
+
+    assert moved is False
+    assert deployment.images["ares-agent"] == "assailai/ares-agent:2.4.0"
+
+
+def test_k8s_apply_restores_both_images_when_a_combined_rollout_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # one patch is one rollout, so "skip the updater" has no meaning here the way it does on
+    # Docker; the coherent equivalent is that nothing moved
+    deployment = _FakeDeployment(ready_after=10**6).install(monkeypatch)
+
+    plan = UpdatePlan(agent="assailai/ares-agent@sha256:a", updater=f"{_UPDATER}@sha256:u")
+    assert K8sBackend().apply(_settings(), plan) is False
+
+    assert deployment.patched(1) == [
+        {"name": "ares-agent", "image": "assailai/ares-agent:2.4.0"},
+        {"name": "ares-updater", "image": f"{_UPDATER}:2.4.0"},
     ]
+
+
+def test_k8s_apply_says_so_when_it_cannot_roll_back(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # the agent is down and we cannot put it back: the log is the only thing standing between an
+    # operator and a silent outage, so it has to name what to restore
+    deployment = _FakeDeployment(ready_after=10**6, rollback_status=403).install(monkeypatch)
+
+    with caplog.at_level(logging.ERROR, logger="ares.updater.k8s"):
+        moved = K8sBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent@sha256:a"))
+
+    assert moved is False
+    assert "assailai/ares-agent:2.4.0" in caplog.text
+    assert "rollout undo" in caplog.text
+    assert len(deployment.patches) == 2
+
+
+def test_k8s_apply_treats_a_scaled_down_deployment_as_rolled_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # an operator who scaled the agent to zero must not get an infinite wait and a spurious
+    # rollback on every tick
+    deployment = _FakeDeployment(replicas=0, ready_after=10**6).install(monkeypatch)
+
+    assert K8sBackend().apply(_settings(), UpdatePlan(agent="assailai/ares-agent@sha256:a")) is True
+    assert len(deployment.patches) == 1
+
+
+def test_k8s_apply_skips_a_container_the_deployment_does_not_have(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # an operator who deleted the sidecar. A strategic-merge patch naming an unknown container
+    # tries to ADD one and is rejected for the fields it cannot invent, so every update would
+    # break rather than just the updater's own move.
+    deployment = _FakeDeployment(
+        containers=[{"name": "ares-agent", "image": "assailai/ares-agent:2.4.0"}]
+    ).install(monkeypatch)
+
+    plan = UpdatePlan(agent="assailai/ares-agent@sha256:a", updater=f"{_UPDATER}@sha256:u")
+    assert K8sBackend().apply(_settings(), plan) is True
+
+    assert deployment.patched(0) == [{"name": "ares-agent", "image": "assailai/ares-agent@sha256:a"}]
+
+
+def test_k8s_running_image_waits_for_the_rollout_to_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # running_image read the Deployment SPEC, so right after a patch it reported the target as
+    # running. That is what made a failed rollout indistinguishable from a successful one - on
+    # that tick and every later one, including after an updater restart, because the spec outlives
+    # the in-memory cache.
+    deployment = _FakeDeployment(ready_after=2).install(monkeypatch)
+    deployment.patches.append({})  # pretend a patch landed, so the status is the driven one
+    deployment.generation = 2
+
+    assert K8sBackend().running_image(_settings()) is None  # not rolled out yet
+    deployment.polls = 5
+    assert K8sBackend().running_image(_settings()) == "assailai/ares-agent:2.4.0"
+
+
+def test_k8s_inspect_self_still_finds_its_own_image_mid_rollout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # the rollout gate is deliberately NOT on inspect_self: an updater that cannot name its own
+    # image mid-roll could never compute a self-target
+    deployment = _FakeDeployment(ready_after=10**6).install(monkeypatch)
+    deployment.patches.append({})
+    deployment.generation = 2
+
+    assert K8sBackend().inspect_self(_settings()) == SelfInspection(
+        role=Role.OWNER, image=f"{_UPDATER}:2.4.0"
+    )
 
 
 def test_k8s_finds_the_updater_sidecar_or_reports_it_unmanaged(
@@ -945,15 +1272,14 @@ def test_a_handoff_that_returns_waits_before_it_is_tried_again(
     assert backend.plan is None
 
 
-@pytest.mark.parametrize(
-    "target", ["3.13.2", "nightly"], ids=["an-older-release", "no-release-at-all"]
-)
-def test_the_updater_never_moves_itself_backwards(
-    target: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # given an updater built as 3.14.0, and a target older than that (an operator rolling the agent
-    # back), or a target it cannot read as a release
-    monkeypatch.setattr(main, "settings", _settings())
+def test_the_updater_never_moves_itself_backwards(monkeypatch: pytest.MonkeyPatch) -> None:
+    # given an updater built as 3.14.0 with the agent's rollback guard opted out of (the only way
+    # the agent moves back at all), and an older release as the target. The opt-out is
+    # deliberately agent-only: see test_the_agent_never_moves_back_below_the_updaters_release for
+    # the default, and test_the_override_still_refuses_anything_that_is_not_a_release for why a
+    # target that is no release at all never gets this far, for either of them.
+    target = "3.13.2"
+    monkeypatch.setattr(main, "settings", _settings(allow_downgrade=True))
     monkeypatch.setattr(main, "_read_target", lambda: target)
     monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
     _verify_to_digest(monkeypatch)
@@ -982,6 +1308,351 @@ def test_the_updater_moves_forward_past_its_own_release(monkeypatch: pytest.Monk
     # when it ticks, then it moves itself forward as usual
     main._tick(backend)
     assert backend.plan == UpdatePlan(updater=f"{_UPDATER}@sha256:3.15.0")
+
+
+_A_RELEASE_DIGEST = "sha256:" + "ab" * 32
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "3.13.2",
+        "latest",
+        "sha-deadbeef",
+        "3.14.1-rc1",
+        f"3.99.0@{_A_RELEASE_DIGEST}",
+        "3.14.0 ",
+    ],
+    ids=[
+        "an-older-release",
+        "a-floating-tag",
+        "a-branch-build",
+        "a-prerelease",
+        "a-newer-name-carrying-an-older-digest",
+        "a-release-with-trailing-space",
+    ],
+)
+def test_the_agent_never_moves_back_below_the_updaters_release(
+    target: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # given an updater built as 3.14.0 and a handoff naming something CI did sign, but that is not
+    # a step forward: an older release, or a build that is no release at all
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: target)
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    seen = _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(
+        running="docker.io/assailai/ares-agent:3.14.0", me=_owner(f"{_UPDATER}:3.14.0")
+    )
+
+    # when it ticks
+    main._tick(backend)
+
+    # then nothing moves, and cosign was never asked: the signature would have PASSED, which is
+    # the whole point - it proves the artifact, not that the version is the current one
+    assert backend.plan is None
+    assert seen == []
+    assert backend.running == "docker.io/assailai/ares-agent:3.14.0"
+
+
+def test_the_agent_moves_forward_past_the_updaters_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given an updater built as 3.14.0 and the next release marked current
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: "3.15.0")
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(
+        running="docker.io/assailai/ares-agent:3.14.0", me=_owner(f"{_UPDATER}:3.14.0")
+    )
+
+    # when it ticks, then the ordinary path is untouched
+    main._tick(backend)
+    assert backend.plan.agent == f"docker.io/assailai/ares-agent@sha256:3.15.0"
+
+
+def test_the_agent_may_catch_up_to_the_release_the_updater_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given an install whose agent lags its own updater (the updater moves second, so a half-done
+    # rollout looks exactly like this)
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: "3.14.0")
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(
+        running="docker.io/assailai/ares-agent:3.13.2", me=_owner(f"{_UPDATER}:3.14.0")
+    )
+
+    # when it ticks, then equal is allowed: the floor is "older than", not "not newer than"
+    main._tick(backend)
+    assert backend.plan.agent == f"docker.io/assailai/ares-agent@sha256:3.14.0"
+
+
+def test_a_version_carrying_a_digest_cannot_walk_past_the_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The way around the floor, if the version pattern is left open at the end.
+
+    ``_resolve`` builds ``f"{repo}:{target}"``, and an OCI reference may carry a tag *and* a
+    digest - where the digest is what is pulled. So ``3.99.0@sha256:<an old release's digest>``
+    reads as 3.99.0 to a floor check that only matches a prefix, clears it, passes cosign (that
+    digest carries a genuine main signature) and lands the old image on the host. Every part of
+    this is legitimate except the first.
+    """
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: f"3.99.0@{_A_RELEASE_DIGEST}")
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    seen = _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(
+        running="docker.io/assailai/ares-agent:3.14.0", me=_owner(f"{_UPDATER}:3.14.0")
+    )
+
+    main._tick(backend)
+
+    assert backend.plan is None
+    assert seen == [], "cosign was asked, so the reference reached the registry"
+
+
+def test_the_override_still_refuses_anything_that_is_not_a_release(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # ARES_UPDATE_ALLOW_DOWNGRADE exists for one thing: a deliberate rollback to an older
+    # RELEASE. What an operator rolls back *to* is a release, so the lever has no reason to admit
+    # `latest`, a branch build or a version with a digest welded on - and admitting them would
+    # make one env var on one host re-open the bypass above.
+    monkeypatch.setattr(main, "settings", _settings(allow_downgrade=True))
+    monkeypatch.setattr(main, "_read_target", lambda: f"3.99.0@{_A_RELEASE_DIGEST}")
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    seen = _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(running="docker.io/assailai/ares-agent:3.14.0")
+
+    with caplog.at_level(logging.WARNING, logger="ares.updater"):
+        main._tick(backend)
+
+    assert backend.plan is None
+    assert seen == []
+    assert "with or without the override" in caplog.text
+
+
+def test_the_updater_also_refuses_to_move_itself_to_a_version_with_a_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # the agent guard returns first, so pin the self guard on its own: _is_backwards reads the
+    # same anchored pattern, and a target it cannot parse is backwards by definition.
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+
+    assert main._is_backwards(f"3.99.0@{_A_RELEASE_DIGEST}")
+    assert main._is_backwards("3.99.0-rc1")
+    assert not main._is_backwards("3.99.0")
+
+
+@pytest.mark.parametrize(
+    "version",
+    ["3.14.0-rc1", "3.14.0@sha256:abc", "3.14", "latest", "v3.14.0.1", "3.14.0 ", " 3.14.0"],
+)
+def test_only_a_plain_release_parses_as_one(version: str) -> None:
+    # the single predicate the floor, the self guard and Dockerfile.updater's build check all
+    # agree on. Anchored at both ends; see _RELEASE.
+    assert main._release_key(version) is None
+    assert main._release_key("3.14.0") == (3, 14, 0)
+    assert main._release_key("v3.14.0") == (3, 14, 0)
+
+
+def test_the_rollback_guard_is_off_without_a_baked_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given a checkout rather than an image: updater/RELEASE does not exist, so there is no floor
+    # to compare against. This is what keeps scripts/e2e_updater.sh working - it ticks from the
+    # host with uv and targets 3.19 and 99.99.99-nope - and it is a deliberate fail-open, since
+    # that path already requires host access.
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: "3.13.2")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(running="docker.io/assailai/ares-agent:3.14.0")
+
+    main._tick(backend)
+    assert backend.plan.agent == f"docker.io/assailai/ares-agent@sha256:3.13.2"
+
+
+def test_a_refused_target_is_logged_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # a standing target is read every poll_seconds; saying so every 30 seconds forever would bury
+    # everything else in the log
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(running="docker.io/assailai/ares-agent:3.14.0")
+
+    with caplog.at_level(logging.WARNING, logger="ares.updater"):
+        monkeypatch.setattr(main, "_read_target", lambda: "3.13.2")
+        for _ in range(3):
+            main._tick(backend)
+        assert len(caplog.records) == 1
+        assert "refusing to move the agent to 3.13.2" in caplog.text
+
+        # a different refused target is its own line
+        monkeypatch.setattr(main, "_read_target", lambda: "3.12.0")
+        main._tick(backend)
+
+    assert len(caplog.records) == 2
+
+
+def test_allow_downgrade_lets_an_operator_move_the_agent_back(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # the lever for a deliberate, vendor-initiated rollback. Reachable only by someone who already
+    # has host/cluster config access, so it hands the control-plane attacker nothing.
+    monkeypatch.setattr(main, "settings", _settings(allow_downgrade=True))
+    monkeypatch.setattr(main, "_read_target", lambda: "3.13.2")
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(running="docker.io/assailai/ares-agent:3.14.0")
+
+    with caplog.at_level(logging.WARNING, logger="ares.updater"):
+        main._tick(backend)
+
+    assert backend.plan.agent == f"docker.io/assailai/ares-agent@sha256:3.13.2"
+    assert "ARES_UPDATE_ALLOW_DOWNGRADE is set" in caplog.text
+
+
+def test_allow_downgrade_never_moves_the_updater_backwards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # the two guards are separate predicates on purpose: one lever must not quietly disable the
+    # other. An updater taken below 3.14.0 could never update itself again (ARES-2049).
+    monkeypatch.setattr(main, "settings", _settings(allow_downgrade=True))
+    monkeypatch.setattr(main, "_read_target", lambda: "3.13.2")
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(
+        running="docker.io/assailai/ares-agent:3.14.0", me=_owner(f"{_UPDATER}:3.14.0")
+    )
+
+    main._tick(backend)
+
+    assert backend.plan == UpdatePlan(agent=f"docker.io/assailai/ares-agent@sha256:3.13.2")
+    assert backend.plan.updater is None
+
+
+def test_the_startup_line_warns_that_the_floor_is_frozen_with_self_update_off(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The gap Saksham found on review, made visible where an operator will meet it.
+
+    The floor is the updater's own release and it only moves when the updater does. With
+    self-update off the agent keeps updating and the floor does not, so the distance between them
+    grows with every release - at 3.15.0 with the agent on 3.18.0, naming 3.16.0 is still
+    believed. Closing it needs the agent's release recorded out of the agent's reach (ARES-2337);
+    until then this says so once, in `docker logs`, rather than only in a docstring.
+    """
+    monkeypatch.setattr(main, "settings", _settings(self_update=False))
+    monkeypatch.setattr(main, "_own_release", lambda: "3.15.0")
+
+    with caplog.at_level(logging.INFO, logger="ares.updater"):
+        main._report_floor()
+
+    assert "self-update is off" in caplog.text
+    assert "3.15.0" in caplog.text
+    assert caplog.records[0].levelno == logging.WARNING
+
+
+def test_the_startup_line_reports_an_unparseable_baked_release_as_an_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Dockerfile.updater refuses to build this, so reaching a host means something upstream went
+    # wrong - and the consequence is the whole downgrade guard off, which is silent otherwise.
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_own_release", lambda: "3.15.0-rc1")
+
+    with caplog.at_level(logging.INFO, logger="ares.updater"):
+        main._report_floor()
+
+    assert main._floor() is None
+    assert caplog.records[0].levelno == logging.ERROR
+    assert "downgrade floor is OFF" in caplog.text
+
+
+def test_the_rollback_guard_does_not_skip_removing_a_predecessor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # the guard sits after _settle_role: a leftover ares-updater-old must not be stranded on the
+    # host just because the standing target is bogus
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: "3.13.2")
+    monkeypatch.setattr(main, "_own_release", lambda: "3.14.0")
+    backend = _FakeBackend(
+        running="docker.io/assailai/ares-agent:3.14.0", me=_owner(f"{_UPDATER}:3.14.0")
+    )
+
+    main._tick(backend)
+
+    assert backend.plan is None
+    assert backend.predecessor_removals == 1
+
+
+def test_tick_backs_off_after_an_update_that_did_not_stick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # given a target whose image verifies but does not survive the move (a crash-looping build, or
+    # a k8s rollout that was rolled back). Without a memo this repeats every poll_seconds forever:
+    # pull, create, wait ten seconds, delete, and a cosign subprocess each time.
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: "3.15.0")
+    seen = _verify_to_digest(monkeypatch)
+    clock = types.SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(main.time, "monotonic", lambda: clock.now)
+    backend = _FakeBackend(running="docker.io/assailai/ares-agent:3.14.0", apply_result=False)
+
+    # when it ticks, is told the agent did not move, and ticks again
+    main._tick(backend)
+    assert backend.plan is not None and len(seen) == 1
+    backend.plan = None
+    main._tick(backend)
+
+    # then nothing was attempted and cosign was not asked a second time
+    assert backend.plan is None
+    assert len(seen) == 1
+
+    # and once the wait is over it tries again, verifying afresh rather than reusing the digest
+    clock.now += main._APPLY_RETRY_SECONDS + 1
+    main._tick(backend)
+    assert backend.plan is not None
+    assert len(seen) == 2
+
+
+def test_tick_forgets_a_digest_whose_move_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # the cache maps a target to "the digest cosign attested for it". Keeping that across a failed
+    # move would let a retry apply an attestation that may since have been revoked.
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: "3.15.0")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(running="docker.io/assailai/ares-agent:3.14.0", apply_result=False)
+
+    main._tick(backend)
+
+    assert "3.15.0" not in main._verified
+
+
+def test_tick_does_not_back_the_agent_off_when_only_the_handoff_returned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # the two memos answer different questions, and conflating them would let a failed updater
+    # handoff freeze the agent's updates for half an hour
+    monkeypatch.setattr(main, "settings", _settings())
+    monkeypatch.setattr(main, "_read_target", lambda: "3.15.0")
+    _verify_to_digest(monkeypatch)
+    backend = _FakeBackend(
+        running="docker.io/assailai/ares-agent:3.15.0", me=_owner(f"{_UPDATER}:3.14.0")
+    )
+
+    main._tick(backend)
+
+    assert backend.plan == UpdatePlan(updater=f"{_UPDATER}@sha256:3.15.0")
+    assert "3.15.0" in main._self_retry_after
+    assert "3.15.0" not in main._apply_retry_after
 
 
 def test_the_owner_removes_its_predecessor_once(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1085,6 +1756,93 @@ def test_an_unreadable_image_bundle_leaves_the_default_trust_alone(
 
     assert tlsconf.install_ca_bundle() is None
     assert "SSL_CERT_FILE" not in os.environ
+
+
+def test_the_non_tls_extracts_are_left_out_of_the_merged_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # SSL_CERT_FILE is what cosign reads, so a root the host trusts only for e-mail or code
+    # signing would otherwise become a valid issuer for the registry and the Sigstore log. The
+    # mount is the RHEL extract directory, which holds one bundle per purpose.
+    host_ca, _ = _prepare_ca_dirs(tmp_path, monkeypatch)
+    host_ca.mkdir()
+    (host_ca / "tls-ca-bundle.pem").write_text("TLS ROOTS\n")
+    (host_ca / "email-ca-bundle.pem").write_text("EMAIL ROOT\n")
+    (host_ca / "objsign-ca-bundle.pem").write_text("OBJSIGN ROOT\n")
+
+    bundle = tlsconf.install_ca_bundle()
+
+    assert bundle is not None
+    body = bundle.read_text()
+    assert "PUBLIC ROOTS" in body and "TLS ROOTS" in body
+    assert "EMAIL ROOT" not in body
+    assert "OBJSIGN ROOT" not in body
+    assert os.environ["SSL_CERT_FILE"] == str(bundle)
+
+
+def test_only_non_tls_extracts_leave_ssl_cert_file_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Nothing eligible once the rule has run. SSL_CERT_FILE *replaces* the default trust, so the
+    # choice is only ever "widen or leave alone", and the image's own store is the answer.
+    host_ca, _ = _prepare_ca_dirs(tmp_path, monkeypatch)
+    host_ca.mkdir()
+    (host_ca / "email-ca-bundle.pem").write_text("EMAIL ROOT\n")
+
+    assert tlsconf.install_ca_bundle() is None
+    assert "SSL_CERT_FILE" not in os.environ
+
+
+def test_the_skipped_extracts_are_named_in_the_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # said before the early return, or "I mounted a directory and the updater did nothing" has no
+    # explanation anywhere - and unlike the agent, the updater has no startup summary line.
+    host_ca, _ = _prepare_ca_dirs(tmp_path, monkeypatch)
+    host_ca.mkdir()
+    (host_ca / "email-ca-bundle.pem").write_text("EMAIL ROOT\n")
+
+    with caplog.at_level(logging.INFO, logger="ares.updater.tls"):
+        tlsconf.install_ca_bundle()
+
+    assert "email-ca-bundle.pem" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        {"tls-ca-bundle.pem": "TLS", "email-ca-bundle.pem": "MAIL", "objsign-ca-bundle.pem": "OBJ"},
+        {"ca-certificates.crt": "DEBIAN"},
+        {"email-ca-bundle.pem": "MAIL", "corp-root.crt": "CORP"},
+        {"corp-root.crt": "CORP", "internal.pem": "INTERNAL"},
+        {"tls-ca-bundle.pem": "TLS", "corp-root.crt": "CORP"},
+    ],
+    ids=[
+        "rhel-extracts",
+        "debian-bundle",
+        "a-stray-email-extract",
+        "an-ordinary-drop-in",
+        "a-drop-in-beside-a-tls-bundle",
+    ],
+)
+def test_the_updater_selects_the_same_host_ca_files_as_the_agent(
+    tmp_path: Path, layout: dict[str, str]
+) -> None:
+    # The two _server_auth_only are the same text on purpose: the updater image ships updater/
+    # only, so it cannot import agent.tlsconf. Compare behaviour rather than source, so a
+    # reformat does not fail and a logic change on one side cannot pass.
+    from agent import tlsconf as agent_tlsconf
+
+    directory = tmp_path / "host-ca"
+    directory.mkdir()
+    for name, body in layout.items():
+        (directory / name).write_text(f"{body}\n")
+
+    assert tlsconf._server_auth_only(tlsconf._pems_in(directory)) == agent_tlsconf._server_auth_only(
+        agent_tlsconf._pems_in(directory)
+    )
+    assert tlsconf._PEM_SUFFIXES == agent_tlsconf._PEM_SUFFIXES
+    assert tlsconf._NON_TLS_BUNDLE_PREFIXES == agent_tlsconf._NON_TLS_BUNDLE_PREFIXES
 
 
 def test_unreadable_mounted_files_leave_the_default_trust_alone(

@@ -1,0 +1,175 @@
+# Generated. Do not edit by hand.
+#
+#   uv pip compile --universal --generate-hashes --python-version 3.12 --no-header -o requirements-updater-lock.txt requirements-updater.txt
+#
+# requirements-updater.txt pins the direct packages and is the file to edit; this one pins everything they pull in,
+# and the artifact of each. The shipped images install from HERE with --require-hashes, so a build
+# can only ever install what a reviewed commit recorded - which is what makes Dependabot's cooldown
+# cover the transitive set too, not just the versions written by hand.
+#
+# --universal because the images build linux/amd64 and linux/arm64 and the builder stage runs per
+# architecture, so one file has to carry every artifact both of them resolve.
+#
+# Named .txt, not .lock, so Dependabot's pip ecosystem scans it: a transitive CVE has to
+# produce a pull request here, or locking would have cost exactly the coverage it was meant
+# to extend. Dependabot rewrites the hashes with the version.
+#
+# requirements-dev.txt is deliberately not locked: it is the test environment, never shipped.
+annotated-types==0.8.0 \
+    --hash=sha256:13b2beaad985e05e2d6407ee4c4f35590b11f8d693a258a561055cac8f64cab7 \
+    --hash=sha256:f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0
+    # via pydantic
+anyio==4.16.0 \
+    --hash=sha256:59bb03251907983d1603d27c3087ddb1e93299ea2163adcdba37899a4fb12ffb \
+    --hash=sha256:c66ae634e0b8228396b801741beb3294326d4b6102f7bba4041c0dfb58c29026
+    # via httpx
+certifi==2026.10.19 \
+    --hash=sha256:035c1e85572b141bf1c3a3eff0e33a8eb74917522f2559075ff8d2fea780a1ae \
+    --hash=sha256:42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b
+    # via
+    #   -r requirements-updater.txt
+    #   httpcore
+    #   httpx
+h11==0.16.0 \
+    --hash=sha256:4e35b956cf45792e4caa5885e69fba00bdbc6ffafbfa020300e549b208ee5ff1 \
+    --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
+    # via httpcore
+httpcore==1.0.9 \
+    --hash=sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55 \
+    --hash=sha256:6e34463af53fd2ab5d807f399a9b45ea31c3dfa2276f15a2c3f00afff6e176e8
+    # via httpx
+httpx==0.28.1 \
+    --hash=sha256:75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc \
+    --hash=sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad
+    # via -r requirements-updater.txt
+idna==3.20 \
+    --hash=sha256:a7db850025b95ded1eae8a46181a1a6c56c92c96f0e2b005d9ff8dc0210cab44 \
+    --hash=sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c
+    # via
+    #   anyio
+    #   httpx
+pydantic==2.10.3 \
+    --hash=sha256:be04d85bbc7b65651c5f8e6b9976ed9c6f41782a55524cef079a34a0bb82144d \
+    --hash=sha256:cb5ac360ce894ceacd69c403187900a02c4b20b693a9dd1d643e1effab9eadf9
+    # via
+    #   -r requirements-updater.txt
+    #   pydantic-settings
+pydantic-core==2.27.1 \
+    --hash=sha256:00e6424f4b26fe82d44577b4c842d7df97c20be6439e8e685d0d715feceb9fb9 \
+    --hash=sha256:029d9757eb621cc6e1848fa0b0310310de7301057f623985698ed7ebb014391b \
+    --hash=sha256:02a3d637bd387c41d46b002f0e49c52642281edacd2740e5a42f7017feea3f2c \
+    --hash=sha256:0325336f348dbee6550d129b1627cb8f5351a9dc91aad141ffb96d4937bd9529 \
+    --hash=sha256:062f60e512fc7fff8b8a9d680ff0ddaaef0193dba9fa83e679c0c5f5fbd018bc \
+    --hash=sha256:0b3dfe500de26c52abe0477dde16192ac39c98f05bf2d80e76102d394bd13854 \
+    --hash=sha256:0e4216e64d203e39c62df627aa882f02a2438d18a5f21d7f721621f7a5d3611d \
+    --hash=sha256:121ceb0e822f79163dd4699e4c54f5ad38b157084d97b34de8b232bcaad70278 \
+    --hash=sha256:159cac0a3d096f79ab6a44d77a961917219707e2a130739c64d4dd46281f5c2a \
+    --hash=sha256:15aae984e46de8d376df515f00450d1522077254ef6b7ce189b38ecee7c9677c \
+    --hash=sha256:15cc53a3179ba0fcefe1e3ae50beb2784dede4003ad2dfd24f81bba4b23a454f \
+    --hash=sha256:161c27ccce13b6b0c8689418da3885d3220ed2eae2ea5e9b2f7f3d48f1d52c27 \
+    --hash=sha256:19910754e4cc9c63bc1c7f6d73aa1cfee82f42007e407c0f413695c2f7ed777f \
+    --hash=sha256:1ba5e3963344ff25fc8c40da90f44b0afca8cfd89d12964feb79ac1411a260ac \
+    --hash=sha256:1c00666a3bd2f84920a4e94434f5974d7bbc57e461318d6bb34ce9cdbbc1f6b2 \
+    --hash=sha256:1c39b07d90be6b48968ddc8c19e7585052088fd7ec8d568bb31ff64c70ae3c97 \
+    --hash=sha256:206b5cf6f0c513baffaeae7bd817717140770c74528f3e4c3e1cec7871ddd61a \
+    --hash=sha256:258c57abf1188926c774a4c94dd29237e77eda19462e5bb901d88adcab6af919 \
+    --hash=sha256:2cdf7d86886bc6982354862204ae3b2f7f96f21a3eb0ba5ca0ac42c7b38598b9 \
+    --hash=sha256:2d4567c850905d5eaaed2f7a404e61012a51caf288292e016360aa2b96ff38d4 \
+    --hash=sha256:35c14ac45fcfdf7167ca76cc80b2001205a8d5d16d80524e13508371fb8cdd9c \
+    --hash=sha256:38de0a70160dd97540335b7ad3a74571b24f1dc3ed33f815f0880682e6880131 \
+    --hash=sha256:3af385b0cee8df3746c3f406f38bcbfdc9041b5c2d5ce3e5fc6637256e60bbc5 \
+    --hash=sha256:3b748c44bb9f53031c8cbc99a8a061bc181c1000c60a30f55393b6e9c45cc5bd \
+    --hash=sha256:3bbd5d8cc692616d5ef6fbbbd50dbec142c7e6ad9beb66b78a96e9c16729b089 \
+    --hash=sha256:3ccaa88b24eebc0f849ce0a4d09e8a408ec5a94afff395eb69baf868f5183107 \
+    --hash=sha256:3fa80ac2bd5856580e242dbc202db873c60a01b20309c8319b5c5986fbe53ce6 \
+    --hash=sha256:4228b5b646caa73f119b1ae756216b59cc6e2267201c27d3912b592c5e323b60 \
+    --hash=sha256:42b0e23f119b2b456d07ca91b307ae167cc3f6c846a7b169fca5326e32fdc6cf \
+    --hash=sha256:45cf8588c066860b623cd11c4ba687f8d7175d5f7ef65f7129df8a394c502de5 \
+    --hash=sha256:45d9c5eb9273aa50999ad6adc6be5e0ecea7e09dbd0d31bd0c65a55a2592ca08 \
+    --hash=sha256:4603137322c18eaf2e06a4495f426aa8d8388940f3c457e7548145011bb68e05 \
+    --hash=sha256:46ccfe3032b3915586e469d4972973f893c0a2bb65669194a5bdea9bacc088c2 \
+    --hash=sha256:4fefee876e07a6e9aad7a8c8c9f85b0cdbe7df52b8a9552307b09050f7512c7e \
+    --hash=sha256:5556470f1a2157031e676f776c2bc20acd34c1990ca5f7e56f1ebf938b9ab57c \
+    --hash=sha256:57866a76e0b3823e0b56692d1a0bf722bffb324839bb5b7226a7dbd6c9a40b17 \
+    --hash=sha256:5897bec80a09b4084aee23f9b73a9477a46c3304ad1d2d07acca19723fb1de62 \
+    --hash=sha256:58ca98a950171f3151c603aeea9303ef6c235f692fe555e883591103da709b23 \
+    --hash=sha256:5ca038c7f6a0afd0b2448941b6ef9d5e1949e999f9e5517692eb6da58e9d44be \
+    --hash=sha256:5f6c8a66741c5f5447e047ab0ba7a1c61d1e95580d64bce852e3df1f895c4067 \
+    --hash=sha256:5f8c4718cd44ec1580e180cb739713ecda2bdee1341084c1467802a417fe0f02 \
+    --hash=sha256:5fde892e6c697ce3e30c61b239330fc5d569a71fefd4eb6512fc6caec9dd9e2f \
+    --hash=sha256:62a763352879b84aa31058fc931884055fd75089cccbd9d58bb6afd01141b235 \
+    --hash=sha256:62ba45e21cf6571d7f716d903b5b7b6d2617e2d5d67c0923dc47b9d41369f840 \
+    --hash=sha256:64c65f40b4cd8b0e049a8edde07e38b476da7e3aaebe63287c899d2cff253fa5 \
+    --hash=sha256:655d7dd86f26cb15ce8a431036f66ce0318648f8853d709b4167786ec2fa4807 \
+    --hash=sha256:66ff044fd0bb1768688aecbe28b6190f6e799349221fb0de0e6f4048eca14c16 \
+    --hash=sha256:672ebbe820bb37988c4d136eca2652ee114992d5d41c7e4858cdd90ea94ffe5c \
+    --hash=sha256:6b9af86e1d8e4cfc82c2022bfaa6f459381a50b94a29e95dcdda8442d6d83864 \
+    --hash=sha256:6e0bd57539da59a3e4671b90a502da9a28c72322a4f17866ba3ac63a82c4498e \
+    --hash=sha256:71a5e35c75c021aaf400ac048dacc855f000bdfed91614b4a726f7432f1f3d6a \
+    --hash=sha256:7597c07fbd11515f654d6ece3d0e4e5093edc30a436c63142d9a4b8e22f19c35 \
+    --hash=sha256:764be71193f87d460a03f1f7385a82e226639732214b402f9aa61f0d025f0737 \
+    --hash=sha256:7699b1df36a48169cdebda7ab5a2bac265204003f153b4bd17276153d997670a \
+    --hash=sha256:7ccebf51efc61634f6c2344da73e366c75e735960b5654b63d7e6f69a5885fa3 \
+    --hash=sha256:7f7059ca8d64fea7f238994c97d91f75965216bcbe5f695bb44f354893f11d52 \
+    --hash=sha256:8065914ff79f7eab1599bd80406681f0ad08f8e47c880f17b416c9f8f7a26d05 \
+    --hash=sha256:816f5aa087094099fff7edabb5e01cc370eb21aa1a1d44fe2d2aefdfb5599b31 \
+    --hash=sha256:81f2ec23ddc1b476ff96563f2e8d723830b06dceae348ce02914a37cb4e74b89 \
+    --hash=sha256:84286494f6c5d05243456e04223d5a9417d7f443c3b76065e75001beb26f88de \
+    --hash=sha256:8bf7b66ce12a2ac52d16f776b31d16d91033150266eb796967a7e4621707e4f6 \
+    --hash=sha256:8f1edcea27918d748c7e5e4d917297b2a0ab80cad10f86631e488b7cddf76a36 \
+    --hash=sha256:981fb88516bd1ae8b0cbbd2034678a39dedc98752f264ac9bc5839d3923fa04c \
+    --hash=sha256:98476c98b02c8e9b2eec76ac4156fd006628b1b2d0ef27e548ffa978393fd154 \
+    --hash=sha256:992cea5f4f3b29d6b4f7f1726ed8ee46c8331c6b4eed6db5b40134c6fe1768bb \
+    --hash=sha256:9a3b0793b1bbfd4146304e23d90045f2a9b5fd5823aa682665fbdaf2a6c28f3e \
+    --hash=sha256:9a42d6a8156ff78981f8aa56eb6394114e0dedb217cf8b729f438f643608cbcd \
+    --hash=sha256:9c10c309e18e443ddb108f0ef64e8729363adbfd92d6d57beec680f6261556f3 \
+    --hash=sha256:9cbd94fc661d2bab2bc702cddd2d3370bbdcc4cd0f8f57488a81bcce90c7a54f \
+    --hash=sha256:9fdcf339322a3fae5cbd504edcefddd5a50d9ee00d968696846f089b4432cf78 \
+    --hash=sha256:a0697803ed7d4af5e4c1adf1670af078f8fcab7a86350e969f454daf598c4960 \
+    --hash=sha256:a28af0695a45f7060e6f9b7092558a928a28553366519f64083c63a44f70e618 \
+    --hash=sha256:a2e02889071850bbfd36b56fd6bc98945e23670773bc7a76657e90e6b6603c08 \
+    --hash=sha256:a33cd6ad9017bbeaa9ed78a2e0752c5e250eafb9534f308e7a5f7849b0b1bfb4 \
+    --hash=sha256:a3cb37038123447cf0f3ea4c74751f6a9d7afef0eb71aa07bf5f652b5e6a132c \
+    --hash=sha256:a57847b090d7892f123726202b7daa20df6694cbd583b67a592e856bff603d6c \
+    --hash=sha256:a5a8e19d7c707c4cadb8c18f5f60c843052ae83c20fa7d44f41594c644a1d330 \
+    --hash=sha256:ac3b20653bdbe160febbea8aa6c079d3df19310d50ac314911ed8cc4eb7f8cb8 \
+    --hash=sha256:ac6c2c45c847bbf8f91930d88716a0fb924b51e0c6dad329b793d670ec5db792 \
+    --hash=sha256:acc07b2cfc5b835444b44a9956846b578d27beeacd4b52e45489e93276241025 \
+    --hash=sha256:aee66be87825cdf72ac64cb03ad4c15ffef4143dbf5c113f64a5ff4f81477bf9 \
+    --hash=sha256:af52d26579b308921b73b956153066481f064875140ccd1dfd4e77db89dbb12f \
+    --hash=sha256:b94d4ba43739bbe8b0ce4262bcc3b7b9f31459ad120fb595627eaeb7f9b9ca01 \
+    --hash=sha256:ba630d5e3db74c79300d9a5bdaaf6200172b107f263c98a0539eeecb857b2337 \
+    --hash=sha256:bed0f8a0eeea9fb72937ba118f9db0cb7e90773462af7962d382445f3005e5a4 \
+    --hash=sha256:bf99c8404f008750c846cb4ac4667b798a9f7de673ff719d705d9b2d6de49c5f \
+    --hash=sha256:c3027001c28434e7ca5a6e1e527487051136aa81803ac812be51802150d880dd \
+    --hash=sha256:c65af9088ac534313e1963443d0ec360bb2b9cba6c2909478d22c2e363d98a51 \
+    --hash=sha256:d0165ab2914379bd56908c02294ed8405c252250668ebcb438a55494c69f44ab \
+    --hash=sha256:d1b26e1dff225c31897696cab7d4f0a315d4c0d9e8666dbffdb28216f3b17fdc \
+    --hash=sha256:d950caa237bb1954f1b8c9227b5065ba6875ac9771bb8ec790d956a699b78676 \
+    --hash=sha256:dc61505e73298a84a2f317255fcc72b710b72980f3a1f670447a21efc88f8381 \
+    --hash=sha256:e173486019cc283dc9778315fa29a363579372fe67045e971e89b6365cc035ed \
+    --hash=sha256:e1f735dc43da318cad19b4173dd1ffce1d84aafd6c9b782b3abc04a0d5a6f5bb \
+    --hash=sha256:e9386266798d64eeb19dd3677051f5705bf873e98e15897ddb7d76f477131967 \
+    --hash=sha256:f216dbce0e60e4d03e0c4353c7023b202d95cbaeff12e5fd2e82ea0a66905073 \
+    --hash=sha256:f4e5658dbffe8843a0f12366a4c2d1c316dbe09bb4dfbdc9d2d9cd6031de8aae \
+    --hash=sha256:f5a823165e6d04ccea61a9f0576f345f8ce40ed533013580e087bd4d7442b52c \
+    --hash=sha256:f69ed81ab24d5a3bd93861c8c4436f54afdf8e8cc421562b0c7504cf3be58206 \
+    --hash=sha256:f82d068a2d6ecfc6e054726080af69a6764a10015467d7d7b9f66d6ed5afa23b
+    # via pydantic
+pydantic-settings==2.6.1 \
+    --hash=sha256:7fb0637c786a558d3103436278a7c4f1cfd29ba8973238a50c5bb9a55387da87 \
+    --hash=sha256:e0f92546d8a9923cb8941689abf85d6601a8c19a23e97a34b2964a2e3f813ca0
+    # via -r requirements-updater.txt
+python-dotenv==1.0.1 \
+    --hash=sha256:e324ee90a023d808f1959c46bcbc04446a10ced277783dc6ee09987c37ec10ca \
+    --hash=sha256:f7b63ef50f1b690dddf550d03497b66d609393b40b564ed0d674909a68ebf16a
+    # via
+    #   -r requirements-updater.txt
+    #   pydantic-settings
+typing-extensions==4.16.0 \
+    --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8 \
+    --hash=sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5
+    # via
+    #   anyio
+    #   pydantic
+    #   pydantic-core

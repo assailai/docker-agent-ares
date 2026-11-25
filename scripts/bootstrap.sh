@@ -32,11 +32,21 @@ set -euo pipefail
 # Fully qualified (docker.io/...): RHEL's Podman enforces short-name resolution, so a bare
 # assailai/ares-agent stops at an interactive "which registry?" prompt, and with no terminal to
 # answer it (Ansible, cloud-init, ssh with a command) the install simply fails. ARES-1725.
-IMAGE="${ARES_IMAGE:-docker.io/assailai/ares-agent:${ARES_VERSION:-3.15.0}}"
+IMAGE="${ARES_IMAGE:-docker.io/assailai/ares-agent:${ARES_VERSION:-3.15.1}}"
 # The companion updater keeps the agent on the release the dashboard marks current; it is the only
 # component that touches the Docker socket (the agent stays unprivileged). Set ARES_DISABLE_AUTOUPDATE
 # to opt out (change-control-sensitive hosts). Override the image with ARES_UPDATER_IMAGE=<full ref>.
-UPDATER_IMAGE="${ARES_UPDATER_IMAGE:-docker.io/assailai/ares-updater:${ARES_VERSION:-3.15.0}}"
+UPDATER_IMAGE="${ARES_UPDATER_IMAGE:-docker.io/assailai/ares-updater:${ARES_VERSION:-3.15.1}}"
+# cosign, to check both images before either one runs. By DIGEST, and from Sigstore rather than
+# from our own updater image: a substituted ares-updater must not be the thing that vouches for
+# itself. v3.1.4, the version Dockerfile.updater builds from source; the same digest is served from
+# gcr.io/projectsigstore/cosign. ARES_COSIGN_IMAGE points this at an internal mirror - it changes
+# WHICH cosign runs, never WHETHER one does.
+COSIGN_IMAGE="${ARES_COSIGN_IMAGE:-ghcr.io/sigstore/cosign/cosign@sha256:0f06154836d2de34f887a5c273506d52ca43edaa1d9e53e6510fa78a48f69c2d}"
+# Must stay identical to UpdaterSettings.cosign_identity / cosign_issuer; tests/test_bootstrap.py
+# fails if they drift. refs/heads/main only: a tag ref is not protected (ARES-2327).
+COSIGN_IDENTITY='^https://github\.com/assailai/docker-agent-ares/\.github/workflows/docker-build\.yml@refs/heads/main$'
+COSIGN_ISSUER="https://token.actions.githubusercontent.com"
 CONTAINER_NAME="ares-agent"
 UPDATER_CONTAINER_NAME="ares-updater"
 VOLUME_NAME="ares-agent-data"
@@ -271,6 +281,112 @@ host_ca_dir() {
     done
 }
 
+# The repository half of an image reference, i.e. everything but the :tag or @digest. A tag only
+# counts as one when what follows the last colon has no slash in it, or a registry:port would eat
+# the hostname. Both can be present at once - "repo:tag@sha256:..." is legal, and is what
+# verify-images.sh writes into a Kubernetes manifest - so take the digest off first and the tag
+# second. Stopping at the digest, as this did until ARES-2351, left the tag glued to the
+# repository and verify_image then looked for a RepoDigest that can never exist.
+repo_of() {
+    local ref="${1%%@*}"
+    case "$ref" in
+        *:*) ;;
+        *)   printf '%s' "$ref"; return ;;
+    esac
+    # a trailing :tag has no slash in it; "localhost:5000/foo/bar" does, and is all repository.
+    case "${ref##*:}" in
+        */*) printf '%s' "$ref" ;;
+        *)   printf '%s' "${ref%:*}" ;;
+    esac
+}
+
+# cosign has to reach the registry, Fulcio and Rekor, and on a TLS-inspecting network that means
+# the host's CAs. Go reads SSL_CERT_FILE and SSL_CERT_DIR; naming the file alone would REPLACE the
+# image's public roots and break the Sigstore endpoints, so always keep /etc/ssl/certs alongside.
+# Only the TLS extract on a RHEL layout, matching what the agent and updater load (ARES-2327).
+cosign_ca_args() {
+    local ca_dir="$1"
+    [ -n "$ca_dir" ] || return 0
+    printf '%s\n' "-v" "$ca_dir:/host-ca:ro"
+    if [ -r "$ca_dir/tls-ca-bundle.pem" ]; then
+        printf '%s\n' "-e" "SSL_CERT_FILE=/host-ca/tls-ca-bundle.pem" "-e" "SSL_CERT_DIR=/etc/ssl/certs"
+    else
+        printf '%s\n' "-e" "SSL_CERT_DIR=/host-ca:/etc/ssl/certs"
+    fi
+}
+
+# Pull an image, check the publisher signed the exact bytes we got, and print the digest reference
+# to run instead of the tag. Returns non-zero when anything about that fails.
+#
+# Why this exists: the installer used to hand the updater the engine socket on the strength of a
+# mutable registry tag. Whoever could write to the Docker Hub repositories - the CI's long-lived
+# token, say - could repoint it and be root on the next host that installs or reinstalls, and the
+# substituted updater then decides every later verification. It cannot forge a cosign signature,
+# so this is the check it could not pass.
+verify_image() {
+    local ref="$1" repo digest ca_dir
+    repo="$(repo_of "$ref")"
+    if ! "$RUNTIME" pull "$ref" >/dev/null 2>&1; then
+        error "Could not pull $ref"
+        return 1
+    fi
+    # The digest the engine actually has, so the signature is checked against the bytes that will
+    # run rather than against whatever the tag points at by the time we ask again. Docker strips
+    # docker.io/ from RepoDigests while Podman keeps it, so match on the repository path and
+    # rebuild the reference from $repo: the fully qualified form is what Podman's short-name
+    # policy needs (ARES-1725).
+    local short="${repo#docker.io/}" sha
+    sha="$("$RUNTIME" image inspect "$ref" --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
+        | grep -E "^(${repo}|${short})@sha256:" | head -1)"
+    sha="${sha##*@}"
+    if [ -z "$sha" ]; then
+        error "Could not resolve a digest for $ref"
+        return 1
+    fi
+    digest="${repo}@${sha}"
+    ca_dir="$(host_ca_dir)"
+    local cosign_args=(run --rm)
+    if [ -n "$ca_dir" ]; then
+        local arg
+        while IFS= read -r arg; do cosign_args+=("$arg"); done < <(cosign_ca_args "$ca_dir")
+    fi
+    cosign_args+=("$COSIGN_IMAGE" verify "$digest"
+        --certificate-identity-regexp "$COSIGN_IDENTITY"
+        --certificate-oidc-issuer "$COSIGN_ISSUER")
+    if ! "$RUNTIME" "${cosign_args[@]}" >/dev/null 2>&1; then
+        return 1
+    fi
+    printf '%s' "$digest"
+}
+
+# Both images, before either one is started. Fail-closed: an unverified updater would be root on
+# this host with the engine socket, so there is no proceed-anyway flag.
+verify_images() {
+    step "Verifying the published images"
+    local which
+    for which in IMAGE UPDATER_IMAGE; do
+        local ref="${!which}" verified
+        if [ "$which" = "UPDATER_IMAGE" ] && [ -n "${ARES_DISABLE_AUTOUPDATE:-}" ]; then
+            continue
+        fi
+        if ! verified="$(verify_image "$ref")"; then
+            error "Could not verify $ref against the Ares publisher."
+            error "Nothing has been started. This means one of:"
+            error "  * the image is not the one Assail published (report it: security@assailai.com)"
+            error "  * this host cannot reach the registry, Fulcio or Rekor (a proxy, or air-gapped)"
+            error "  * cosign could not be pulled: $COSIGN_IMAGE"
+            error "Reproduce it with: $RUNTIME run --rm $COSIGN_IMAGE verify $ref \\"
+            error "  --certificate-identity-regexp '$COSIGN_IDENTITY' \\"
+            error "  --certificate-oidc-issuer $COSIGN_ISSUER"
+            error "Mirroring cosign internally? Point ARES_COSIGN_IMAGE at it (by digest)."
+            exit 1
+        fi
+        # run the digest, not the tag: repointing it after this check cannot change what starts.
+        printf -v "$which" '%s' "$verified"
+        info "Verified ${ref}"
+    done
+}
+
 start_container() {
     step "Starting the agent"
     replace_existing "$CONTAINER_NAME"
@@ -323,6 +439,8 @@ start_container() {
     # comes back after logout and reboot.
     run_args+=(-v "${VOLUME_NAME}:/data" --restart=always)
 
+    # $IMAGE is the verified digest by now (verify_images rewrote it), so what starts here is the
+    # exact artifact the publisher signed.
     if ! "$RUNTIME" run "${run_args[@]}" "$IMAGE" >/dev/null; then
         error "Failed to start the container. Try: $RUNTIME pull $IMAGE"
         exit 1
@@ -360,6 +478,11 @@ start_updater() {
     ca_dir="$(host_ca_dir)"
     if [ -n "$ca_dir" ]; then
         updater_args+=(-v "$ca_dir:/host-ca:ro")
+    fi
+    # A deliberate, operator-driven rollback. The updater otherwise refuses to move the agent to
+    # a release older than its own, because a signed-but-old image is still a downgrade attack.
+    if [ -n "${ARES_UPDATE_ALLOW_DOWNGRADE:-}" ]; then
+        updater_args+=(-e "ARES_UPDATE_ALLOW_DOWNGRADE=$ARES_UPDATE_ALLOW_DOWNGRADE")
     fi
     updater_args+=(--restart=always)
 
@@ -478,6 +601,11 @@ main() {
     resolve_token "$@"
     setup_persistence
     setup_rootful_podman
+    # before reset_state, which destroys this host's agent identity, and well before start_updater
+    # hands anything the engine socket. Verification can now fail on a host that cannot reach
+    # ghcr.io, Fulcio or Rekor, and failing *after* ARES_RESET=1 had already deleted the volume
+    # would leave the host with no agent and no identity to go back to.
+    verify_images
     reset_state
     start_container
     start_updater
