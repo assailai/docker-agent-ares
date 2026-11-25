@@ -1,0 +1,7 @@
+running
+===LISTALL===
+public (active)
+  target: ACCEPT
+  icmp-block-inversion: no
+  interfaces: eth0
+  services: ssh dhcpv6-client

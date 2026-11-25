@@ -1546,6 +1546,8 @@ _HOST_SOURCE_COLLECTOR_NAMES = {
     linux_host.SOURCE_SYSCTL: "collect_sysctl_config",
     linux_host.SOURCE_PASSWD: "collect_passwd_database",
     linux_host.SOURCE_PKG: "collect_pkg_config",
+    linux_host.SOURCE_FIREWALL: "collect_firewall_state",
+    linux_host.SOURCE_PKG_AUTO: "collect_pkg_auto_config",
 }
 
 

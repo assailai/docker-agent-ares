@@ -1,0 +1,3 @@
+bash: firewall-cmd: command not found
+===LISTALL===
+bash: firewall-cmd: command not found

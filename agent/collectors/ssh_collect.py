@@ -33,6 +33,11 @@ _PASSWD_COMMAND = "getent passwd"
 # The dnf package-manager configuration (rpm/dnf hosts). Read-only file read; a non-dnf host has no
 # such file and the read simply fails, recorded as honest UNAVAILABLE coverage.
 _PKG_CONFIG_COMMAND = "cat /etc/dnf/dnf.conf"
+# The running host firewall posture (firewalld). Read-only queries; a host without firewalld prints a
+# shell error, which the parser reads as abstain (its absence is not a weakness on an SG-fronted host).
+_FIREWALL_STATE_COMMAND = "firewall-cmd --state 2>&1; echo '===LISTALL==='; firewall-cmd --list-all 2>&1"
+# The dnf-automatic updater configuration (rpm/dnf hosts). Read-only file read; an absent file abstains.
+_PKG_AUTO_COMMAND = "cat /etc/dnf/automatic.conf"
 
 
 async def _run_show(
@@ -161,4 +166,38 @@ async def collect_pkg_config(
     fails, which the caller records as honest UNAVAILABLE coverage rather than a guessed fact."""
     return await _run_show(
         host, credential, _PKG_CONFIG_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
+    )
+
+
+async def collect_firewall_state(
+    host: str,
+    credential: Credential,
+    *,
+    port: int = 22,
+    timeout: float = 20.0,
+    max_bytes: int = 500_000,
+) -> str:
+    """The Linux host's running firewalld posture (``firewall-cmd --state`` + ``--list-all``),
+    truncated. Read-only queries: they report state and change nothing. Used for the host tier
+    (``server.firewall.*``); a host without firewalld prints a shell error, which the parser abstains
+    on (absence is not a weakness on an SG-fronted host) rather than reading as a disabled firewall."""
+    return await _run_show(
+        host, credential, _FIREWALL_STATE_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
+    )
+
+
+async def collect_pkg_auto_config(
+    host: str,
+    credential: Credential,
+    *,
+    port: int = 22,
+    timeout: float = 20.0,
+    max_bytes: int = 500_000,
+) -> str:
+    """The Linux host's dnf-automatic updater configuration (``/etc/dnf/automatic.conf``), truncated.
+    Read-only file read. Used for the host tier (``server.pkg.auto_updates``); an absent file (the
+    updater is not installed) fails the read, which the parser abstains on rather than reading as
+    unpatched."""
+    return await _run_show(
+        host, credential, _PKG_AUTO_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
     )

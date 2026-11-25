@@ -1,0 +1,6 @@
+[commands]
+upgrade_type = security
+apply_updates = no
+
+[emitters]
+emit_via = stdio

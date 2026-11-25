@@ -162,6 +162,43 @@ def test_text_that_is_not_a_dnf_conf_abstains() -> None:
     assert linux_host.parse_gpg_check_disabled(missing) is None
 
 
+# ── firewalld (server.firewall.permissive) ────────────────────────────────────────────────────────
+def test_running_firewall_with_accept_default_is_flagged() -> None:
+    permissive = (_FIX / "firewall_permissive.txt").read_text()
+    assert linux_host.parse_firewall_permissive(permissive) is True
+
+
+def test_running_firewall_with_restrictive_default_passes() -> None:
+    hardened = (_FIX / "firewall_hardened.txt").read_text()
+    assert linux_host.parse_firewall_permissive(hardened) is False
+
+
+def test_absent_firewalld_abstains_never_false_positives() -> None:
+    # No firewalld (an SG-fronted cloud host): its absence is NOT a weakness we can assert, so abstain
+    # rather than read "no host firewall" as disabled. This is the integrity property for cloud hosts.
+    absent = (_FIX / "firewall_absent.txt").read_text()
+    assert linux_host.parse_firewall_permissive(absent) is None
+    assert linux_host.parse_firewall_permissive("not running\n") is None
+
+
+# ── dnf-automatic (server.pkg.auto_updates) ───────────────────────────────────────────────────────
+def test_automatic_updates_configured_off_is_flagged() -> None:
+    disabled = (_FIX / "automatic_disabled.txt").read_text()
+    assert linux_host.parse_auto_updates_disabled(disabled) is True
+
+
+def test_automatic_updates_configured_on_passes() -> None:
+    enabled = (_FIX / "automatic_enabled.txt").read_text()
+    assert linux_host.parse_auto_updates_disabled(enabled) is False
+
+
+def test_absent_dnf_automatic_abstains_never_false_positives() -> None:
+    # dnf-automatic not installed: a host may patch via SSM Patch Manager or config management, so
+    # absence abstains rather than reading as unpatched.
+    missing = "cat: /etc/dnf/automatic.conf: No such file or directory\n"
+    assert linux_host.parse_auto_updates_disabled(missing) is None
+
+
 def test_a_missing_sysctl_key_abstains() -> None:
     # A real sysctl dump (ostype marker present) that omits a key abstains on that control.
     dump = "kernel.ostype = Linux\nnet.ipv4.ip_forward = 0\n"
@@ -213,6 +250,8 @@ def test_source_routing_maps_each_control_to_one_source() -> None:
     assert linux_host.source_for("server.sysctl.send_redirects") == linux_host.SOURCE_SYSCTL
     assert linux_host.source_for("server.account.extra_root") == linux_host.SOURCE_PASSWD
     assert linux_host.source_for("server.pkg.gpg_check") == linux_host.SOURCE_PKG
+    assert linux_host.source_for("server.firewall.permissive") == linux_host.SOURCE_FIREWALL
+    assert linux_host.source_for("server.pkg.auto_updates") == linux_host.SOURCE_PKG_AUTO
     assert linux_host.source_for("net.management.telnet") is None
 
 

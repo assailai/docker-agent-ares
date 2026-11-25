@@ -30,6 +30,8 @@ SOURCE_SSHD = "sshd"
 SOURCE_SYSCTL = "sysctl"
 SOURCE_PASSWD = "passwd"
 SOURCE_PKG = "pkg"
+SOURCE_FIREWALL = "firewall"
+SOURCE_PKG_AUTO = "pkg_auto"
 
 
 # ── sshd -T (effective SSH daemon configuration) ──────────────────────────────────────────────────
@@ -317,6 +319,63 @@ def parse_gpg_check_disabled(pkg_output: str) -> bool | None:
     return None if value is None else value.strip().lower() in _PKG_FALSEY
 
 
+# ── firewall-cmd --state / --list-all (the running host firewall posture) ──────────────────────────
+# The weakness this reads is an AFFIRMATIVE one: firewalld is RUNNING and its default zone accepts
+# everything (`target: ACCEPT`), a permissive host firewall. It deliberately does NOT read "firewalld
+# is absent / not running" as a weakness: on a cloud host the inbound filter is the security group,
+# not a host firewall, so "no host firewall" is unknowable here, not a finding. Absence therefore
+# ABSTAINS (returns None -> NOT_ASSESSED), which is why this never false-positives on an SG-fronted
+# host. Live FIRING validation needs a host that actually runs firewalld; the abstain path is
+# validated against the real (firewalld-absent) lab capture.
+def parse_firewall_permissive(firewall_output: str) -> bool | None:
+    """Whether a RUNNING host firewall accepts all traffic by default (firewalld ``target: ACCEPT``),
+    or ``None`` to abstain when firewalld is not running/installed (its absence is not a weakness we
+    can assert on an SG-fronted host). Reads firewalld only; a host using nftables/ufw directly
+    abstains here, a documented limitation."""
+    lines = [line.strip() for line in firewall_output.splitlines()]
+    # `firewall-cmd --state` prints exactly "running" or "not running"; a missing binary prints a
+    # shell error. Only a bare "running" line means the daemon is up.
+    if not any(line.lower() == "running" for line in lines):
+        return None
+    for line in lines:
+        low = line.lower()
+        if low.startswith("target:"):
+            return low.split(":", 1)[1].strip() == "accept"
+    return None
+
+
+# ── /etc/dnf/automatic.conf (the dnf-automatic updater configuration) ──────────────────────────────
+# Reads an AFFIRMATIVE weakness: dnf-automatic is CONFIGURED and set not to apply updates
+# (`apply_updates = no`). It does NOT read "dnf-automatic is absent" as a weakness: a host may patch
+# through another mechanism (AWS SSM Patch Manager, a config-management tool), so absence is
+# unknowable here and ABSTAINS (None -> NOT_ASSESSED), never a false "unpatched". rpm/dnf hosts only.
+def _automatic_conf_values(pkg_auto_output: str) -> dict[str, str]:
+    """``/etc/dnf/automatic.conf`` as a ``{key: value}`` map; empty when the text is not an
+    automatic.conf (no recognized key), which makes the control abstain."""
+    values: dict[str, str] = {}
+    for raw in pkg_auto_output.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";", "[")):
+            continue
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip().lower()
+        if key:
+            values[key] = value.strip()
+    if not any(k in values for k in ("apply_updates", "upgrade_type", "download_updates")):
+        return {}
+    return values
+
+
+def parse_auto_updates_disabled(pkg_auto_output: str) -> bool | None:
+    """Whether dnf-automatic is present but configured NOT to apply updates (``apply_updates = no``),
+    or ``None`` to abstain when the directive/file is absent. The weakness is the affirmative
+    configured-off state, so a host with no dnf-automatic abstains rather than reading as unpatched."""
+    value = _automatic_conf_values(pkg_auto_output).get("apply_updates")
+    return None if value is None else value.strip().lower() in _PKG_FALSEY
+
+
 # One entry per (control_id, field): the evidence source it reads and the extractor. A control whose
 # extractor abstains (returns None) is omitted from the collected fields, so the control plane
 # evaluates it NOT_ASSESSED rather than on a guess.
@@ -380,6 +439,14 @@ _FIELD_EXTRACTORS = {
     ("server.pkg.gpg_check", "pkg_gpg_check_disabled"): (
         SOURCE_PKG,
         parse_gpg_check_disabled,
+    ),
+    ("server.firewall.permissive", "firewall_permissive_default"): (
+        SOURCE_FIREWALL,
+        parse_firewall_permissive,
+    ),
+    ("server.pkg.auto_updates", "pkg_auto_updates_disabled"): (
+        SOURCE_PKG_AUTO,
+        parse_auto_updates_disabled,
     ),
 }
 
