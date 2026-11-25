@@ -10,6 +10,7 @@ the cross-repo golden fixture (ARES-2214) guards that the two stay compatible.
 from __future__ import annotations
 
 import base64
+import ipaddress
 
 import pytest
 
@@ -75,6 +76,126 @@ def test_derive_scope_refuses_a_job_missing_binding() -> None:
     del job["snapshot_id"]
     with pytest.raises(ValueError, match="snapshot_id"):
         assessment_discover.derive_scope(job)
+
+
+def test_derive_scope_reads_a_public_host_job() -> None:
+    # The public-host lane carries host NAMES (no CIDRs) and the public-only address policy; the agent
+    # resolves and vets the names at dial time (fold_resolved_hosts), so networks is empty here.
+    scope = assessment_discover.derive_scope(
+        _job(
+            target_cidrs=[],
+            target_hosts=["scanme.example.com"],
+            address_policy="public_only",
+        )
+    )
+    assert scope.target_hosts == ("scanme.example.com",)
+    assert scope.public_only is True
+    assert scope.networks == ()
+
+
+def test_derive_scope_refuses_a_job_with_no_destinations() -> None:
+    with pytest.raises(ValueError, match="no target networks or hosts"):
+        assessment_discover.derive_scope(_job(target_cidrs=[]))
+
+
+def test_derive_scope_defaults_to_the_internal_rule() -> None:
+    # an ordinary CIDR job carries no policy token, which reads as the private-allowed internal lane
+    scope = assessment_discover.derive_scope(_job())
+    assert scope.public_only is False
+    assert scope.target_hosts == ()
+
+
+def test_fold_resolved_hosts_folds_a_global_address_into_the_scope() -> None:
+    scope = assessment_discover.derive_scope(
+        _job(target_cidrs=[], target_hosts=["scanme.example.com"], address_policy="public_only")
+    )
+    folded, coverage = assessment_discover.fold_resolved_hosts(
+        scope, {"scanme.example.com": ["8.8.8.8"]}
+    )
+    assert ipaddress.ip_network("8.8.8.8/32") in folded.networks
+    assert folded.in_scope("8.8.8.8") is True
+    assert coverage == []
+
+
+def test_fold_resolved_hosts_refuses_a_private_resolution() -> None:
+    # a 'public' name that resolves into private space is the MEDIUM-067 shape: not swept, and noted
+    scope = assessment_discover.derive_scope(
+        _job(target_cidrs=[], target_hosts=["sneaky.example.com"], address_policy="public_only")
+    )
+    folded, coverage = assessment_discover.fold_resolved_hosts(
+        scope, {"sneaky.example.com": ["10.1.2.3"]}
+    )
+    assert folded.networks == ()
+    assert folded.in_scope("10.1.2.3") is False
+    assert coverage == [
+        {"scope": "sneaky.example.com", "state": "prohibited", "reason_code": "non_global_address"}
+    ]
+
+
+def test_fold_resolved_hosts_notes_an_unresolved_host() -> None:
+    scope = assessment_discover.derive_scope(
+        _job(target_cidrs=[], target_hosts=["nxdomain.example.com"], address_policy="public_only")
+    )
+    folded, coverage = assessment_discover.fold_resolved_hosts(
+        scope, {"nxdomain.example.com": []}
+    )
+    assert folded.networks == ()
+    assert coverage == [
+        {
+            "scope": "nxdomain.example.com",
+            "state": "unavailable",
+            "reason_code": "resolution_failed",
+        }
+    ]
+
+
+def test_fold_resolved_hosts_keeps_the_global_half_of_a_mixed_resolution() -> None:
+    scope = assessment_discover.derive_scope(
+        _job(target_cidrs=[], target_hosts=["mixed.example.com"], address_policy="public_only")
+    )
+    folded, coverage = assessment_discover.fold_resolved_hosts(
+        scope, {"mixed.example.com": ["8.8.8.8", "192.168.0.9"]}
+    )
+    assert ipaddress.ip_network("8.8.8.8/32") in folded.networks
+    assert ipaddress.ip_network("192.168.0.9/32") not in folded.networks
+    assert {"scope": "mixed.example.com", "state": "prohibited", "reason_code": "non_global_address"} in coverage
+
+
+def test_public_only_in_scope_rejects_a_private_address_even_inside_a_network() -> None:
+    # belt-and-suspenders: even if a non-global /32 reached networks, public_only refuses it at the gate
+    scope = assessment_discover.DiscoverScope(
+        networks=(
+            ipaddress.ip_network("8.8.8.8/32"),
+            ipaddress.ip_network("192.168.0.9/32"),
+        ),
+        excludes=(),
+        ports=(80,),
+        public_only=True,
+    )
+    assert scope.in_scope("8.8.8.8") is True
+    assert scope.in_scope("192.168.0.9") is False
+    # the same networks under the internal rule admit the private address
+    internal = assessment_discover.DiscoverScope(
+        networks=(ipaddress.ip_network("192.168.0.9/32"),), excludes=(), ports=(80,)
+    )
+    assert internal.in_scope("192.168.0.9") is True
+
+
+@pytest.mark.parametrize(
+    "address,routable",
+    [
+        ("8.8.8.8", True),  # a global unicast address
+        ("8.8.8.8", True),
+        ("10.0.0.1", False),  # RFC1918
+        ("192.168.1.1", False),
+        ("127.0.0.1", False),  # loopback
+        ("169.254.169.254", False),  # link-local (the cloud metadata address)
+        ("100.64.0.1", False),  # CGNAT shared address space
+        ("224.0.0.1", False),  # multicast
+    ],
+)
+def test_is_globally_routable(address: str, routable: bool) -> None:
+    assert assessment_discover._is_globally_routable(ipaddress.ip_address(address)) is routable
 
 
 def test_service_observation_rejects_a_bad_outcome() -> None:

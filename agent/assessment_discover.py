@@ -16,7 +16,7 @@ trip (ARES-2214) is the standing guard that these two definitions stay in step.
 from __future__ import annotations
 
 import ipaddress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # The envelope schema and signature domain a discover RESULT is sealed under. These mirror
 # ``results.SCHEMA_DISCOVER_RESULT_V1`` and ``results.SIGN_DOMAIN_DISCOVER_RESULT`` on the control
@@ -28,7 +28,9 @@ RESULT_DOMAIN = "ares.network-assessment.result.discover:v1"
 _MAX_PORT = 65535
 
 # The binding and probe fields a verified job must carry for the agent to act on it. Re-derivation
-# refuses a job missing any of them rather than probing with a defaulted scope.
+# refuses a job missing any of them rather than probing with a defaulted scope. The destination
+# fields (``target_cidrs`` / ``target_hosts``) are NOT here because a job carries one kind or the
+# other; ``derive_scope`` checks that at least one destination is present after parsing.
 _REQUIRED_JOB_FIELDS = (
     "tenant_id",
     "assessment_id",
@@ -37,9 +39,28 @@ _REQUIRED_JOB_FIELDS = (
     "agent_id",
     "job_id",
     "nonce",
-    "target_cidrs",
     "tcp_ports",
 )
+
+# The ``address_policy`` token (mirror of ares.domain.assessment.enums.NetworkAddressPolicy) that
+# holds every resolved destination to globally-routable space. Any other value, or its absence, is
+# the internal rule (private space allowed), so an unrecognised token fails closed to the safer lane.
+_PUBLIC_ONLY_POLICY = "public_only"
+
+
+def _is_globally_routable(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    """Whether ``address`` is a globally-routable unicast address a third party could own.
+
+    The public-host lane's address rule, enforced at the agent. The control plane authorizes the host
+    NAME syntactically; this is the dial-time belt that the address it actually resolved to is genuinely
+    public, so a name that points into private space (the MEDIUM-067 shape) is refused rather than swept
+    as an internal port scan. ``ipaddress.is_global`` already answers False for private, loopback,
+    link-local (incl. the cloud metadata address), unspecified, shared-address-space and reserved
+    ranges; multicast is excluded explicitly because a unicast sweep never has a destination there.
+    """
+    return address.is_global and not address.is_multicast
 
 # NetworkObservationOutcome values (mirror of ares.domain.assessment.enums). A probe outcome outside
 # this set is a bug in the mapping, not something to pass through to the signed result.
@@ -113,17 +134,26 @@ class DiscoverScope:
     # The bounded UDP operations the verified job asked for (e.g. the SNMP default-community probe).
     # A trailing field with a default, so existing constructions and the TCP-only path are unchanged.
     udp_operations: tuple[str, ...] = ()
+    # The host NAMES a public-host job asks the agent to resolve and sweep (empty for the internal
+    # CIDR lane). ``fold_resolved_hosts`` turns the resolved, vetted addresses into ``networks``.
+    target_hosts: tuple[str, ...] = ()
+    # When True (the public-host lane), a destination must be globally routable on TOP of being in a
+    # network. Belt-and-suspenders with the resolution vetting, so a bug or a non-global /32 that ever
+    # reached ``networks`` is still never dialed.
+    public_only: bool = False
 
     def in_scope(self, ip: str) -> bool:
-        """Whether ``ip`` is inside a target network AND outside every exclude. Fails closed on an
-        address that does not parse."""
+        """Whether ``ip`` is inside a target network AND outside every exclude (AND, on the public-host
+        lane, globally routable). Fails closed on an address that does not parse."""
         try:
             address = ipaddress.ip_address(ip)
         except ValueError:
             return False
         if not any(address in network for network in self.networks):
             return False
-        return not any(address in exclude for exclude in self.excludes)
+        if any(address in exclude for exclude in self.excludes):
+            return False
+        return not (self.public_only and not _is_globally_routable(address))
 
 
 def derive_scope(job: dict) -> DiscoverScope:
@@ -139,21 +169,82 @@ def derive_scope(job: dict) -> DiscoverScope:
             f"verified job missing required field(s): {', '.join(missing)}"
         )
     networks = tuple(
-        ipaddress.ip_network(cidr, strict=False) for cidr in job["target_cidrs"]
+        ipaddress.ip_network(cidr, strict=False) for cidr in job.get("target_cidrs", [])
     )
     excludes = tuple(
         ipaddress.ip_network(cidr, strict=False)
         for cidr in job.get("exclude_cidrs", [])
     )
-    if not networks:
-        raise ValueError("verified job has no target networks")
+    target_hosts = tuple(
+        host.strip()
+        for host in job.get("target_hosts", [])
+        if isinstance(host, str) and host.strip()
+    )
+    if not networks and not target_hosts:
+        raise ValueError("verified job has no target networks or hosts")
     ports = tuple(parse_port_spec(job["tcp_ports"]))
     udp_operations = tuple(
         op for op in job.get("udp_operations", []) if isinstance(op, str) and op
     )
+    public_only = job.get("address_policy") == _PUBLIC_ONLY_POLICY
     return DiscoverScope(
-        networks=networks, excludes=excludes, ports=ports, udp_operations=udp_operations
+        networks=networks,
+        excludes=excludes,
+        ports=ports,
+        udp_operations=udp_operations,
+        target_hosts=target_hosts,
+        public_only=public_only,
     )
+
+
+def fold_resolved_hosts(
+    scope: DiscoverScope, resolved: dict[str, list[str]]
+) -> tuple[DiscoverScope, list[dict]]:
+    """Fold a public-host scope's RESOLVED addresses into its networks, returning the new scope and the
+    coverage entries for every host or address that was refused.
+
+    ``resolved`` maps each ``scope.target_hosts`` name to the addresses it answered with (the agent's
+    DNS step produced it; this function is pure so it is unit-testable without a resolver). Each
+    globally-routable address becomes a ``/32`` / ``/128`` network the existing probe path sweeps;
+    a non-global address is dropped with a ``prohibited`` coverage note (``read_host`` on the control
+    plane already refused an obviously-private target, so this catches a name that resolves into
+    private space at dial time), and a name that answered with nothing gets an ``unavailable`` note.
+    Honest coverage: a refused or unresolved host is recorded, never silently swept to an empty result.
+    """
+    if not scope.target_hosts:
+        return scope, []
+    pinned: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    coverage: list[dict] = []
+    for host in scope.target_hosts:
+        addresses = resolved.get(host, [])
+        if not addresses:
+            coverage.append(
+                coverage_entry(scope=host, state="unavailable", reason_code="resolution_failed")
+            )
+            continue
+        host_pinned = 0
+        for raw in addresses:
+            try:
+                address = ipaddress.ip_address(raw)
+            except ValueError:
+                continue
+            if scope.public_only and not _is_globally_routable(address):
+                coverage.append(
+                    coverage_entry(
+                        scope=host, state="prohibited", reason_code="non_global_address"
+                    )
+                )
+                continue
+            pinned.append(ipaddress.ip_network(address))
+            host_pinned += 1
+        if host_pinned == 0 and not any(
+            entry["scope"] == host and entry["state"] == "prohibited" for entry in coverage
+        ):
+            coverage.append(
+                coverage_entry(scope=host, state="unavailable", reason_code="resolution_failed")
+            )
+    folded = replace(scope, networks=(*scope.networks, *pinned))
+    return folded, coverage
 
 
 def service_observation(

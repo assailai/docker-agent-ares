@@ -18,6 +18,7 @@ import logging
 import os
 import resource
 import secrets
+import socket
 import ssl
 import sys
 import time
@@ -1280,6 +1281,25 @@ async def _probe_discover_scope(scope: assessment_discover.DiscoverScope) -> lis
     return observations
 
 
+async def _resolve_hosts(hosts: tuple[str, ...]) -> dict[str, list[str]]:
+    """Resolve each public-host NAME to the addresses it answers with (IPv4 and IPv6), deduped.
+
+    One bounded ``getaddrinfo`` per host. A name that does not resolve maps to an empty list, which
+    ``fold_resolved_hosts`` records as an unavailable-coverage note rather than a silent gap, and an
+    IP literal resolves to itself so the caller never special-cases one. This step only resolves; the
+    public-only vetting of each resolved address is the folder's job (and ``in_scope``'s belt)."""
+    loop = asyncio.get_running_loop()
+    resolved: dict[str, list[str]] = {}
+    for host in hosts:
+        try:
+            infos = await loop.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+        except (OSError, UnicodeError):
+            resolved[host] = []
+            continue
+        resolved[host] = sorted({str(info[4][0]) for info in infos})
+    return resolved
+
+
 async def _run_assessment_discover(state: AgentState, token: str, task: dict) -> None:
     """Run one signed Network Assessment discover job: verify, re-derive scope, probe, sign, submit.
 
@@ -1320,12 +1340,19 @@ async def _run_assessment_discover(state: AgentState, token: str, task: dict) ->
 
     await control_plane.task_started(settings, token, task_id)
     try:
+        # A public-host job carries NAMES; resolving and vetting them is target activity, so it runs
+        # after task_started. The resolved, globally-routable addresses are folded into the scope as
+        # /32|/128 networks the probe path then sweeps; refused or unresolved hosts become coverage.
+        host_coverage: list[dict] = []
+        if scope.target_hosts:
+            resolved = await _resolve_hosts(scope.target_hosts)
+            scope, host_coverage = assessment_discover.fold_resolved_hosts(scope, resolved)
         observations = await _probe_discover_scope(scope)
         if observations is None:
             logger.warning("Paused mid-discover; handing assessment task %s back.", task_id)
             await _hand_back(token, task_id)
             return
-        coverage = [
+        coverage = host_coverage + [
             assessment_discover.coverage_entry(scope=str(network), state="assessed")
             for network in scope.networks
         ]
