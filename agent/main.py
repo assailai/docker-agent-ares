@@ -1147,6 +1147,80 @@ async def _snmp_discover(scope: assessment_discover.DiscoverScope) -> list[dict]
     return observations
 
 
+# Matches ares.domain.assessment.enums.NetworkUdpOperation.FULL_SWEEP byte for byte (the wire
+# contract rides NetworkDiscoverTaskV1.udp_operations as plain text); the cross-repo golden-fixture
+# round trip is the guard. An older agent that lacks this token simply ignores it.
+_UDP_FULL_SWEEP_OP = "udp_full_sweep"
+
+
+async def _udp_port_open(ip: str, port: int, *, timeout: float) -> bool:
+    """Send one empty UDP datagram to ``ip:port`` and return True iff a non-empty reply arrives within
+    ``timeout``. A reply proves a listener (OPEN); silence or an ICMP port-unreachable (surfaced as an
+    empty result by :class:`_SnmpDatagramProtocol`) proves nothing we report, because UDP has no RST
+    and ICMP is rate-limited, so a non-open port stays INDETERMINATE and is never recorded. Read-only:
+    one empty datagram, no payload that could change device state."""
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[bytes] = loop.create_future()
+    try:
+        transport, _ = await loop.create_datagram_endpoint(
+            lambda: _SnmpDatagramProtocol(future), remote_addr=(ip, port)
+        )
+    except OSError:
+        return False
+    try:
+        transport.sendto(b"")
+        data = await asyncio.wait_for(future, timeout=timeout)
+    except (OSError, asyncio.TimeoutError, TimeoutError):
+        return False
+    finally:
+        transport.close()
+    return bool(data)
+
+
+async def _udp_full_sweep_discover(scope: assessment_discover.DiscoverScope) -> list[dict]:
+    """Exhaustive UDP port sweep, when the signed job asked for it (``_UDP_FULL_SWEEP_OP`` in its
+    udp_operations): the "replicate" parity with the retiring SERVICE port-inventory lane (ARES-2249),
+    whose distinctive output was the full UDP inventory. Each in-scope host is probed on every scope
+    port with one empty datagram; a port that REPLIES becomes one OPEN udp observation
+    (``protocol_id = None``, since an empty-probe reply identifies no protocol). A non-responder is
+    left silent, never reported closed, so a UDP no-response stays indeterminate. Bounded by the same
+    host cap and worker pool as the TCP/SNMP paths, so a wide scope never materialises a socket per
+    (host, port) at once."""
+    if _UDP_FULL_SWEEP_OP not in scope.udp_operations:
+        return []
+    hosts = [ip for ip in _scope_udp_hosts(scope, cap=settings.scan_max_hosts) if scope.in_scope(ip)]
+    ports = list(scope.ports)
+    if not hosts or not ports:
+        return []
+
+    queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
+    for ip in hosts:
+        for port in ports:
+            queue.put_nowait((ip, port))
+    observations: list[dict] = []
+
+    async def _worker() -> None:
+        while True:
+            try:
+                ip, port = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if await _udp_port_open(ip, port, timeout=settings.scan_connect_timeout):
+                observations.append(
+                    assessment_discover.service_observation(
+                        address=ip,
+                        port=port,
+                        transport="udp",
+                        outcome="open",
+                        protocol_id=None,
+                    )
+                )
+
+    worker_count = min(max(1, _scan_limits["concurrency"]), queue.qsize())
+    await asyncio.gather(*(_worker() for _ in range(worker_count)))
+    return observations
+
+
 async def _probe_discover_scope(scope: assessment_discover.DiscoverScope) -> list[dict] | None:
     """Probe every in-scope network over the scope's ports, returning OPEN service observations, or
     None if a pause landed first (the caller then hands the task back).
@@ -1199,6 +1273,10 @@ async def _probe_discover_scope(scope: assessment_discover.DiscoverScope) -> lis
     if snmp_hits is None:
         return None
     observations.extend(snmp_hits)
+    udp_sweep = await _unless_paused(asyncio.create_task(_udp_full_sweep_discover(scope)))
+    if udp_sweep is None:
+        return None
+    observations.extend(udp_sweep)
     return observations
 
 
