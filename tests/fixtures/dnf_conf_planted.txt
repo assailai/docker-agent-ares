@@ -1,0 +1,6 @@
+# see `man dnf.conf` for defaults and possible options
+
+[main]
+gpgcheck=0
+installonly_limit=3
+clean_requirements_on_remove=True

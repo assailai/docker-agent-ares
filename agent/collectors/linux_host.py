@@ -29,6 +29,7 @@ from __future__ import annotations
 SOURCE_SSHD = "sshd"
 SOURCE_SYSCTL = "sysctl"
 SOURCE_PASSWD = "passwd"
+SOURCE_PKG = "pkg"
 
 
 # ── sshd -T (effective SSH daemon configuration) ──────────────────────────────────────────────────
@@ -165,14 +166,20 @@ def _sysctl_values(sysctl_output: str) -> dict[str, str]:
     return values
 
 
+def _sysctl_int(sysctl_output: str, key: str) -> int | None:
+    """The integer value of a numeric sysctl, or ``None`` to abstain when the key is absent or
+    non-numeric. Shared by the boolean flags and the threshold reads below."""
+    value = _sysctl_values(sysctl_output).get(key)
+    if value is None or not value.lstrip("-").isdigit():
+        return None
+    return int(value)
+
+
 def _sysctl_flag_enabled(sysctl_output: str, key: str) -> bool | None:
     """Whether a boolean-style sysctl (``0``/``1``) is enabled, or ``None`` to abstain when the key is
     absent or non-numeric. A positive integer reads as enabled."""
-    values = _sysctl_values(sysctl_output)
-    value = values.get(key)
-    if value is None or not value.lstrip("-").isdigit():
-        return None
-    return int(value) != 0
+    value = _sysctl_int(sysctl_output, key)
+    return None if value is None else value != 0
 
 
 def parse_ip_forwarding_enabled(sysctl_output: str) -> bool | None:
@@ -194,6 +201,40 @@ def parse_icmp_redirects_accepted(sysctl_output: str) -> bool | None:
     to abstain. Accepting redirects lets an on-path host rewrite the routing table and is off in a
     hardened baseline."""
     return _sysctl_flag_enabled(sysctl_output, "net.ipv4.conf.all.accept_redirects")
+
+
+def parse_icmp_redirects_v6_accepted(sysctl_output: str) -> bool | None:
+    """Whether IPv6 ICMP redirects are accepted (``net.ipv6.conf.all.accept_redirects = 1``), or
+    ``None`` to abstain. The IPv6 twin of :func:`parse_icmp_redirects_accepted`: accepting a redirect
+    lets an on-path host rewrite the routing table over IPv6, and a hardened baseline turns it off on
+    both stacks. Unambiguous (no host should accept redirects), so this is not applicability-bound."""
+    return _sysctl_flag_enabled(sysctl_output, "net.ipv6.conf.all.accept_redirects")
+
+
+def parse_send_redirects_enabled(sysctl_output: str) -> bool | None:
+    """Whether the host SENDS ICMP redirects (``net.ipv4.conf.all.send_redirects = 1``), or ``None``
+    to abstain. A host that is not an approved router should not emit redirects (they leak topology
+    and can be abused); the control's applicability binds the approved-router question exactly as it
+    does for IPv4 forwarding, and this parser reports only the running state."""
+    return _sysctl_flag_enabled(sysctl_output, "net.ipv4.conf.all.send_redirects")
+
+
+def parse_syncookies_disabled(sysctl_output: str) -> bool | None:
+    """Whether TCP SYN cookies are turned off (``net.ipv4.tcp_syncookies = 0``), or ``None`` to
+    abstain. SYN cookies defend the listen backlog against a SYN flood; disabling them has no
+    legitimate server use, so a zero reads as an unambiguous weakness (the secure default is enabled,
+    hence the inverted sense: the weakness is the OFF state)."""
+    value = _sysctl_int(sysctl_output, "net.ipv4.tcp_syncookies")
+    return None if value is None else value == 0
+
+
+def parse_aslr_disabled(sysctl_output: str) -> bool | None:
+    """Whether address-space layout randomization is weakened (``kernel.randomize_va_space < 2``), or
+    ``None`` to abstain. Full ASLR is ``2``; ``1`` randomizes less and ``0`` disables it, both of which
+    make memory-corruption exploitation materially easier. The secure default is ``2``, so the
+    weakness is any value below it."""
+    value = _sysctl_int(sysctl_output, "kernel.randomize_va_space")
+    return None if value is None else value < 2
 
 
 # ── getent passwd (the account database) ──────────────────────────────────────────────────────────
@@ -234,6 +275,48 @@ def parse_duplicate_uid(passwd_output: str) -> bool | None:
     return len(set(uids)) != len(uids)
 
 
+# ── /etc/dnf/dnf.conf (the rpm/dnf package-manager configuration) ─────────────────────────────────
+# dnf.conf is an INI file; the `[main]` section (or a recognizable dnf key) marks a genuine dnf
+# config, so unrelated bytes abstain rather than read a field out of them. Only rpm/dnf hosts carry
+# it; a Debian/Ubuntu host (apt) or a network device has no such file, so the read fails upstream and
+# the control is recorded UNAVAILABLE, never silently passed.
+_PKG_FALSEY = frozenset({"0", "false", "no", "off"})
+
+
+def _dnf_conf_values(pkg_output: str) -> dict[str, str]:
+    """``/etc/dnf/dnf.conf`` as a ``{key: value}`` map, keys lower-cased, section headers and comments
+    skipped. Returns an empty map when the text is not a dnf config (no ``[main]`` header and no
+    recognized dnf key), which makes every field abstain."""
+    values: dict[str, str] = {}
+    has_main = False
+    for raw in pkg_output.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            has_main = has_main or line.lower() == "[main]"
+            continue
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip().lower()
+        if key:
+            values[key] = value.strip()
+    if not (has_main or any(k in values for k in ("gpgcheck", "installonly_limit"))):
+        return {}
+    return values
+
+
+def parse_gpg_check_disabled(pkg_output: str) -> bool | None:
+    """Whether dnf package-signature verification is turned off (``gpgcheck=0``/``False`` in
+    ``dnf.conf``), or ``None`` to abstain when the directive is absent. gpgcheck off means packages
+    install without verifying their signature, an unambiguous supply-chain weakness independent of the
+    host's patch cadence. Absent means the dnf default (on), which the parser abstains on rather than
+    asserting: the control stays NOT_ASSESSED, never a false pass."""
+    value = _dnf_conf_values(pkg_output).get("gpgcheck")
+    return None if value is None else value.strip().lower() in _PKG_FALSEY
+
+
 # One entry per (control_id, field): the evidence source it reads and the extractor. A control whose
 # extractor abstains (returns None) is omitted from the collected fields, so the control plane
 # evaluates it NOT_ASSESSED rather than on a guess.
@@ -270,6 +353,22 @@ _FIELD_EXTRACTORS = {
         SOURCE_SYSCTL,
         parse_icmp_redirects_accepted,
     ),
+    ("server.sysctl.icmp_redirects_v6", "sysctl_icmp_redirects_v6_accepted"): (
+        SOURCE_SYSCTL,
+        parse_icmp_redirects_v6_accepted,
+    ),
+    ("server.sysctl.send_redirects", "sysctl_send_redirects_enabled"): (
+        SOURCE_SYSCTL,
+        parse_send_redirects_enabled,
+    ),
+    ("server.sysctl.syncookies", "sysctl_syncookies_disabled"): (
+        SOURCE_SYSCTL,
+        parse_syncookies_disabled,
+    ),
+    ("server.sysctl.aslr", "sysctl_aslr_disabled"): (
+        SOURCE_SYSCTL,
+        parse_aslr_disabled,
+    ),
     ("server.account.extra_root", "account_extra_root_present"): (
         SOURCE_PASSWD,
         parse_extra_root_account,
@@ -277,6 +376,10 @@ _FIELD_EXTRACTORS = {
     ("server.account.duplicate_uid", "account_duplicate_uid_present"): (
         SOURCE_PASSWD,
         parse_duplicate_uid,
+    ),
+    ("server.pkg.gpg_check", "pkg_gpg_check_disabled"): (
+        SOURCE_PKG,
+        parse_gpg_check_disabled,
     ),
 }
 

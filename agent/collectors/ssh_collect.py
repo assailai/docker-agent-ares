@@ -30,6 +30,9 @@ _SYSCTL_COMMAND = "sysctl -a"
 # The account database (name:passwd:uid:gid:gecos:home:shell). Read-only enumeration; getent reads
 # the resolved database (files + any directory source) without the shadow hashes.
 _PASSWD_COMMAND = "getent passwd"
+# The dnf package-manager configuration (rpm/dnf hosts). Read-only file read; a non-dnf host has no
+# such file and the read simply fails, recorded as honest UNAVAILABLE coverage.
+_PKG_CONFIG_COMMAND = "cat /etc/dnf/dnf.conf"
 
 
 async def _run_show(
@@ -141,4 +144,21 @@ async def collect_passwd_database(
     UNAVAILABLE coverage."""
     return await _run_show(
         host, credential, _PASSWD_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
+    )
+
+
+async def collect_pkg_config(
+    host: str,
+    credential: Credential,
+    *,
+    port: int = 22,
+    timeout: float = 20.0,
+    max_bytes: int = 500_000,
+) -> str:
+    """The Linux host's dnf package-manager configuration (``/etc/dnf/dnf.conf``), truncated. Read-only
+    file read: it prints config and changes nothing. Used for the host tier (``server.pkg.*``
+    controls); a non-dnf host (Debian/Ubuntu, a network device) has no such file and the read simply
+    fails, which the caller records as honest UNAVAILABLE coverage rather than a guessed fact."""
+    return await _run_show(
+        host, credential, _PKG_CONFIG_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
     )

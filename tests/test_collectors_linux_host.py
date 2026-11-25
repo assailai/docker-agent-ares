@@ -119,6 +119,10 @@ def test_planted_sysctl_reads_every_weak_setting() -> None:
     assert linux_host.parse_ip_forwarding_enabled(cfg) is True
     assert linux_host.parse_source_route_accepted(cfg) is True
     assert linux_host.parse_icmp_redirects_accepted(cfg) is True
+    assert linux_host.parse_icmp_redirects_v6_accepted(cfg) is True
+    assert linux_host.parse_send_redirects_enabled(cfg) is True
+    assert linux_host.parse_syncookies_disabled(cfg) is True
+    assert linux_host.parse_aslr_disabled(cfg) is True
 
 
 def test_clean_sysctl_reads_every_hardened_setting() -> None:
@@ -126,6 +130,36 @@ def test_clean_sysctl_reads_every_hardened_setting() -> None:
     assert linux_host.parse_ip_forwarding_enabled(cfg) is False
     assert linux_host.parse_source_route_accepted(cfg) is False
     assert linux_host.parse_icmp_redirects_accepted(cfg) is False
+    assert linux_host.parse_icmp_redirects_v6_accepted(cfg) is False
+    assert linux_host.parse_send_redirects_enabled(cfg) is False
+    assert linux_host.parse_syncookies_disabled(cfg) is False
+    assert linux_host.parse_aslr_disabled(cfg) is False
+
+
+def test_aslr_partially_randomized_still_reads_as_weak() -> None:
+    # randomize_va_space 1 randomizes less than full (2); the weakness is any value below 2.
+    weak = "kernel.ostype = Linux\nkernel.randomize_va_space = 1\n"
+    full = "kernel.ostype = Linux\nkernel.randomize_va_space = 2\n"
+    assert linux_host.parse_aslr_disabled(weak) is True
+    assert linux_host.parse_aslr_disabled(full) is False
+
+
+# ── /etc/dnf/dnf.conf ─────────────────────────────────────────────────────────────────────────────
+def test_dnf_gpgcheck_off_is_flagged_and_on_passes() -> None:
+    planted = (_FIX / "dnf_conf_planted.txt").read_text()
+    clean = (_FIX / "dnf_conf_clean.txt").read_text()
+    assert linux_host.parse_gpg_check_disabled(planted) is True
+    assert linux_host.parse_gpg_check_disabled(clean) is False
+
+
+def test_dnf_gpgcheck_absent_abstains() -> None:
+    # A real dnf.conf (the [main] header marks it) that omits gpgcheck abstains rather than assume.
+    assert linux_host.parse_gpg_check_disabled("[main]\ninstallonly_limit=3\n") is None
+
+
+def test_text_that_is_not_a_dnf_conf_abstains() -> None:
+    missing = "cat: /etc/dnf/dnf.conf: No such file or directory\n"
+    assert linux_host.parse_gpg_check_disabled(missing) is None
 
 
 def test_a_missing_sysctl_key_abstains() -> None:
@@ -176,15 +210,27 @@ def test_passwd_without_a_root_line_abstains() -> None:
 def test_source_routing_maps_each_control_to_one_source() -> None:
     assert linux_host.source_for("server.ssh.password") == linux_host.SOURCE_SSHD
     assert linux_host.source_for("server.sysctl.ip_forwarding") == linux_host.SOURCE_SYSCTL
+    assert linux_host.source_for("server.sysctl.send_redirects") == linux_host.SOURCE_SYSCTL
     assert linux_host.source_for("server.account.extra_root") == linux_host.SOURCE_PASSWD
+    assert linux_host.source_for("server.pkg.gpg_check") == linux_host.SOURCE_PKG
     assert linux_host.source_for("net.management.telnet") is None
 
 
 def test_sources_for_collects_each_needed_source_once() -> None:
     needed = linux_host.sources_for(
-        ["server.ssh.password", "server.sysctl.ip_forwarding", "server.account.extra_root"]
+        [
+            "server.ssh.password",
+            "server.sysctl.ip_forwarding",
+            "server.account.extra_root",
+            "server.pkg.gpg_check",
+        ]
     )
-    assert needed == {linux_host.SOURCE_SSHD, linux_host.SOURCE_SYSCTL, linux_host.SOURCE_PASSWD}
+    assert needed == {
+        linux_host.SOURCE_SSHD,
+        linux_host.SOURCE_SYSCTL,
+        linux_host.SOURCE_PASSWD,
+        linux_host.SOURCE_PKG,
+    }
     assert linux_host.sources_for(["net.management.telnet"]) == set()
 
 

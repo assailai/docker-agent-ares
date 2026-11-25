@@ -1545,6 +1545,7 @@ _HOST_SOURCE_COLLECTOR_NAMES = {
     linux_host.SOURCE_SSHD: "collect_sshd_effective_config",
     linux_host.SOURCE_SYSCTL: "collect_sysctl_config",
     linux_host.SOURCE_PASSWD: "collect_passwd_database",
+    linux_host.SOURCE_PKG: "collect_pkg_config",
 }
 
 
