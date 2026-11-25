@@ -271,3 +271,69 @@ def test_lldp_detail_parses_data_plane_links_and_reports_mgmt_neighbours() -> No
 def test_lldp_empty_or_unknown_output_is_no_neighbours() -> None:
     assert arista.parse_lldp_neighbours("") == []
     assert arista.parse_lldp_neighbours("% Unknown command: show lldp neighbors") == []
+
+
+# --- net.routing.peer_authentication_missing (BGP session authentication) -------------------------
+
+# A found device: one BGP neighbor has a session password, the other does not. Mirrors the shape the
+# cEOS edge-router renders (EOS rewrites `password 0 <x>` to `password 7 <hash>`, which still matches).
+_BGP_FOUND = (
+    "router bgp 65010\n"
+    "   router-id 10.255.0.1\n"
+    "   neighbor 10.255.0.2 remote-as 65020\n"
+    "   neighbor 10.255.0.2 password 7 /issLx4twq0gLKBoyy3vhEtqxN056ysM\n"
+    "   neighbor 10.255.0.3 remote-as 65030\n"
+)
+
+# A clean device: every configured neighbor names a session key.
+_BGP_CLEAN = (
+    "router bgp 65010\n"
+    "   router-id 10.255.0.1\n"
+    "   neighbor 10.255.0.2 remote-as 65020\n"
+    "   neighbor 10.255.0.2 password 7 /issLx4twq0gLKBoyy3vhEtqxN056ysM\n"
+    "   neighbor 10.255.0.3 remote-as 65030\n"
+    "   neighbor 10.255.0.3 password 7 AnotherHashValueHere000000000000\n"
+)
+
+
+def test_bgp_neighbor_without_a_password_is_found() -> None:
+    assert arista.parse_routing_peer_authentication_missing(_BGP_FOUND) is True
+
+
+def test_bgp_neighbors_all_authenticated_is_clean() -> None:
+    assert arista.parse_routing_peer_authentication_missing(_BGP_CLEAN) is False
+
+
+def test_no_router_bgp_abstains() -> None:
+    # a device that runs no BGP has no adjacency to assess, so the field is NOT_ASSESSED, never clean
+    cfg = "hostname core-switch\nno ip routing\n"
+    assert arista.parse_routing_peer_authentication_missing(cfg) is None
+
+
+def test_bgp_with_no_neighbors_abstains() -> None:
+    cfg = "router bgp 65010\n   router-id 10.255.0.1\n"
+    assert arista.parse_routing_peer_authentication_missing(cfg) is None
+
+
+def test_a_neighbor_inherits_a_peer_group_password() -> None:
+    cfg = (
+        "router bgp 65010\n"
+        "   neighbor PEERS peer group\n"
+        "   neighbor PEERS password 7 GroupHashValue00000000000000000\n"
+        "   neighbor 10.255.0.2 peer group PEERS\n"
+        "   neighbor 10.255.0.2 remote-as 65020\n"
+    )
+    assert arista.parse_routing_peer_authentication_missing(cfg) is False
+
+
+def test_collect_control_fields_abstains_field_less_for_a_no_bgp_device() -> None:
+    # the collector returns a field-less (but gated) result for a supported control the config does
+    # not show, which the control plane evaluates NOT_ASSESSED, never a fabricated clean
+    cfg = "hostname core-switch\nno ip routing\n"
+    out = arista.collect_control_fields(cfg, "net.routing.peer_authentication_missing")
+    assert out == {}
+
+
+def test_collect_control_fields_reads_the_field_on_a_found_device() -> None:
+    out = arista.collect_control_fields(_BGP_FOUND, "net.routing.peer_authentication_missing")
+    assert out == {"routing_peer_authentication_missing": True}

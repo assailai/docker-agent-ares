@@ -243,8 +243,80 @@ def parse_access_port_without_port_security(running_config: str) -> bool:
             return True
     return False
 
+
+# BGP session authentication (RFC 2385 MD5 / TCP-AO). EOS renders a configured BGP adjacency as a
+# `neighbor <peer> remote-as <asn>` line inside the `router bgp` block, and its session key as a
+# `neighbor <peer> password ...` line (direct, or inherited from a peer group the neighbor joins). A
+# neighbor with a remote-as and no password runs an UNAUTHENTICATED BGP session, which a same-segment
+# attacker can hijack or reset. Only BGP is read here (not OSPF/EIGRP), so a device that runs no BGP
+# abstains rather than reading clean.
+_ROUTER_BGP = re.compile(r"^router bgp \d+")
+_BGP_NEIGHBOR_REMOTE_AS = re.compile(r"^neighbor (\S+) remote-as \d+")
+_BGP_NEIGHBOR_PASSWORD = re.compile(r"^neighbor (\S+) password ")
+_BGP_NEIGHBOR_PEER_GROUP = re.compile(r"^neighbor (\S+) peer[- ]group(?: (\S+))?$")
+
+
+def _router_bgp_block(running_config: str) -> list[str] | None:
+    """The stripped, indented lines of the `router bgp` block, or ``None`` when the device runs no
+    BGP. EOS renders the block header flush-left and its members indented."""
+    lines = running_config.splitlines()
+    for index, line in enumerate(lines):
+        if _ROUTER_BGP.match(line.rstrip()):
+            block: list[str] = []
+            for nxt in lines[index + 1 :]:
+                if _indented(nxt):
+                    block.append(nxt.strip())
+                elif nxt.strip() == "":
+                    continue
+                else:
+                    break
+            return block
+    return None
+
+
+def parse_routing_peer_authentication_missing(running_config: str) -> bool | None:
+    """True when a configured BGP adjacency names no session authentication key.
+
+    A `neighbor <peer> remote-as <asn>` with no matching `neighbor <peer> password` line (and no
+    password inherited from a peer group it joins) is an unauthenticated BGP session. Returns False
+    when every configured neighbor is authenticated. ABSTAINS (``None``) when the device runs no BGP,
+    or BGP is configured with no neighbors, so there is no routing adjacency to assess and the control
+    stays NOT_ASSESSED rather than reading clean. Scope: BGP only; OSPF/EIGRP adjacency authentication
+    is not read here, so an OSPF/EIGRP-only device abstains.
+    """
+    block = _router_bgp_block(running_config)
+    if block is None:
+        return None
+    remote_as_peers: list[str] = []
+    passworded: set[str] = set()
+    group_of: dict[str, str] = {}
+    for line in block:
+        remote_as = _BGP_NEIGHBOR_REMOTE_AS.match(line)
+        if remote_as:
+            remote_as_peers.append(remote_as.group(1))
+            continue
+        password = _BGP_NEIGHBOR_PASSWORD.match(line)
+        if password:
+            passworded.add(password.group(1))
+            continue
+        peer_group = _BGP_NEIGHBOR_PEER_GROUP.match(line)
+        if peer_group and peer_group.group(2):
+            group_of[peer_group.group(1)] = peer_group.group(2)
+    if not remote_as_peers:
+        return None  # BGP configured but with no adjacency to assess
+    for peer in remote_as_peers:
+        if peer in passworded:
+            continue
+        group = group_of.get(peer)
+        if group is not None and group in passworded:
+            continue
+        return True  # a neighbor with a remote-as but no direct or inherited password
+    return False
+
+
 # Which control fields this parser can extract, and how. Each returns the field's typed value, or
-# raises to signal the config did not show it (the collector then abstains for that field).
+# ``None`` to abstain when the config does not clearly show it (the collector then leaves that field
+# out and the control stays NOT_ASSESSED).
 _FIELD_EXTRACTORS = {
     ("net.management.telnet", "management_protocols"): parse_management_protocols,
     ("net.snmp.default_community", "default_snmp_community_present"): (
@@ -265,17 +337,33 @@ _FIELD_EXTRACTORS = {
     ("net.l2.port_security_missing", "access_port_without_port_security"): (
         parse_access_port_without_port_security
     ),
+    ("net.routing.peer_authentication_missing", "routing_peer_authentication_missing"): (
+        parse_routing_peer_authentication_missing
+    ),
 }
 
 
 def collect_control_fields(running_config: str, control_id: str) -> dict[str, object] | None:
     """The typed field values this parser can read for ``control_id`` from an EOS config, or ``None``
-    if the parser does not support that control (the collector then records it UNSUPPORTED)."""
+    if the parser does not support that control (the collector then records it UNSUPPORTED).
+
+    A field whose extractor ABSTAINS (returns ``None``) is left out, so a supported control whose
+    evidence the config does not show returns a field-less (but gated) result that evaluates
+    NOT_ASSESSED, never a fabricated clean. A supported control with at least one readable field
+    returns those fields."""
+    supported = [
+        (field, extractor)
+        for (ctrl, field), extractor in _FIELD_EXTRACTORS.items()
+        if ctrl == control_id
+    ]
+    if not supported:
+        return None
     fields: dict[str, object] = {}
-    for (ctrl, field), extractor in _FIELD_EXTRACTORS.items():
-        if ctrl == control_id:
-            fields[field] = extractor(running_config)
-    return fields or None
+    for field, extractor in supported:
+        value = extractor(running_config)
+        if value is not None:
+            fields[field] = value
+    return fields
 
 
 # --- LLDP neighbours (a second show command: `show lldp neighbors detail`) ------------------------
