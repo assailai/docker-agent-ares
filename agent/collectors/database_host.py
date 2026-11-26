@@ -106,11 +106,18 @@ def _pg_hba_rows(pg_hba: str) -> list[list[str]]:
 
 
 def _row_opens_to_all(row: list[str]) -> bool:
-    """Whether a TCP pg_hba row admits every host (``0.0.0.0/0`` / ``::/0``, or the old netmask form
-    ``0.0.0.0 0.0.0.0``). The ADDRESS is the fourth token (``TYPE DATABASE USER ADDRESS ...``)."""
-    address = row[3] if len(row) > 3 else ""
+    """Whether a TCP pg_hba row admits every host: the ``all`` ADDRESS keyword (what the stock
+    PostgreSQL image ships as ``host all all all ...``), the all-addresses CIDRs ``0.0.0.0/0`` /
+    ``::/0``, or the old netmask form ``0.0.0.0 0.0.0.0``. The ADDRESS is the fourth token
+    (``TYPE DATABASE USER ADDRESS ...``), so matching ``all`` here is the address, not the
+    database/user ``all`` in tokens 2 and 3."""
+    address = row[3].lower() if len(row) > 3 else ""
     netmask = row[4] if len(row) > 4 else ""
-    return address in _PG_HBA_OPEN_CIDRS or (address == "0.0.0.0" and netmask == "0.0.0.0")
+    return (
+        address == "all"
+        or address in _PG_HBA_OPEN_CIDRS
+        or (address == "0.0.0.0" and netmask == "0.0.0.0")
+    )
 
 
 def parse_db_listener_unrestricted(pg_hba: str) -> bool | None:

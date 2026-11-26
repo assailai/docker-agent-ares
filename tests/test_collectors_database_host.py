@@ -55,6 +55,15 @@ def test_old_netmask_all_addresses_form_is_open() -> None:
     )
 
 
+def test_stock_postgres_all_keyword_address_is_open() -> None:
+    # The stock PostgreSQL image ships `host all all all scram-sha-256`: the fourth token is the
+    # `all` ADDRESS keyword (every host), the most common open-postgres config. It must read
+    # not-restricted, and `host` permits plaintext so TLS is not required.
+    line = "host all all all scram-sha-256\n"
+    assert database_host.parse_db_listener_unrestricted(line) is False
+    assert database_host.parse_db_client_tls_required(line) is False
+
+
 def test_hostnossl_entry_means_tls_not_required() -> None:
     assert database_host.parse_db_client_tls_required("hostnossl all all 10.0.0.0/24 md5\n") is False
 
