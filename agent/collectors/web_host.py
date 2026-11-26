@@ -9,12 +9,14 @@ host with no nginx at all, is left out so the control stays NOT_ASSESSED rather 
 claim.
 
 Only nginx, and only what a server/location config proves, lives here. Apache/IIS (different config
-grammars) are future siblings. The web controls that need app code, a WAF rule set, secret stores, an
-RBAC model or request-time telemetry (``web.waf.*``, ``web.secret.*``, ``web.rbac.*``,
-``web.audit.*``, ...) are not a single config directive and stay DESIGNED.
+grammars) are future siblings. The web controls that need app code, an RBAC model, a version
+inventory, a message broker or request-time telemetry (``web.rbac.*``, ``web.module.*``,
+``web.broker.*``, ...) are not a single config directive and stay DESIGNED.
 """
 
 from __future__ import annotations
+
+import re
 
 # The evidence source this collector reads, and the ssh_collect reader that produces it.
 SOURCE_NGINX = "nginx_conf"
@@ -201,6 +203,51 @@ def parse_admin_public_access_allowed(nginx_conf: str) -> bool | None:
     return not all(_location_restricts_clients(inner) for inner in admin_locations)
 
 
+def _without_comments(text: str) -> str:
+    """``text`` with ``#`` line comments removed, for presence scans."""
+    return "\n".join(raw.split("#", 1)[0] for raw in text.splitlines())
+
+
+# Directives that mark a WAF / request-filtering mechanism in the config. ModSecurity / Coraza / NAXSI
+# are web application firewalls; nginx's own ``limit_req`` / ``limit_conn`` are request-rate filtering,
+# which the control's title ("WAF/request-filtering") includes.
+_WAF_SIGNALS = (
+    "modsecurity on",
+    "modsecurity_rules",
+    "ngx_http_modsecurity",
+    "coraza",
+    "naxsi",
+    "limit_req",
+    "limit_conn",
+)
+
+
+def parse_waf_protection_enabled(nginx_conf: str) -> bool | None:
+    """Whether a WAF or request-filtering mechanism is enabled, or ``None`` to abstain when the text is
+    not an nginx config. ``True`` when a ModSecurity/Coraza/NAXSI directive or an nginx rate-limit
+    (``limit_req`` / ``limit_conn``) is configured; ``False`` (a finding) when a web-serving nginx
+    carries no such protection."""
+    if not _looks_like_nginx(nginx_conf):
+        return None
+    text = _without_comments(nginx_conf).lower()
+    return any(signal in text for signal in _WAF_SIGNALS)
+
+
+def parse_security_event_logging_enabled(nginx_conf: str) -> bool | None:
+    """Whether access/security-event logging is enabled, or ``None`` to abstain when the text is not an
+    nginx config. ``False`` (a finding) when access logging is turned off (``access_log off``) with no
+    log path re-enabling it; ``True`` when a log path is configured, or when no ``access_log`` appears
+    at all (nginx logs by default)."""
+    if not _looks_like_nginx(nginx_conf):
+        return None
+    text = _without_comments(nginx_conf)
+    has_off = re.search(r"\baccess_log\s+off\b", text) is not None
+    has_path = re.search(r"\baccess_log\s+(?!off\b)\S+", text) is not None
+    if has_off and not has_path:
+        return False
+    return True
+
+
 # One entry per (control_id, field): the evidence source it reads and the extractor.
 _FIELD_EXTRACTORS = {
     ("web.tls.client_facing_not_enforced", "client_facing_tls_enforced"): (
@@ -210,6 +257,14 @@ _FIELD_EXTRACTORS = {
     ("web.admin.public", "admin_public_access_allowed"): (
         SOURCE_NGINX,
         parse_admin_public_access_allowed,
+    ),
+    ("web.waf.disabled", "waf_protection_enabled"): (
+        SOURCE_NGINX,
+        parse_waf_protection_enabled,
+    ),
+    ("web.audit.logging_disabled", "security_event_logging_enabled"): (
+        SOURCE_NGINX,
+        parse_security_event_logging_enabled,
     ),
 }
 

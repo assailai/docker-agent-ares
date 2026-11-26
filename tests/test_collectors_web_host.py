@@ -71,3 +71,32 @@ def test_serves_and_fields_and_host_tier_routing() -> None:
         {"nginx_conf": _PLAINTEXT_SERVED}, "web.tls.client_facing_not_enforced"
     )
     assert fields == {"client_facing_tls_enforced": False}
+
+
+def test_no_waf_reads_disabled_and_waf_directive_reads_enabled() -> None:
+    plain = "http { server { listen 80; location / { proxy_pass http://x; } } }"
+    assert web_host.parse_waf_protection_enabled(plain) is False
+    waffed = "http { server { listen 80; modsecurity on; location / { proxy_pass http://x; } } }"
+    assert web_host.parse_waf_protection_enabled(waffed) is True
+    ratelimited = "http { limit_req_zone $binary_remote_addr zone=a:10m rate=1r/s; server { listen 80; location / { limit_req zone=a; proxy_pass http://x; } } }"
+    assert web_host.parse_waf_protection_enabled(ratelimited) is True
+    assert web_host.parse_waf_protection_enabled("not a config") is None
+
+
+def test_access_log_off_reads_logging_disabled() -> None:
+    off = "http { server { listen 80; access_log off; location / { root /srv; } } }"
+    assert web_host.parse_security_event_logging_enabled(off) is False
+    on = "http { server { listen 80; access_log /var/log/nginx/access.log; location / { root /srv; } } }"
+    assert web_host.parse_security_event_logging_enabled(on) is True
+    # off at one scope but a path elsewhere -> logging is on somewhere, do not flag
+    mixed = "http { access_log /var/log/nginx/a.log; server { listen 80; location /h { access_log off; } } }"
+    assert web_host.parse_security_event_logging_enabled(mixed) is True
+    # no access_log directive at all -> nginx default is on
+    default = "http { server { listen 80; location / { root /srv; } } }"
+    assert web_host.parse_security_event_logging_enabled(default) is True
+    assert web_host.parse_security_event_logging_enabled("nope") is None
+
+
+def test_new_web_controls_served() -> None:
+    assert web_host.serves("web.waf.disabled") is True
+    assert web_host.serves("web.audit.logging_disabled") is True
