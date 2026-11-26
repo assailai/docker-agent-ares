@@ -32,6 +32,7 @@ SOURCE_PASSWD = "passwd"
 SOURCE_PKG = "pkg"
 SOURCE_FIREWALL = "firewall"
 SOURCE_PKG_AUTO = "pkg_auto"
+SOURCE_AUDIT = "audit"
 
 
 # ── sshd -T (effective SSH daemon configuration) ──────────────────────────────────────────────────
@@ -376,6 +377,60 @@ def parse_auto_updates_disabled(pkg_auto_output: str) -> bool | None:
     return None if value is None else value.strip().lower() in _PKG_FALSEY
 
 
+# ── systemctl is-enabled/is-active auditd (the Linux security audit log) ───────────────────────────
+# Reads whether the host's security audit log (auditd) is running. The two queries are joined by a
+# `===ACTIVE===` separator: the first (`is-enabled`) tells us the unit EXISTS and the second
+# (`is-active`) whether it is running now. The weakness is a host that HAS auditd installed but is not
+# running it (security logging effectively off). A host with no auditd unit at all ABSTAINS (returns
+# None -> NOT_ASSESSED): it may ship logs through journald/rsyslog to a SIEM, so "no auditd" is
+# unknowable here, not a finding. That abstain is why this never false-positives on such a host.
+_AUDIT_SEPARATOR = "===ACTIVE==="
+# `systemctl is-enabled` tokens that mean the unit is present (whether or not it starts at boot). Any
+# of these proves auditd EXISTS, so a non-running one is a real "logging off", not an absent host.
+_AUDIT_KNOWN_UNIT_TOKENS = frozenset(
+    {
+        "enabled",
+        "enabled-runtime",
+        "disabled",
+        "static",
+        "masked",
+        "masked-runtime",
+        "alias",
+        "indirect",
+        "generated",
+        "linked",
+        "linked-runtime",
+        "transient",
+    }
+)
+# Substrings `systemctl` prints when the unit does not exist, so the parser abstains instead of
+# reading "no such unit" as a stopped daemon.
+_AUDIT_ABSENT_MARKERS = (
+    "no such file",
+    "not-found",
+    "could not be found",
+    "failed to get unit file state",
+    "command not found",
+)
+
+
+def parse_security_logging_enabled(audit_output: str) -> bool | None:
+    """Whether the host's security audit log (auditd) is running, or ``None`` to abstain when auditd
+    is not installed. Reads the joined ``is-enabled`` / ``is-active`` output: it abstains when the
+    unit does not exist (absent markers, or no recognized ``is-enabled`` state), and otherwise returns
+    whether the daemon is currently ``active``. So an installed-but-stopped auditd reads ``False``
+    (security logging disabled -> a finding) and a running one ``True``; a host that ships logs some
+    other way never reaches a verdict here."""
+    enabled_part, _, active_part = audit_output.partition(_AUDIT_SEPARATOR)
+    enabled_low = enabled_part.lower()
+    if any(marker in enabled_low for marker in _AUDIT_ABSENT_MARKERS):
+        return None
+    if not any(token in _AUDIT_KNOWN_UNIT_TOKENS for token in enabled_low.split()):
+        return None
+    # Exact token match, so "inactive" (which contains "active") does not read as running.
+    return "active" in active_part.lower().split()
+
+
 # One entry per (control_id, field): the evidence source it reads and the extractor. A control whose
 # extractor abstains (returns None) is omitted from the collected fields, so the control plane
 # evaluates it NOT_ASSESSED rather than on a guess.
@@ -447,6 +502,10 @@ _FIELD_EXTRACTORS = {
     ("server.pkg.auto_updates", "pkg_auto_updates_disabled"): (
         SOURCE_PKG_AUTO,
         parse_auto_updates_disabled,
+    ),
+    ("server.audit.security_logging_disabled", "security_audit_logging_enabled"): (
+        SOURCE_AUDIT,
+        parse_security_logging_enabled,
     ),
 }
 

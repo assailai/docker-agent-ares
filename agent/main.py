@@ -1653,6 +1653,7 @@ _HOST_SOURCE_COLLECTOR_NAMES = {
     linux_host.SOURCE_PKG: "collect_pkg_config",
     linux_host.SOURCE_FIREWALL: "collect_firewall_state",
     linux_host.SOURCE_PKG_AUTO: "collect_pkg_auto_config",
+    linux_host.SOURCE_AUDIT: "collect_auditd_state",
 }
 
 

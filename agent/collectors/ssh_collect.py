@@ -38,6 +38,13 @@ _PKG_CONFIG_COMMAND = "cat /etc/dnf/dnf.conf"
 _FIREWALL_STATE_COMMAND = "firewall-cmd --state 2>&1; echo '===LISTALL==='; firewall-cmd --list-all 2>&1"
 # The dnf-automatic updater configuration (rpm/dnf hosts). Read-only file read; an absent file abstains.
 _PKG_AUTO_COMMAND = "cat /etc/dnf/automatic.conf"
+# The host's auditd service state (the Linux security audit log). Read-only systemctl queries; a host
+# with no auditd unit prints a "No such file"/"not-found" line, which the parser abstains on (we
+# cannot assert "security logging disabled" on a host that ships logs through journald/rsyslog to a
+# SIEM instead). The ``is-enabled`` read confirms the unit exists; ``is-active`` reads whether it runs.
+_AUDITD_STATE_COMMAND = (
+    "systemctl is-enabled auditd 2>&1; echo '===ACTIVE==='; systemctl is-active auditd 2>&1"
+)
 
 
 async def _run_show(
@@ -200,4 +207,22 @@ async def collect_pkg_auto_config(
     unpatched."""
     return await _run_show(
         host, credential, _PKG_AUTO_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
+    )
+
+
+async def collect_auditd_state(
+    host: str,
+    credential: Credential,
+    *,
+    port: int = 22,
+    timeout: float = 20.0,
+    max_bytes: int = 500_000,
+) -> str:
+    """The Linux host's auditd service state (``systemctl is-enabled``/``is-active auditd``),
+    truncated. Read-only queries: they report state and change nothing. Used for the host tier
+    (``server.audit.security_logging_disabled``); a host with no auditd unit prints a "No such
+    file"/"not-found" line, which the parser abstains on rather than reading as a host with security
+    logging disabled (it may ship its logs through journald/rsyslog to a SIEM instead)."""
+    return await _run_show(
+        host, credential, _AUDITD_STATE_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
     )

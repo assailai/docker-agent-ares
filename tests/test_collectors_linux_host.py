@@ -199,6 +199,34 @@ def test_absent_dnf_automatic_abstains_never_false_positives() -> None:
     assert linux_host.parse_auto_updates_disabled(missing) is None
 
 
+# ── auditd (server.audit.security_logging_disabled) ───────────────────────────────────────────────
+def test_installed_but_stopped_auditd_reads_logging_off() -> None:
+    # auditd exists (is-enabled returned a real state) but is not running: security logging is off.
+    stopped = (_FIX / "audit_disabled.txt").read_text()
+    assert linux_host.parse_security_logging_enabled(stopped) is False
+
+
+def test_running_auditd_reads_logging_on() -> None:
+    running = (_FIX / "audit_enabled.txt").read_text()
+    assert linux_host.parse_security_logging_enabled(running) is True
+
+
+def test_static_but_active_auditd_reads_logging_on() -> None:
+    # auditd.service is commonly `static` (pulled in, not boot-enabled); active means it is logging.
+    assert linux_host.parse_security_logging_enabled("static\n===ACTIVE===\nactive\n") is True
+
+
+def test_absent_auditd_abstains_never_false_positives() -> None:
+    # No auditd unit: a host may ship logs through journald/rsyslog to a SIEM, so its absence is NOT a
+    # weakness we can assert, and abstaining is what keeps this from false-positiving such a host.
+    absent = (_FIX / "audit_absent.txt").read_text()
+    assert linux_host.parse_security_logging_enabled(absent) is None
+    # "inactive" must not read as running (it contains the substring "active").
+    assert linux_host.parse_security_logging_enabled("disabled\n===ACTIVE===\ninactive\n") is False
+    # Unrecognized is-enabled output (not a known unit state, no absent marker): abstain.
+    assert linux_host.parse_security_logging_enabled("\n===ACTIVE===\nactive\n") is None
+
+
 def test_a_missing_sysctl_key_abstains() -> None:
     # A real sysctl dump (ostype marker present) that omits a key abstains on that control.
     dump = "kernel.ostype = Linux\nnet.ipv4.ip_forward = 0\n"
@@ -252,6 +280,7 @@ def test_source_routing_maps_each_control_to_one_source() -> None:
     assert linux_host.source_for("server.pkg.gpg_check") == linux_host.SOURCE_PKG
     assert linux_host.source_for("server.firewall.permissive") == linux_host.SOURCE_FIREWALL
     assert linux_host.source_for("server.pkg.auto_updates") == linux_host.SOURCE_PKG_AUTO
+    assert linux_host.source_for("server.audit.security_logging_disabled") == linux_host.SOURCE_AUDIT
     assert linux_host.source_for("net.management.telnet") is None
 
 
