@@ -41,3 +41,21 @@ def test_serves_and_fields() -> None:
     assert mail_dns.spf_field(["v=spf1 ~all"]) == {"spf_enforced": False}
     assert mail_dns.dmarc_field(["v=DMARC1; p=none"]) == {"dmarc_policy_enforced": False}
     assert mail_dns.spf_field("x") is None
+
+
+def test_mtasts_enforced_only_when_published_and_mode_enforce() -> None:
+    assert mail_dns.parse_mtasts_published(["v=STSv1; id=20260101"]) is True
+    assert mail_dns.parse_mtasts_published(["unrelated"]) is False
+    assert mail_dns.parse_mtasts_published([]) is False
+    assert mail_dns.parse_mtasts_published("x") is None
+    assert mail_dns.parse_mtasts_mode("version: STSv1\nmode: enforce\nmx: m.lab\nmax_age: 86400") == "enforce"
+    assert mail_dns.parse_mtasts_mode("mode: testing") == "testing"
+    assert mail_dns.parse_mtasts_mode("no mode here") is None
+    # enforced only when BOTH published and mode enforce
+    assert mail_dns.parse_mtasts_enforce_enabled(True, "enforce") is True
+    assert mail_dns.parse_mtasts_enforce_enabled(True, "testing") is False
+    assert mail_dns.parse_mtasts_enforce_enabled(False, None) is False
+    # not published (the common real finding) -> not enforced
+    assert mail_dns.mtasts_field(False, None) == {"mta_sts_enforce_mode_enabled": False}
+    assert mail_dns.mtasts_field(True, "enforce") == {"mta_sts_enforce_mode_enabled": True}
+    assert mail_dns.serves("mail.mtasts.not_enforced") is True

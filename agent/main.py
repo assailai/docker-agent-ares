@@ -2093,6 +2093,9 @@ async def _collect_mail_dns_controls(
                 fields = mail_dns.dmarc_field(
                     await mail_dns.fetch_dmarc_txt(domain, timeout=timeout_s)
                 )
+            elif control_id == "mail.mtasts.not_enforced":
+                published, mode = await mail_dns.fetch_mtasts_posture(domain, timeout=timeout_s)
+                fields = mail_dns.mtasts_field(published, mode)
             else:
                 fields = None
         except Exception as exc:  # noqa: BLE001 - a failed resolve is honest UNAVAILABLE

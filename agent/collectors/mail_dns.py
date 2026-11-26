@@ -15,10 +15,14 @@ exists. The mailbox-audit / forwarding / anti-phish controls are cloud-mail-tena
 from __future__ import annotations
 
 import asyncio
+import ssl
 
 import dns.resolver
+import httpx
 
-SERVES = frozenset({"mail.spf.not_enforced", "mail.dmarc.not_enforced"})
+SERVES = frozenset(
+    {"mail.spf.not_enforced", "mail.dmarc.not_enforced", "mail.mtasts.not_enforced"}
+)
 
 
 def serves(control_id: str) -> bool:
@@ -98,6 +102,42 @@ def dmarc_field(txt_values: object) -> dict[str, object] | None:
     return None if value is None else {"dmarc_policy_enforced": value}
 
 
+# ── MTA-STS ───────────────────────────────────────────────────────────────────────────────────────
+# MTA-STS is published in two parts: a DNS TXT record at ``_mta-sts.<domain>`` announcing a policy, and
+# the policy itself served over HTTPS at ``https://mta-sts.<domain>/.well-known/mta-sts.txt`` with a
+# ``mode:`` of enforce / testing / none. Enforcement is the HTTPS policy's mode, so the enabled fact is
+# "published AND mode is enforce".
+def parse_mtasts_published(txt_values: object) -> bool | None:
+    """Whether an MTA-STS policy is announced in DNS (``v=STSv1`` at ``_mta-sts.<domain>``), or ``None``
+    to abstain when the TXT values are not a list."""
+    if not isinstance(txt_values, list):
+        return None
+    return any(isinstance(v, str) and v.strip().lower().startswith("v=stsv1") for v in txt_values)
+
+
+def parse_mtasts_mode(policy_text: object) -> str | None:
+    """The ``mode`` of an MTA-STS policy file (``enforce`` / ``testing`` / ``none``), or ``None`` when
+    the text carries no ``mode:`` line (not a policy)."""
+    if not isinstance(policy_text, str):
+        return None
+    for line in policy_text.splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip().lower() == "mode":
+            return value.strip().lower() or None
+    return None
+
+
+def parse_mtasts_enforce_enabled(published: object, mode: object) -> bool:
+    """Whether MTA-STS is ENFORCED: a policy is published AND its mode is ``enforce``. Anything else
+    (not published, ``testing``, ``none``, no mode) is not enforced (a finding)."""
+    return bool(published) and mode == "enforce"
+
+
+def mtasts_field(published: object, mode: object) -> dict[str, object]:
+    """The ``mail.mtasts.not_enforced`` field dict from the DNS-published flag and the policy mode."""
+    return {"mta_sts_enforce_mode_enabled": parse_mtasts_enforce_enabled(published, mode)}
+
+
 def _resolve_txt(name: str, timeout: float) -> list[str]:
     """The TXT strings published at ``name``, read through the system resolver. Returns an empty list
     when the name has no TXT record (NXDOMAIN / NoAnswer), which the parsers read as "not published"."""
@@ -123,3 +163,35 @@ async def fetch_spf_txt(domain: str, *, timeout: float) -> list[str]:
 async def fetch_dmarc_txt(domain: str, *, timeout: float) -> list[str]:
     """The TXT records at ``_dmarc.<domain>`` (where DMARC is published)."""
     return await asyncio.to_thread(_resolve_txt, f"_dmarc.{domain}", timeout)
+
+
+def _unverified_tls() -> ssl.SSLContext:
+    """A TLS context that encrypts but does not verify the MTA-STS policy host's certificate: a lab /
+    on-prem host commonly serves its own self-signed certificate. Mirrors the other tiers."""
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def _fetch_mtasts_policy(domain: str, timeout: float) -> str | None:
+    """The MTA-STS policy text from ``https://mta-sts.<domain>/.well-known/mta-sts.txt``, or ``None``
+    when it cannot be fetched (no policy host / non-200). Synchronous (runs in a thread)."""
+    url = f"https://mta-sts.{domain}/.well-known/mta-sts.txt"
+    try:
+        response = httpx.get(url, timeout=timeout, verify=_unverified_tls(), follow_redirects=False)
+    except Exception:  # noqa: BLE001 - an unreachable policy host is read as "no policy"
+        return None
+    return response.text if response.status_code == 200 else None
+
+
+async def fetch_mtasts_posture(domain: str, *, timeout: float) -> tuple[bool, str | None]:
+    """The domain's MTA-STS posture as ``(published, mode)``: whether a policy is announced in DNS, and
+    the mode of the HTTPS-served policy (fetched only when it is announced). Read in a thread."""
+
+    def _read() -> tuple[bool, str | None]:
+        published = parse_mtasts_published(_resolve_txt(f"_mta-sts.{domain}", timeout)) or False
+        mode = parse_mtasts_mode(_fetch_mtasts_policy(domain, timeout)) if published else None
+        return published, mode
+
+    return await asyncio.to_thread(_read)
