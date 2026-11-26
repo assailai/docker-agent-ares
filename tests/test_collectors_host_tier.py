@@ -4,9 +4,15 @@ sources are merged loss-free, and a control no host family serves falls through 
 
 from __future__ import annotations
 
-from agent.collectors import database_host, host_tier, linux_host, storage_host
+from agent.collectors import (
+    database_host,
+    host_tier,
+    linux_host,
+    mail_host,
+    storage_host,
+)
 
-_FAMILIES = (linux_host, storage_host, database_host)
+_FAMILIES = (linux_host, storage_host, database_host, mail_host)
 
 
 def test_each_control_routes_to_its_owning_family() -> None:
@@ -14,6 +20,7 @@ def test_each_control_routes_to_its_owning_family() -> None:
     assert host_tier.serves("server.audit.security_logging_disabled") is True
     assert host_tier.serves("storage.nfs.wildcard_rw") is True
     assert host_tier.serves("database.client.tls") is True
+    assert host_tier.serves("mail.auth.legacy") is True
     # A device control (read from the running-config) is NOT a host control: it falls through.
     assert host_tier.serves("net.management.telnet") is False
 

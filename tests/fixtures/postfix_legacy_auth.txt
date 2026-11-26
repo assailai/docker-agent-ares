@@ -1,0 +1,8 @@
+# Postfix main.cf
+myhostname = mail.example.com
+inet_interfaces = all
+mynetworks = 127.0.0.0/8
+    10.0.0.0/24
+smtpd_sasl_auth_enable = yes
+smtpd_tls_auth_only = no
+smtpd_tls_security_level = may

@@ -60,6 +60,9 @@ _POSTGRES_HBA_COMMAND = (
     "cat /etc/postgresql/*/main/pg_hba.conf /var/lib/pgsql/data/pg_hba.conf "
     "/var/lib/postgresql/data/pg_hba.conf 2>/dev/null"
 )
+# Postfix's main.cf. Read-only file read; a host with no Postfix yields empty output, which the parser
+# abstains on rather than reading as a mail server with a missing directive.
+_POSTFIX_MAIN_CF_COMMAND = "cat /etc/postfix/main.cf 2>/dev/null"
 
 
 async def _run_show(
@@ -291,4 +294,21 @@ async def collect_postgres_hba(
     on rather than reading as a database with no restriction."""
     return await _run_show(
         host, credential, _POSTGRES_HBA_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
+    )
+
+
+async def collect_postfix_main_cf(
+    host: str,
+    credential: Credential,
+    *,
+    port: int = 22,
+    timeout: float = 20.0,
+    max_bytes: int = 500_000,
+) -> str:
+    """Postfix's ``/etc/postfix/main.cf``, truncated. Read-only file read: it prints config and
+    changes nothing. Used for the host tier (``mail.auth.legacy`` / ``mail.tls.inbound_not_enforced``);
+    a host with no Postfix yields empty output, which the parser abstains on rather than reading as a
+    mail server with a missing directive."""
+    return await _run_show(
+        host, credential, _POSTFIX_MAIN_CF_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
     )
