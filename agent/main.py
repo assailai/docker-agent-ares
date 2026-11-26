@@ -1700,6 +1700,33 @@ async def _collect_host_controls(
     return controls, coverage
 
 
+def _append_kube_control(
+    target: str,
+    control_id: str,
+    requested_ids: list[str],
+    resource: dict,
+    field_fn,
+    controls: list[dict],
+    coverage: list[dict],
+) -> None:
+    """Append one kubernetes control's facts (or an UNSUPPORTED coverage entry) when it was requested.
+    ``field_fn`` maps the already-fetched resource LIST to the control's field dict, or ``None`` to
+    abstain (recorded UNSUPPORTED)."""
+    if control_id not in requested_ids:
+        return
+    fields = field_fn(resource)
+    if fields is None:
+        coverage.append(
+            assessment_collect.coverage_entry(
+                scope=f"{target}:{control_id}", state="unsupported", reason_code="no_parser"
+            )
+        )
+        return
+    controls.append(
+        assessment_collect.control_facts(control_id, fields, collection_complete=True)
+    )
+
+
 async def _collect_kube_controls(
     job: dict, control_ids: list[str], credential, timeout_s: float
 ) -> tuple[list[dict], list[dict]]:
@@ -1713,31 +1740,37 @@ async def _collect_kube_controls(
         return [], _unavailable_coverage(
             target, control_ids, "wrong_credential_kind:expected_k8s_token"
         )
-    try:
-        api = kube_collect.api_for(target, credential.secret, timeout=timeout_s)
-        pods = await kube_collect.fetch_pods(api)
-    except Exception as exc:  # noqa: BLE001 - any connect/auth/read failure is honest UNAVAILABLE
-        return [], _unavailable_coverage(
-            target, control_ids, f"collect_failed:{type(exc).__name__}"
-        )
+    api = kube_collect.api_for(target, credential.secret, timeout=timeout_s)
     controls: list[dict] = []
     coverage: list[dict] = []
-    for control_id in control_ids:
-        fields = (
-            kube_collect.privileged_workloads_field(pods)
-            if control_id == "kubernetes.workload.privileged"
-            else None
-        )
-        if fields is None:
-            coverage.append(
-                assessment_collect.coverage_entry(
-                    scope=f"{target}:{control_id}", state="unsupported", reason_code="no_parser"
-                )
+    # Each control LISTs a different resource; fetch a resource once, only when a requested control
+    # needs it, and a failed fetch makes only that resource's controls UNAVAILABLE.
+    pod_ids = [cid for cid in control_ids if cid in kube_collect.POD_CONTROLS]
+    if pod_ids:
+        try:
+            pods = await kube_collect.fetch_pods(api)
+        except Exception as exc:  # noqa: BLE001 - a failed read is honest UNAVAILABLE, not a crash
+            coverage += _unavailable_coverage(
+                target, pod_ids, f"collect_failed:{type(exc).__name__}"
             )
-            continue
-        controls.append(
-            assessment_collect.control_facts(control_id, fields, collection_complete=True)
-        )
+        else:
+            _append_kube_control(
+                target, "kubernetes.workload.privileged", pod_ids, pods,
+                kube_collect.privileged_workloads_field, controls, coverage,
+            )
+    netpol_ids = [cid for cid in control_ids if cid in kube_collect.NETPOL_CONTROLS]
+    if netpol_ids:
+        try:
+            netpols = await kube_collect.fetch_networkpolicies(api)
+        except Exception as exc:  # noqa: BLE001 - a failed read is honest UNAVAILABLE, not a crash
+            coverage += _unavailable_coverage(
+                target, netpol_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            _append_kube_control(
+                target, "kubernetes.network.no_default_deny", netpol_ids, netpols,
+                kube_collect.default_deny_field, controls, coverage,
+            )
     return controls, coverage
 
 

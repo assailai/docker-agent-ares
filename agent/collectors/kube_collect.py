@@ -20,8 +20,11 @@ from __future__ import annotations
 
 from agent.kubeinfo import KubeApi
 
-# The kubernetes controls this collector reads from the authenticated API.
-SERVES = frozenset({"kubernetes.workload.privileged"})
+# The kubernetes controls this collector reads from the authenticated API, grouped by the resource
+# each one LISTs so the tier fetches a resource only when a control needs it.
+POD_CONTROLS = frozenset({"kubernetes.workload.privileged"})
+NETPOL_CONTROLS = frozenset({"kubernetes.network.no_default_deny"})
+SERVES = POD_CONTROLS | NETPOL_CONTROLS
 
 # The Kubernetes-owned namespaces: privileged system pods (CNI, kube-proxy) live here and are expected
 # platform components, so a privileged-workload finding counts USER namespaces only to avoid a false
@@ -77,18 +80,56 @@ def parse_privileged_workloads(pods: dict) -> int | None:
     return count
 
 
-async def fetch_pods(api: KubeApi) -> dict:
-    """Page through ``GET /api/v1/pods`` and return one ``{"items": [...]}`` document, bounded by
-    ``_MAX_PODS``. Read-only: a LIST GET, no watch, no write. Raises on connect/auth/HTTP error, which
-    the caller records as honest UNAVAILABLE."""
+def _selects_all_pods(pod_selector: object) -> bool:
+    """Whether a NetworkPolicy podSelector selects EVERY pod in its namespace (an empty selector: no
+    matchLabels and no matchExpressions), which is what a default-deny policy uses."""
+    if not isinstance(pod_selector, dict):
+        return False
+    return not pod_selector.get("matchLabels") and not pod_selector.get("matchExpressions")
+
+
+def parse_default_deny_present(netpols: dict) -> bool | None:
+    """Whether at least one NetworkPolicy enforces a namespace default-deny (selects all pods and names
+    a policyType with no allow rules), or ``None`` to abstain when the input is not a NetworkPolicy
+    list. The field is the present sense, so ABSENCE reads ``False`` (a finding). Under-reports rather
+    than over-reports: a default-deny in one namespace reads present even if another lacks it, so this
+    never false-positives a cluster that does have default-deny."""
+    items = netpols.get("items")
+    if not isinstance(items, list):
+        return None
+    for policy in items:
+        if not isinstance(policy, dict):
+            continue
+        spec = policy.get("spec") or {}
+        if not _selects_all_pods(spec.get("podSelector", {})):
+            continue
+        policy_types = spec.get("policyTypes") or []
+        if "Ingress" in policy_types and not spec.get("ingress"):
+            return True
+        if "Egress" in policy_types and not spec.get("egress"):
+            return True
+    return False
+
+
+def default_deny_field(netpols: dict) -> dict[str, object] | None:
+    """The ``kubernetes.network.no_default_deny`` field dict from a NetworkPolicy list, or ``None`` to
+    abstain."""
+    present = parse_default_deny_present(netpols)
+    return None if present is None else {"default_deny_network_policy_present": present}
+
+
+async def _fetch_list(api: KubeApi, path: str, max_items: int) -> dict:
+    """Page through a read-only LIST GET and return one ``{"items": [...]}`` document, bounded by
+    ``max_items`` (build-for-scale). A LIST GET only, no watch, no write. Raises on connect/auth/HTTP
+    error, which the caller records as honest UNAVAILABLE."""
     items: list[dict] = []
     continue_token = ""
     async with api.client() as client:
-        while len(items) < _MAX_PODS:
+        while len(items) < max_items:
             params: dict[str, object] = {"limit": _PAGE_LIMIT}
             if continue_token:
                 params["continue"] = continue_token
-            response = await client.get("/api/v1/pods", params=params)
+            response = await client.get(path, params=params)
             response.raise_for_status()
             body = response.json()
             page = body.get("items")
@@ -97,7 +138,17 @@ async def fetch_pods(api: KubeApi) -> dict:
             continue_token = (body.get("metadata") or {}).get("continue") or ""
             if not continue_token:
                 break
-    return {"items": items[:_MAX_PODS]}
+    return {"items": items[:max_items]}
+
+
+async def fetch_pods(api: KubeApi) -> dict:
+    """The cluster's pods, paged read-only (bounded by ``_MAX_PODS``)."""
+    return await _fetch_list(api, "/api/v1/pods", _MAX_PODS)
+
+
+async def fetch_networkpolicies(api: KubeApi) -> dict:
+    """The cluster's NetworkPolicies across all namespaces, paged read-only (bounded)."""
+    return await _fetch_list(api, "/apis/networking.k8s.io/v1/networkpolicies", _MAX_PODS)
 
 
 def api_for(target: str, token: str, *, timeout: float, verify: str | bool = False) -> KubeApi:
