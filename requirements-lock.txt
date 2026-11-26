@@ -6,6 +6,10 @@ anyio==4.16.0 \
     --hash=sha256:59bb03251907983d1603d27c3087ddb1e93299ea2163adcdba37899a4fb12ffb \
     --hash=sha256:c66ae634e0b8228396b801741beb3294326d4b6102f7bba4041c0dfb58c29026
     # via httpx
+asn1crypto==1.5.1 \
+    --hash=sha256:13ae38502be632115abf8a24cbe5f4da52e3b5231990aff31123c805306ccb9c \
+    --hash=sha256:db4e40728b728508912cbb3d44f19ce188f218e9eba635821bb4b68564f8fd67
+    # via scramp
 asyncssh==2.24.1 \
     --hash=sha256:efcd36e9b35f79873535b06444a7c9b0a3c61d97081b208c7fdd3fd8a40f1eca \
     --hash=sha256:fc560b4f43be0f0c602d184783e5e3876f5d24d933a25359d86e5a50a5f46fe5
@@ -212,6 +216,10 @@ idna==3.20 \
     # via
     #   anyio
     #   httpx
+pg8000==1.31.2 \
+    --hash=sha256:1ea46cf09d8eca07fe7eaadefd7951e37bee7fabe675df164f1a572ffb300876 \
+    --hash=sha256:436c771ede71af4d4c22ba867a30add0bc5c942d7ab27fadbb6934a487ecc8f6
+    # via -r requirements.txt
 pycparser==3.12 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy' \
     --hash=sha256:a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e \
     --hash=sha256:f03387877eab82ce01bbdfd0ba7252ee55a90b1c708d5129e2ce915475cf1db6
@@ -328,12 +336,20 @@ pydantic-settings==2.6.1 \
     --hash=sha256:7fb0637c786a558d3103436278a7c4f1cfd29ba8973238a50c5bb9a55387da87 \
     --hash=sha256:e0f92546d8a9923cb8941689abf85d6601a8c19a23e97a34b2964a2e3f813ca0
     # via -r requirements.txt
+python-dateutil==4.0.0 \
+    --hash=sha256:a5e246f79eb80475e691bf93862cead98decd8a498cf53ba0516fcdc0f50dc1c \
+    --hash=sha256:d7295ff14fdc0f92f662100bfb6c551d160ca090f2939f1ec5b9794265c03f06
+    # via pg8000
 python-dotenv==1.0.1 \
     --hash=sha256:e324ee90a023d808f1959c46bcbc04446a10ced277783dc6ee09987c37ec10ca \
     --hash=sha256:f7b63ef50f1b690dddf550d03497b66d609393b40b564ed0d674909a68ebf16a
     # via
     #   -r requirements.txt
     #   pydantic-settings
+scramp==1.5.0 \
+    --hash=sha256:21b88a54bc4b656f57de9f0f6be531ca99f7efe49220bbd083b84cf88748e395 \
+    --hash=sha256:8280608f568e81da9e9c9d69cac1331b836622d9b48bf5c5e400e16129c6d1fa
+    # via pg8000
 typing-extensions==4.16.0 \
     --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8 \
     --hash=sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5
@@ -342,6 +358,10 @@ typing-extensions==4.16.0 \
     #   asyncssh
     #   pydantic
     #   pydantic-core
+tzdata==2026.6 \
+    --hash=sha256:0a10eec6e13ef16b627fabed9a5f2ba61a62b1c67f327305f4e7e412a70b4aec \
+    --hash=sha256:85d2cd9c09f81f0bb29db27759fc83af4f1e620efb814f8c5bf8b4cc4feece6d
+    # via python-dateutil
 websockets==14.1 \
     --hash=sha256:00fe5da3f037041da1ee0cf8e308374e236883f9842c7c465aa65098b1c9af59 \
     --hash=sha256:01bb2d4f0a6d04538d3c5dfd27c0643269656c28045a53439cbf1c004f90897a \

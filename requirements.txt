@@ -34,3 +34,10 @@ cryptography==50.0.2
 # (GHSA-2wxc-x7rj-hg8f), and 2.24.x also clears GHSA-rw4j-r22c-9gc3. API used (connect,
 # import_private_key, run) is stable across these minors.
 asyncssh==2.24.1
+
+# PostgreSQL client for the credentialed DATABASE collect tier (agent/collectors/db_query.py): a
+# read-only catalog query (e.g. the installed-extension list) under a reader login from the local
+# vault. Deliberately pg8000, the PURE-PYTHON driver (no C extension), so the Alpine image needs no
+# extra build toolchain and the wheel is platform-independent. Transitive: scramp (SCRAM auth) and
+# asn1crypto, both pure-Python.
+pg8000==1.31.2

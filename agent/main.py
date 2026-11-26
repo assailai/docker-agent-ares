@@ -45,7 +45,7 @@ from agent import (
     protocols,
     snmp,
 )
-from agent.collectors import host_tier, kube_collect, ssh_collect, vendor
+from agent.collectors import db_query, host_tier, kube_collect, ssh_collect, vendor
 from agent.credential_vault import CredentialVault
 from agent.state import AgentState, fingerprint, load_state, save_state
 from agent.tunnel import (
@@ -1734,6 +1734,48 @@ async def _collect_kube_controls(
     return controls, coverage
 
 
+async def _collect_db_query_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float
+) -> tuple[list[dict], list[dict]]:
+    """The database-query tier: open ONE read-only TLS SQL session to the target with the ``db_login``
+    reader credential, run a fixed catalog query, and normalise each requested control. A wrong
+    credential kind (not db_login), or a failed connect/query, makes every requested control
+    UNAVAILABLE; a control this tier does not support is UNSUPPORTED. One fixed query, no arbitrary
+    SQL, no row sampling."""
+    target = job["target_address"]
+    if credential.kind != "db_login":
+        return [], _unavailable_coverage(
+            target, control_ids, "wrong_credential_kind:expected_db_login"
+        )
+    try:
+        extension_names = await db_query.fetch_extension_names(
+            target, credential, timeout=timeout_s
+        )
+    except Exception as exc:  # noqa: BLE001 - any connect/auth/query failure is honest UNAVAILABLE
+        return [], _unavailable_coverage(
+            target, control_ids, f"collect_failed:{type(exc).__name__}"
+        )
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    for control_id in control_ids:
+        fields = (
+            db_query.dangerous_extensions_field(extension_names)
+            if control_id == "database.extension.dangerous_enabled"
+            else None
+        )
+        if fields is None:
+            coverage.append(
+                assessment_collect.coverage_entry(
+                    scope=f"{target}:{control_id}", state="unsupported", reason_code="no_parser"
+                )
+            )
+            continue
+        controls.append(
+            assessment_collect.control_facts(control_id, fields, collection_complete=True)
+        )
+    return controls, coverage
+
+
 async def _collect_controls(
     job: dict, control_ids: list[str], credential
 ) -> tuple[list[dict], list[dict], list[dict]]:
@@ -1751,10 +1793,13 @@ async def _collect_controls(
     timeout_s, max_bytes = _effective_collect_budget(job)
     host_ids = [cid for cid in control_ids if host_tier.serves(cid)]
     kube_ids = [cid for cid in control_ids if kube_collect.serves(cid)]
+    db_query_ids = [cid for cid in control_ids if db_query.serves(cid)]
     network_ids = [
         cid
         for cid in control_ids
-        if not host_tier.serves(cid) and not kube_collect.serves(cid)
+        if not host_tier.serves(cid)
+        and not kube_collect.serves(cid)
+        and not db_query.serves(cid)
     ]
     controls: list[dict] = []
     coverage: list[dict] = []
@@ -1777,6 +1822,12 @@ async def _collect_controls(
         )
         controls += kube_controls
         coverage += kube_coverage
+    if db_query_ids:
+        db_controls, db_coverage = await _collect_db_query_controls(
+            job, db_query_ids, credential, timeout_s
+        )
+        controls += db_controls
+        coverage += db_coverage
     return controls, coverage, neighbours
 
 
