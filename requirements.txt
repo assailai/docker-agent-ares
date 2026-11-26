@@ -40,7 +40,7 @@ asyncssh==2.24.1
 # vault. Deliberately pg8000, the PURE-PYTHON driver (no C extension), so the Alpine image needs no
 # extra build toolchain and the wheel is platform-independent. Transitive: scramp (SCRAM auth) and
 # asn1crypto, both pure-Python.
-pg8000==1.31.2
+pg8000==1.31.6
 
 # LDAP client for the credentialed IDENTITY collect tier (agent/collectors/ldap_query.py): a
 # read-only LDAPS bind + scoped search of an Active Directory domain controller under a reader login

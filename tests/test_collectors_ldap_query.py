@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from agent.collectors import ldap_query
+from agent.credential_vault import Credential
 
 # userAccountControl bit flags.
 _NORMAL = 0x200  # NORMAL_ACCOUNT
@@ -91,3 +92,44 @@ def test_krbtgt_age_field() -> None:
     old = _to_filetime(_NOW - timedelta(days=365))
     assert ldap_query.krbtgt_age_field(old, _NOW) == {"krbtgt_password_age_days": 365}
     assert ldap_query.krbtgt_age_field(0, _NOW) is None
+
+
+def test_float_timeout_is_coerced_to_int_for_ldap3(monkeypatch) -> None:
+    """ldap3's connect_timeout / receive_timeout require an int. The collect path passes a float
+    budget (e.g. 20.0), which made every bind fail with "required argument is not an integer" and the
+    identity tier report UNAVAILABLE. The query must coerce the timeout to a whole number of seconds.
+    Regression for the live end-to-end run that surfaced it."""
+    from agent.collectors import ldap_query
+
+    seen: dict[str, object] = {}
+
+    class _Server:
+        def __init__(self, *a, **k):
+            seen["server_connect_timeout"] = k.get("connect_timeout")
+            self.info = None
+
+    class _Conn:
+        def __init__(self, *a, **k):
+            seen["conn_receive_timeout"] = k.get("receive_timeout")
+
+        def search(self, *a, **k):
+            return None
+
+        entries: list = []
+
+        def unbind(self):
+            return None
+
+    monkeypatch.setattr(ldap_query.ldap3, "Server", _Server)
+    monkeypatch.setattr(ldap_query.ldap3, "Connection", _Conn)
+    # a float timeout (what the collect budget passes) must reach ldap3 as an int
+    try:
+        ldap_query._query_delegation_uac("dc", 636, _cred(), 20.0)
+    except Exception:
+        pass  # the stubbed directory has no naming context; we only assert the timeout type
+    assert isinstance(seen["server_connect_timeout"], int)
+    assert isinstance(seen["conn_receive_timeout"], int)
+
+
+def _cred() -> Credential:
+    return Credential(kind="ldap_bind", username="Administrator@LAB.LOCAL", secret="pw")

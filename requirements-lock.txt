@@ -220,9 +220,9 @@ ldap3==2.9.1 \
     --hash=sha256:5869596fc4948797020d3f03b7939da938778a0f9e2009f7a072ccf92b8e8d70 \
     --hash=sha256:f3e7fc4718e3f09dda568b57100095e0ce58633bcabbed8667ce3f8fbaa4229f
     # via -r requirements.txt
-pg8000==1.31.2 \
-    --hash=sha256:1ea46cf09d8eca07fe7eaadefd7951e37bee7fabe675df164f1a572ffb300876 \
-    --hash=sha256:436c771ede71af4d4c22ba867a30add0bc5c942d7ab27fadbb6934a487ecc8f6
+pg8000==1.31.6 \
+    --hash=sha256:1ffe27af94fa5b37ce6885b98d591dc75562ff076859bf50ca7729af59345a80 \
+    --hash=sha256:553b240256d4b2d8f0ad2af28d07df1f9980247f74ac98d2c2b573762ec1ff1b
     # via -r requirements.txt
 pyasn1==0.6.5 \
     --hash=sha256:4017b0fce125096b8573b39c989fdb1a4b19cf761e683398184550fea0e66587 \

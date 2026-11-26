@@ -85,6 +85,10 @@ def _query_delegation_uac(host: str, port: int, credential: Credential, timeout:
     """Bind to the DC over LDAPS, search for the delegation-flagged principals, and return their
     userAccountControl values. Synchronous (ldap3 is), so the caller runs it in a thread. Read-only:
     one bind, one scoped search, then unbind."""
+    # ldap3's connect_timeout / receive_timeout require an int; the collect path passes a float
+    # budget (e.g. 20.0) and ldap3 then raises "required argument is not an integer" on the socket,
+    # so every search fails UNAVAILABLE. Coerce to a whole number of seconds, at least 1.
+    timeout = max(1, int(timeout))
     server = ldap3.Server(
         host,
         port=port,
@@ -177,6 +181,8 @@ def _query_krbtgt_pwdlastset(
 ) -> object:
     """Bind to the DC over LDAPS, read the krbtgt account's pwdLastSet, and return it as ldap3 presents
     it, or ``None`` when the account/attribute is absent. Synchronous (ldap3 is)."""
+    # ldap3 needs an int timeout (see _query_delegation_uac); the collect budget is a float.
+    timeout = max(1, int(timeout))
     server = ldap3.Server(
         host, port=port, use_ssl=True, tls=_tls(), get_info=ldap3.DSA, connect_timeout=timeout
     )
