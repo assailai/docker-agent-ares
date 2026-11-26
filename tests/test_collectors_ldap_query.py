@@ -6,6 +6,8 @@ bit-parsing."""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from agent.collectors import ldap_query
 
 # userAccountControl bit flags.
@@ -46,9 +48,46 @@ def test_non_int_entries_are_ignored() -> None:
 
 def test_serves_and_field_dict() -> None:
     assert ldap_query.serves("identity.delegation.unconstrained") is True
-    assert ldap_query.serves("identity.krbtgt.rotation_stale") is False  # not built on this tier yet
+    assert ldap_query.serves("identity.krbtgt.rotation_stale") is True
     assert ldap_query.serves("server.ssh.password") is False
     assert ldap_query.unconstrained_delegation_field([_NORMAL | _DELEGATION]) == {
         "unconstrained_delegation_principals": 1
     }
     assert ldap_query.unconstrained_delegation_field("nope") is None
+
+
+# ── krbtgt password age ───────────────────────────────────────────────────────────────────────────
+_EPOCH = datetime(1601, 1, 1, tzinfo=UTC)
+_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def _to_filetime(dt: datetime) -> int:
+    return int((dt - _EPOCH).total_seconds() * 10_000_000)
+
+
+def test_krbtgt_age_from_filetime_string() -> None:
+    # ldap3 commonly returns pwdLastSet as a FILETIME string; a 200-day-old password reads 200.
+    old = str(_to_filetime(_NOW - timedelta(days=200)))
+    assert ldap_query.parse_krbtgt_age_days(old, _NOW) == 200
+
+
+def test_krbtgt_age_from_datetime() -> None:
+    # Schema-aware ldap3 may return a datetime; a 100-day-old password reads 100.
+    assert ldap_query.parse_krbtgt_age_days(_NOW - timedelta(days=100), _NOW) == 100
+
+
+def test_freshly_rotated_krbtgt_reads_low_age() -> None:
+    assert ldap_query.parse_krbtgt_age_days(_to_filetime(_NOW - timedelta(days=3)), _NOW) == 3
+
+
+def test_krbtgt_unset_or_unreadable_abstains() -> None:
+    # pwdLastSet 0 means "must change at next logon", never a real age: abstain.
+    assert ldap_query.parse_krbtgt_age_days(0, _NOW) is None
+    assert ldap_query.parse_krbtgt_age_days("not-a-number", _NOW) is None
+    assert ldap_query.parse_krbtgt_age_days(None, _NOW) is None
+
+
+def test_krbtgt_age_field() -> None:
+    old = _to_filetime(_NOW - timedelta(days=365))
+    assert ldap_query.krbtgt_age_field(old, _NOW) == {"krbtgt_password_age_days": 365}
+    assert ldap_query.krbtgt_age_field(0, _NOW) is None

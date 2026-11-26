@@ -21,12 +21,15 @@ from __future__ import annotations
 
 import asyncio
 import ssl
+from datetime import UTC, datetime, timedelta
 
 import ldap3
 
 from agent.credential_vault import Credential
 
-SERVES = frozenset({"identity.delegation.unconstrained"})
+DELEGATION_CONTROLS = frozenset({"identity.delegation.unconstrained"})
+KRBTGT_CONTROLS = frozenset({"identity.krbtgt.rotation_stale"})
+SERVES = DELEGATION_CONTROLS | KRBTGT_CONTROLS
 
 # userAccountControl bit flags (Microsoft AD): a principal TRUSTED_FOR_DELEGATION (unconstrained) is
 # the finding; a SERVER_TRUST_ACCOUNT (a domain controller) holds that flag legitimately and is
@@ -133,3 +136,76 @@ async def fetch_delegation_uac(
     synchronous ldap3 bind+search in a thread so the event loop is not blocked. Raises on
     bind/search failure, which the caller records as honest UNAVAILABLE."""
     return await asyncio.to_thread(_query_delegation_uac, host, port, credential, timeout)
+
+
+# ── krbtgt password age ───────────────────────────────────────────────────────────────────────────
+# The krbtgt account signs every Kerberos ticket, so a password not rotated in a long time means a
+# stolen key (a golden-ticket secret) stays valid indefinitely. pwdLastSet is a Windows FILETIME:
+# 100-nanosecond intervals since 1601-01-01 UTC. ldap3 may present it as that raw number (a string
+# under get_info=DSA) or, schema-aware, as a datetime; the parser handles both.
+_KRBTGT_FILTER = "(sAMAccountName=krbtgt)"
+_FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=UTC)
+
+
+def parse_krbtgt_age_days(pwdlastset: object, now: datetime) -> int | None:
+    """The age in whole days of the krbtgt password from its pwdLastSet, or ``None`` to abstain when
+    the value is unset (``0`` means "must change at next logon", never a real age) or unreadable.
+    ``now`` is injected so the computation is deterministic and testable."""
+    if isinstance(pwdlastset, datetime):
+        set_at = pwdlastset if pwdlastset.tzinfo else pwdlastset.replace(tzinfo=UTC)
+    else:
+        try:
+            filetime = int(pwdlastset)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        if filetime <= 0:
+            return None
+        set_at = _FILETIME_EPOCH + timedelta(microseconds=filetime // 10)
+    age = (now - set_at).days
+    return age if age >= 0 else None
+
+
+def krbtgt_age_field(pwdlastset: object, now: datetime) -> dict[str, object] | None:
+    """The ``identity.krbtgt.rotation_stale`` field dict from a pwdLastSet value, or ``None`` to
+    abstain."""
+    age = parse_krbtgt_age_days(pwdlastset, now)
+    return None if age is None else {"krbtgt_password_age_days": age}
+
+
+def _query_krbtgt_pwdlastset(
+    host: str, port: int, credential: Credential, timeout: float
+) -> object:
+    """Bind to the DC over LDAPS, read the krbtgt account's pwdLastSet, and return it as ldap3 presents
+    it, or ``None`` when the account/attribute is absent. Synchronous (ldap3 is)."""
+    server = ldap3.Server(
+        host, port=port, use_ssl=True, tls=_tls(), get_info=ldap3.DSA, connect_timeout=timeout
+    )
+    connection = ldap3.Connection(
+        server,
+        user=credential.username,
+        password=credential.secret,
+        auto_bind=True,
+        receive_timeout=timeout,
+    )
+    try:
+        base = ""
+        if server.info and server.info.other:
+            contexts = server.info.other.get("defaultNamingContext") or server.info.naming_contexts
+            if contexts:
+                base = str(contexts[0])
+        if not base:
+            raise ldap3.core.exceptions.LDAPException("no defaultNamingContext on the directory")
+        connection.search(base, _KRBTGT_FILTER, attributes=["pwdLastSet"])
+        for entry in connection.entries:
+            return entry.pwdLastSet.value
+        return None
+    finally:
+        connection.unbind()
+
+
+async def fetch_krbtgt_pwdlastset(
+    host: str, credential: Credential, *, timeout: float, port: int = _LDAPS_PORT
+) -> object:
+    """The krbtgt account's pwdLastSet, read over LDAPS. Runs the synchronous ldap3 bind in a thread.
+    Raises on bind/search failure, which the caller records as honest UNAVAILABLE."""
+    return await asyncio.to_thread(_query_krbtgt_pwdlastset, host, port, credential, timeout)

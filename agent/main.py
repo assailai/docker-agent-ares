@@ -1816,44 +1816,78 @@ async def _collect_db_query_controls(
     return controls, coverage
 
 
+def _record_control(
+    target: str,
+    control_id: str,
+    fields: dict | None,
+    controls: list[dict],
+    coverage: list[dict],
+) -> None:
+    """Append a control's facts, or an UNSUPPORTED coverage entry when the parser abstained (``fields``
+    is ``None``)."""
+    if fields is None:
+        coverage.append(
+            assessment_collect.coverage_entry(
+                scope=f"{target}:{control_id}", state="unsupported", reason_code="no_parser"
+            )
+        )
+        return
+    controls.append(
+        assessment_collect.control_facts(control_id, fields, collection_complete=True)
+    )
+
+
 async def _collect_ldap_controls(
     job: dict, control_ids: list[str], credential, timeout_s: float
 ) -> tuple[list[dict], list[dict]]:
     """The identity (LDAP) tier: bind to the target domain controller over LDAPS with the ``ldap_bind``
-    reader credential, run a scoped read-only search, and normalise each requested control. A wrong
-    credential kind (not ldap_bind), or a failed bind/search, makes every requested control
-    UNAVAILABLE; a control this tier does not support is UNSUPPORTED."""
+    reader credential, run a scoped read-only search per control, and normalise each. A wrong
+    credential kind (not ldap_bind), or a failed bind/search, makes that search's controls UNAVAILABLE;
+    a control this tier does not support is UNSUPPORTED."""
     target = job["target_address"]
     if credential.kind != "ldap_bind":
         return [], _unavailable_coverage(
             target, control_ids, "wrong_credential_kind:expected_ldap_bind"
         )
-    try:
-        delegation_uac = await ldap_query.fetch_delegation_uac(
-            target, credential, timeout=timeout_s
-        )
-    except Exception as exc:  # noqa: BLE001 - any bind/search failure is honest UNAVAILABLE
-        return [], _unavailable_coverage(
-            target, control_ids, f"collect_failed:{type(exc).__name__}"
-        )
     controls: list[dict] = []
     coverage: list[dict] = []
-    for control_id in control_ids:
-        fields = (
-            ldap_query.unconstrained_delegation_field(delegation_uac)
-            if control_id == "identity.delegation.unconstrained"
-            else None
-        )
-        if fields is None:
-            coverage.append(
-                assessment_collect.coverage_entry(
-                    scope=f"{target}:{control_id}", state="unsupported", reason_code="no_parser"
-                )
+    delegation_ids = [cid for cid in control_ids if cid in ldap_query.DELEGATION_CONTROLS]
+    if delegation_ids:
+        try:
+            delegation_uac = await ldap_query.fetch_delegation_uac(
+                target, credential, timeout=timeout_s
             )
-            continue
-        controls.append(
-            assessment_collect.control_facts(control_id, fields, collection_complete=True)
-        )
+        except Exception as exc:  # noqa: BLE001 - any bind/search failure is honest UNAVAILABLE
+            coverage += _unavailable_coverage(
+                target, delegation_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            for control_id in delegation_ids:
+                fields = (
+                    ldap_query.unconstrained_delegation_field(delegation_uac)
+                    if control_id == "identity.delegation.unconstrained"
+                    else None
+                )
+                _record_control(target, control_id, fields, controls, coverage)
+    krbtgt_ids = [cid for cid in control_ids if cid in ldap_query.KRBTGT_CONTROLS]
+    if krbtgt_ids:
+        try:
+            pwdlastset = await ldap_query.fetch_krbtgt_pwdlastset(
+                target, credential, timeout=timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - any bind/search failure is honest UNAVAILABLE
+            coverage += _unavailable_coverage(
+                target, krbtgt_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            now = datetime.now(UTC)
+            for control_id in krbtgt_ids:
+                fields = (
+                    ldap_query.krbtgt_age_field(pwdlastset, now)
+                    if control_id == "identity.krbtgt.rotation_stale"
+                    else None
+                )
+                _record_control(target, control_id, fields, controls, coverage)
     return controls, coverage
 
 
