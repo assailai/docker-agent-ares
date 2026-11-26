@@ -205,6 +205,20 @@ def parse_mysql_listener_unrestricted(my_cnf: str) -> bool | None:
     return bind.lower() not in _MYSQL_ALL_INTERFACES
 
 
+# innodb_encrypt_tables values that turn tablespace (at-rest) encryption on. FORCE additionally refuses
+# unencrypted tables; ON encrypts by default.
+_MYSQL_ENCRYPT_ON = _MYSQL_TRUEY | {"force"}
+
+
+def parse_mysql_encryption_at_rest(my_cnf: str) -> bool | None:
+    """Whether MySQL/MariaDB at-rest (InnoDB tablespace) encryption is on, or ``None`` to abstain when
+    ``innodb_encrypt_tables`` is not set in ``[mysqld]`` (the effective value may be SET PERSISTed,
+    which this file read cannot see). ``ON``/``FORCE`` reads ``True``; ``OFF`` reads ``False`` (a
+    finding: data at rest is not encrypted)."""
+    value = _mysqld_values(my_cnf).get("innodb_encrypt_tables")
+    return None if value is None else value.lower() in _MYSQL_ENCRYPT_ON
+
+
 # One entry per (control_id, field): the ordered evidence sources it can be read from. A control that
 # more than one engine expresses (listener, client TLS) lists each engine's (source, extractor); the
 # first source that yields a value wins, and the others abstain because their engine's files are absent
@@ -220,6 +234,9 @@ _FIELD_EXTRACTORS: dict[tuple[str, str], list[tuple[str, object]]] = {
     ("database.client.tls", "client_tls_required"): [
         (SOURCE_PG_HBA, parse_db_client_tls_required),
         (SOURCE_MY_CNF, parse_mysql_client_tls_required),
+    ],
+    ("database.encryption.at_rest_disabled", "encryption_at_rest_enabled"): [
+        (SOURCE_MY_CNF, parse_mysql_encryption_at_rest),
     ],
 }
 

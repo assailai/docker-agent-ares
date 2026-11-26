@@ -127,3 +127,15 @@ def test_routing_and_collection() -> None:
         "client_tls_required": True
     }
     assert database_host.collect_control_fields(pg_only, "net.management.telnet") is None
+
+
+def test_mysql_at_rest_encryption_off_is_a_finding() -> None:
+    from agent.collectors import database_host as dh
+    assert dh.parse_mysql_encryption_at_rest("[mysqld]\ninnodb_encrypt_tables = OFF") is False
+    assert dh.parse_mysql_encryption_at_rest("[mysqld]\ninnodb_encrypt_tables = ON") is True
+    assert dh.parse_mysql_encryption_at_rest("[mysqld]\ninnodb_encrypt_tables = FORCE") is True
+    # absent -> abstain (effective value may be SET PERSISTed)
+    assert dh.parse_mysql_encryption_at_rest("[mysqld]\nbind-address = 0.0.0.0") is None
+    assert dh.serves("database.encryption.at_rest_disabled") is True
+    assert dh.collect_control_fields({"my_cnf": "[mysqld]\ninnodb_encrypt_tables = OFF"},
+                                     "database.encryption.at_rest_disabled") == {"encryption_at_rest_enabled": False}
