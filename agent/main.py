@@ -1791,6 +1791,29 @@ async def _collect_kube_controls(
     return controls, coverage
 
 
+async def _collect_kube_probe_controls(
+    job: dict, control_ids: list[str], timeout_s: float
+) -> tuple[list[dict], list[dict]]:
+    """The no-credential Kubernetes PROBE tier: check whether the API server accepts the anonymous
+    identity, WITHOUT any token (a GET to the API root with no Authorization header). Needs no local
+    credential; a failed probe (unreachable) makes the control UNAVAILABLE."""
+    target = job["target_address"]
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    for control_id in control_ids:
+        try:
+            if control_id == "kubernetes.api.anonymous":
+                enabled = await kube_collect.fetch_anonymous_auth(target, timeout=timeout_s)
+                fields = kube_collect.anonymous_auth_field(enabled)
+            else:
+                fields = None
+        except Exception as exc:  # noqa: BLE001 - a failed probe is honest UNAVAILABLE
+            coverage += _unavailable_coverage(target, [control_id], f"probe_failed:{type(exc).__name__}")
+            continue
+        _record_control(target, control_id, fields, controls, coverage)
+    return controls, coverage
+
+
 async def _collect_db_query_controls(
     job: dict, control_ids: list[str], credential, timeout_s: float
 ) -> tuple[list[dict], list[dict]]:
@@ -2010,11 +2033,27 @@ async def _collect_controls(
     the host's own config, a ``kubernetes.*`` control from the API server (token-authenticated LIST),
     every other control from the device running-config. Each transport is opened at most once and only
     when a control needs it, so a host-only job never dials for a running-config it would not use. No
-    local credential makes every requested control UNAVAILABLE (honest coverage), never a guess."""
+    local credential makes every CREDENTIALED control UNAVAILABLE (honest coverage), never a guess;
+    an unauthenticated PROBE control (the anonymous-auth check) runs with no credential."""
     target = job["target_address"]
-    if credential is None:
-        return [], _unavailable_coverage(target, control_ids, "no_local_credential"), []
     timeout_s, max_bytes = _effective_collect_budget(job)
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    neighbours: list[dict] = []
+    # Unauthenticated probe controls run WITHOUT a credential and are not subject to the no-credential
+    # gate below.
+    probe_ids = [cid for cid in control_ids if kube_collect.probes(cid)]
+    if probe_ids:
+        probe_controls, probe_coverage = await _collect_kube_probe_controls(job, probe_ids, timeout_s)
+        controls += probe_controls
+        coverage += probe_coverage
+    credentialed_ids = [cid for cid in control_ids if not kube_collect.probes(cid)]
+    if not credentialed_ids:
+        return controls, coverage, neighbours
+    if credential is None:
+        coverage += _unavailable_coverage(target, credentialed_ids, "no_local_credential")
+        return controls, coverage, neighbours
+    control_ids = credentialed_ids
     host_ids = [cid for cid in control_ids if host_tier.serves(cid)]
     kube_ids = [cid for cid in control_ids if kube_collect.serves(cid)]
     db_query_ids = [cid for cid in control_ids if db_query.serves(cid)]
@@ -2035,15 +2074,13 @@ async def _collect_controls(
         and not backup_collect.serves(cid)
         and not mail_dns.serves(cid)
     ]
-    controls: list[dict] = []
-    coverage: list[dict] = []
-    neighbours: list[dict] = []
     if network_ids:
-        net_controls, net_coverage, neighbours = await _collect_network_controls(
+        net_controls, net_coverage, net_neighbours = await _collect_network_controls(
             job, network_ids, credential, timeout_s, max_bytes
         )
         controls += net_controls
         coverage += net_coverage
+        neighbours += net_neighbours
     if host_ids:
         host_controls, host_coverage = await _collect_host_controls(
             job, host_ids, credential, timeout_s, max_bytes

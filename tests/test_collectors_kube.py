@@ -168,3 +168,11 @@ def test_namespace_serves_and_field() -> None:
         "pod_security_admission_enforced": True
     }
     assert kube_collect.pod_security_field({"items": "nope"}) is None
+def test_anonymous_auth_field_and_serves() -> None:
+    from agent.collectors import kube_collect as kc
+    assert kc.serves("kubernetes.api.anonymous") is False  # a probe, not the token tier
+    assert kc.probes("kubernetes.api.anonymous") is True
+    # the probe returns True when the API did NOT answer 401 (anonymous accepted)
+    assert kc.anonymous_auth_field(True) == {"anonymous_auth_enabled": True}
+    assert kc.anonymous_auth_field(False) == {"anonymous_auth_enabled": False}
+    assert kc.anonymous_auth_field("x") is None

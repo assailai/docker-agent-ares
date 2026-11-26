@@ -18,6 +18,10 @@ coroutine so the handler is testable by monkeypatching the fetch.
 
 from __future__ import annotations
 
+import ssl
+
+import httpx
+
 from agent.kubeinfo import KubeApi
 
 # The kubernetes controls this collector reads from the authenticated API, grouped by the resource
@@ -26,6 +30,10 @@ POD_CONTROLS = frozenset({"kubernetes.workload.privileged"})
 NETPOL_CONTROLS = frozenset({"kubernetes.network.no_default_deny"})
 NAMESPACE_CONTROLS = frozenset({"kubernetes.admission.pod_security_disabled"})
 SERVES = POD_CONTROLS | NETPOL_CONTROLS | NAMESPACE_CONTROLS
+# Probed WITHOUT the token, so NOT part of the authenticated LIST tier (SERVES): whether the API
+# server accepts the anonymous identity at all. A separate `probes()` predicate so the dispatcher
+# runs it as a no-credential probe, not through the k8s_token tier.
+PROBE_CONTROLS = frozenset({"kubernetes.api.anonymous"})
 
 # Pod Security admission enforce levels that actually restrict workloads; "privileged" (or an absent
 # label) does not enforce.
@@ -47,8 +55,15 @@ _API_PORT = 6443
 
 
 def serves(control_id: str) -> bool:
-    """Whether this collector reads ``control_id`` from the Kubernetes API."""
+    """Whether this collector reads ``control_id`` from the Kubernetes API with the token (the
+    authenticated LIST tier). The anonymous-auth probe is NOT here: it uses no credential."""
     return control_id in SERVES
+
+
+def probes(control_id: str) -> bool:
+    """Whether ``control_id`` is a no-credential Kubernetes PROBE (the anonymous-auth check), run
+    without the token rather than through the authenticated LIST tier."""
+    return control_id in PROBE_CONTROLS
 
 
 def _is_privileged(container: object) -> bool:
@@ -207,3 +222,30 @@ def privileged_workloads_field(pods: dict) -> dict[str, object] | None:
     """The ``kubernetes.workload.privileged`` field dict from a pod list, or ``None`` to abstain."""
     count = parse_privileged_workloads(pods)
     return None if count is None else {"privileged_workloads": count}
+
+
+def anonymous_auth_field(anonymous_enabled: object) -> dict[str, object] | None:
+    """The ``kubernetes.api.anonymous`` field dict from the anonymous-auth probe result, or ``None``
+    to abstain when the probe did not return a boolean."""
+    if not isinstance(anonymous_enabled, bool):
+        return None
+    return {"anonymous_auth_enabled": anonymous_enabled}
+
+
+async def fetch_anonymous_auth(target: str, *, timeout: float, verify: str | bool = False) -> bool:
+    """Whether the API server accepts the ANONYMOUS identity, probed WITHOUT a token: a GET to the
+    API root with no Authorization header. ``401 Unauthorized`` means anonymous is rejected
+    (disabled); any other status (``200``/``403``) means the request was processed as
+    ``system:anonymous`` (enabled). ``verify`` is False because the API serves its own CA-signed cert,
+    exactly as the token path; the probe sends no credential, so there is nothing to protect on the
+    wire. Raises on connect failure, which the caller records as honest UNAVAILABLE."""
+    url = f"https://{target}:{_API_PORT}/api"
+    verify_arg: ssl.SSLContext | str | bool = verify
+    if verify is False:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        verify_arg = ctx
+    async with httpx.AsyncClient(verify=verify_arg, timeout=timeout) as client:
+        response = await client.get(url, headers={"Accept": "application/json"})
+    return response.status_code != 401
