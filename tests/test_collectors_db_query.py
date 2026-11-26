@@ -41,3 +41,17 @@ def test_serves_and_field_dict() -> None:
         "dangerous_extensions_enabled": 1
     }
     assert db_query.dangerous_extensions_field("nope") is None
+
+
+def test_engine_eol_count_flags_below_the_supported_floor() -> None:
+    from agent.collectors import db_query as dq
+    assert dq.parse_engine_eol_count(120022) == 1   # PostgreSQL 12 -> EOL
+    assert dq.parse_engine_eol_count(130010) == 1   # 13 -> EOL
+    assert dq.parse_engine_eol_count(140008) == 0   # 14 -> supported
+    assert dq.parse_engine_eol_count(170004) == 0   # 17 -> supported
+    assert dq.parse_engine_eol_count("120022") == 1  # string form coerced
+    assert dq.parse_engine_eol_count(0) is None
+    assert dq.parse_engine_eol_count("nope") is None
+    assert dq.serves("database.lifecycle.unsupported_engine") is True
+    assert dq.engine_eol_field(120022) == {"end_of_life_engine_or_extensions": 1}
+    assert dq.engine_eol_field(170004) == {"end_of_life_engine_or_extensions": 0}

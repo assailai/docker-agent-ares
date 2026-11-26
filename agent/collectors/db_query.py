@@ -21,7 +21,15 @@ import pg8000.native
 
 from agent.credential_vault import Credential
 
-SERVES = frozenset({"database.extension.dangerous_enabled"})
+SERVES = frozenset(
+    {"database.extension.dangerous_enabled", "database.lifecycle.unsupported_engine"}
+)
+
+# The oldest PostgreSQL major still receiving upstream fixes. Anything below it is end-of-life. A
+# bundled reference (the EOL calendar is public), dated so it is refreshed deliberately: as of
+# 2026-11-26 PostgreSQL 13 and below are EOL (13 reached EOL 2025-11-13), so 14 is the floor.
+_POSTGRES_MIN_SUPPORTED_MAJOR = 14
+_SERVER_VERSION_QUERY = "SELECT current_setting('server_version_num')"
 
 # Extensions whose mere presence confers code execution, server-file access, or arbitrary outbound
 # connections from inside the database: the untrusted procedural languages and the foreign-data /
@@ -117,4 +125,61 @@ async def fetch_extension_names(
     which the caller records as honest UNAVAILABLE."""
     return await asyncio.to_thread(
         _query_extension_names, host, port, credential, database, timeout
+    )
+
+
+def parse_engine_eol_count(server_version_num: object) -> int | None:
+    """The number of end-of-life engine components (1 when the PostgreSQL major is below the supported
+    floor, else 0), or ``None`` to abstain when the version is unreadable. ``server_version_num`` is
+    PostgreSQL's integer form (e.g. 120022 for 12.22), whose major is the value over 10000 on every
+    release this tier reaches (10+)."""
+    try:
+        version_num = int(server_version_num)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if version_num <= 0:
+        return None
+    major = version_num // 10000
+    return 1 if major < _POSTGRES_MIN_SUPPORTED_MAJOR else 0
+
+
+def engine_eol_field(server_version_num: object) -> dict[str, object] | None:
+    """The ``database.lifecycle.unsupported_engine`` field dict, or ``None`` to abstain."""
+    count = parse_engine_eol_count(server_version_num)
+    return None if count is None else {"end_of_life_engine_or_extensions": count}
+
+
+def _query_server_version_num(
+    host: str, port: int, credential: Credential, database: str, timeout: float
+) -> object:
+    """Open ONE read-only TLS connection and return the server's integer version number. Synchronous
+    (pg8000 is), so the caller runs it in a thread."""
+    connection = pg8000.native.Connection(
+        user=credential.username,
+        password=credential.secret,
+        host=host,
+        port=port,
+        database=database,
+        ssl_context=_tls_context(),
+        timeout=timeout,
+    )
+    try:
+        rows = connection.run(_SERVER_VERSION_QUERY)
+        return rows[0][0] if rows and rows[0] else None
+    finally:
+        connection.close()
+
+
+async def fetch_server_version_num(
+    host: str,
+    credential: Credential,
+    *,
+    timeout: float,
+    port: int = _DEFAULT_PORT,
+    database: str = _DEFAULT_DATABASE,
+) -> object:
+    """The target database's integer server version, read over TLS (for the engine-lifecycle control).
+    Raises on connect/auth/query failure, which the caller records as honest UNAVAILABLE."""
+    return await asyncio.to_thread(
+        _query_server_version_num, host, port, credential, database, timeout
     )

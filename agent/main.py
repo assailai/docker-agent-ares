@@ -1804,22 +1804,52 @@ async def _collect_db_query_controls(
         return [], _unavailable_coverage(
             target, control_ids, "wrong_credential_kind:expected_db_login"
         )
-    try:
-        extension_names = await db_query.fetch_extension_names(
-            target, credential, timeout=timeout_s
-        )
-    except Exception as exc:  # noqa: BLE001 - any connect/auth/query failure is honest UNAVAILABLE
-        return [], _unavailable_coverage(
-            target, control_ids, f"collect_failed:{type(exc).__name__}"
-        )
+    # Fetch each read-only query at most once, and only when a requested control needs it. A query that
+    # fails marks the controls that depend on it UNAVAILABLE, while controls on a query that succeeded
+    # are still assessed.
+    extension_names: list[str] | None = None
+    ext_failed: str | None = None
+    if "database.extension.dangerous_enabled" in control_ids:
+        try:
+            extension_names = await db_query.fetch_extension_names(
+                target, credential, timeout=timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - any failure is honest UNAVAILABLE
+            ext_failed = f"collect_failed:{type(exc).__name__}"
+    version_num: object = None
+    version_failed: str | None = None
+    if "database.lifecycle.unsupported_engine" in control_ids:
+        try:
+            version_num = await db_query.fetch_server_version_num(
+                target, credential, timeout=timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - any failure is honest UNAVAILABLE
+            version_failed = f"collect_failed:{type(exc).__name__}"
     controls: list[dict] = []
     coverage: list[dict] = []
     for control_id in control_ids:
-        fields = (
-            db_query.dangerous_extensions_field(extension_names)
-            if control_id == "database.extension.dangerous_enabled"
-            else None
-        )
+        if control_id == "database.extension.dangerous_enabled":
+            if ext_failed:
+                coverage.append(
+                    assessment_collect.coverage_entry(
+                        scope=f"{target}:{control_id}", state="unavailable", reason_code=ext_failed
+                    )
+                )
+                continue
+            fields = db_query.dangerous_extensions_field(extension_names)
+        elif control_id == "database.lifecycle.unsupported_engine":
+            if version_failed:
+                coverage.append(
+                    assessment_collect.coverage_entry(
+                        scope=f"{target}:{control_id}",
+                        state="unavailable",
+                        reason_code=version_failed,
+                    )
+                )
+                continue
+            fields = db_query.engine_eol_field(version_num)
+        else:
+            fields = None
         if fields is None:
             coverage.append(
                 assessment_collect.coverage_entry(
