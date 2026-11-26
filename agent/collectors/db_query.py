@@ -22,7 +22,35 @@ import pg8000.native
 from agent.credential_vault import Credential
 
 SERVES = frozenset(
-    {"database.extension.dangerous_enabled", "database.lifecycle.unsupported_engine"}
+    {
+        "database.extension.dangerous_enabled",
+        "database.lifecycle.unsupported_engine",
+        "database.config.baseline_drift",
+    }
+)
+
+# A baseline-comparison control: the agent reports the CURRENT value of each monitored security
+# setting as a ``name=value`` string and leaves the ``policy_approved`` gate for the control plane,
+# which diffs the observed set against the tenant's approved baseline (the agent has no baseline, and
+# the control is drift from the APPROVED values, not from a fixed benchmark). A setting whose current
+# value is not among the approved ones counts as drift.
+BASELINE_CONTROLS = frozenset({"database.config.baseline_drift"})
+
+# The security-relevant settings this tier watches for drift. A FIXED, documented reference (the
+# monitoring SCOPE, not a secure value: the tenant's baseline supplies the approved values), exactly
+# as ``_DANGEROUS_EXTENSIONS`` is a fixed reference. "Not a full benchmark sweep" (the catalog says
+# so): a small, unambiguous set a tenant would baseline. Extend by adding a name here.
+_MONITORED_SECURITY_SETTINGS = (
+    "ssl",
+    "log_connections",
+    "log_disconnections",
+    "password_encryption",
+    "log_statement",
+)
+_SECURITY_SETTINGS_QUERY = (
+    "SELECT name, setting FROM pg_settings WHERE name IN ("
+    + ",".join(f"'{name}'" for name in _MONITORED_SECURITY_SETTINGS)
+    + ")"
 )
 
 # The oldest PostgreSQL major still receiving upstream fixes. Anything below it is end-of-life. A
@@ -183,3 +211,56 @@ async def fetch_server_version_num(
     return await asyncio.to_thread(
         _query_server_version_num, host, port, credential, database, timeout
     )
+
+
+def _query_security_settings(
+    host: str, port: int, credential: Credential, database: str, timeout: float
+) -> dict[str, str]:
+    """Open ONE read-only TLS connection and return the monitored settings as a ``{name: value}`` map.
+    Synchronous (pg8000 is), so the caller runs it in a thread."""
+    connection = pg8000.native.Connection(
+        user=credential.username,
+        password=credential.secret,
+        host=host,
+        port=port,
+        database=database,
+        ssl_context=_tls_context(),
+        timeout=timeout,
+    )
+    try:
+        rows = connection.run(_SECURITY_SETTINGS_QUERY)
+        return {
+            str(row[0]): str(row[1])
+            for row in rows
+            if row and row[0] is not None and row[1] is not None
+        }
+    finally:
+        connection.close()
+
+
+async def fetch_security_settings(
+    host: str,
+    credential: Credential,
+    *,
+    timeout: float,
+    port: int = _DEFAULT_PORT,
+    database: str = _DEFAULT_DATABASE,
+) -> dict[str, str]:
+    """The current values of the monitored security settings, read over TLS (for the config-drift
+    control). Runs the synchronous pg8000 query in a thread. Raises on connect/auth/query failure,
+    which the caller records as honest UNAVAILABLE."""
+    return await asyncio.to_thread(
+        _query_security_settings, host, port, credential, database, timeout
+    )
+
+
+def security_settings_field(settings: object) -> dict[str, object] | None:
+    """The observed-set field the agent sends for ``database.config.baseline_drift``: each monitored
+    setting's CURRENT state as a sorted ``name=value`` string, under the wire key the control plane's
+    approved-policy normalizer reads. The control plane diffs this against the tenant's approved
+    ``name=value`` set; a setting whose current value is not approved is drift. Abstains (``None``)
+    when the input is not a settings map."""
+    if not isinstance(settings, dict):
+        return None
+    observed = sorted(f"{name}={value}" for name, value in settings.items())
+    return {"observed_db_settings": observed}

@@ -55,3 +55,29 @@ def test_engine_eol_count_flags_below_the_supported_floor() -> None:
     assert dq.serves("database.lifecycle.unsupported_engine") is True
     assert dq.engine_eol_field(120022) == {"end_of_life_engine_or_extensions": 1}
     assert dq.engine_eol_field(170004) == {"end_of_life_engine_or_extensions": 0}
+
+
+# ── security settings drift (database.config.baseline_drift, a baseline-comparison control) ────────
+def test_security_settings_field_encodes_name_value_pairs() -> None:
+    settings = {"ssl": "off", "log_connections": "on", "password_encryption": "md5"}
+    assert db_query.security_settings_field(settings) == {
+        "observed_db_settings": ["log_connections=on", "password_encryption=md5", "ssl=off"]
+    }
+
+
+def test_security_settings_field_abstains_on_non_dict() -> None:
+    assert db_query.security_settings_field(None) is None
+    assert db_query.security_settings_field("nope") is None
+
+
+def test_baseline_drift_served_and_baseline() -> None:
+    assert db_query.serves("database.config.baseline_drift") is True
+    assert "database.config.baseline_drift" in db_query.BASELINE_CONTROLS
+    # a factual-absolute db control is NOT a baseline control.
+    assert "database.extension.dangerous_enabled" not in db_query.BASELINE_CONTROLS
+
+
+def test_monitored_settings_query_names_only_the_fixed_set() -> None:
+    # the query is built from the fixed reference, so no injection surface and a stable scope.
+    for name in db_query._MONITORED_SECURITY_SETTINGS:
+        assert f"'{name}'" in db_query._SECURITY_SETTINGS_QUERY

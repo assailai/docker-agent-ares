@@ -1880,6 +1880,15 @@ async def _collect_db_query_controls(
             )
         except Exception as exc:  # noqa: BLE001 - any failure is honest UNAVAILABLE
             version_failed = f"collect_failed:{type(exc).__name__}"
+    settings: object = None
+    settings_failed: str | None = None
+    if "database.config.baseline_drift" in control_ids:
+        try:
+            settings = await db_query.fetch_security_settings(
+                target, credential, timeout=timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - any failure is honest UNAVAILABLE
+            settings_failed = f"collect_failed:{type(exc).__name__}"
     controls: list[dict] = []
     coverage: list[dict] = []
     for control_id in control_ids:
@@ -1903,6 +1912,17 @@ async def _collect_db_query_controls(
                 )
                 continue
             fields = db_query.engine_eol_field(version_num)
+        elif control_id == "database.config.baseline_drift":
+            if settings_failed:
+                coverage.append(
+                    assessment_collect.coverage_entry(
+                        scope=f"{target}:{control_id}",
+                        state="unavailable",
+                        reason_code=settings_failed,
+                    )
+                )
+                continue
+            fields = db_query.security_settings_field(settings)
         else:
             fields = None
         if fields is None:
@@ -1912,8 +1932,15 @@ async def _collect_db_query_controls(
                 )
             )
             continue
+        # A baseline-comparison control (database.config.baseline_drift) sends the RAW observed set
+        # and leaves the policy gate for the control plane to earn from the tenant baseline.
         controls.append(
-            assessment_collect.control_facts(control_id, fields, collection_complete=True)
+            assessment_collect.control_facts(
+                control_id,
+                fields,
+                collection_complete=True,
+                include_policy_gate=control_id not in db_query.BASELINE_CONTROLS,
+            )
         )
     return controls, coverage
 
