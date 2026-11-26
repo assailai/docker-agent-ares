@@ -16,10 +16,23 @@ antiphish controls are cloud-mail-tenant APIs. All of those stay DESIGNED.
 
 from __future__ import annotations
 
-# The evidence source this collector reads, and the ssh_collect reader that produces it.
-SOURCE_POSTFIX = "postfix_maincf"
+import re
 
-SOURCE_READERS = {SOURCE_POSTFIX: "collect_postfix_main_cf"}
+# The evidence sources this collector reads, and the ssh_collect readers that produce them.
+SOURCE_POSTFIX = "postfix_maincf"
+SOURCE_POSTFIX_VERSION = "postfix_version"
+
+SOURCE_READERS = {
+    SOURCE_POSTFIX: "collect_postfix_main_cf",
+    SOURCE_POSTFIX_VERSION: "collect_postfix_version",
+}
+
+# The oldest Postfix minor release still receiving upstream fixes; a release below it is end-of-life.
+# Postfix maintains roughly the four most recent stable releases and retires the oldest as each new one
+# ships. A dated, documented reference (like the database-engine floor): as of 2026-11-26 the supported
+# line is 3.6..3.9, so 3.6 is the floor. The Postfix SERVER version only; a mail gateway or other
+# component's lifecycle is a separate control (the catalog says so), so this never over-reports.
+_POSTFIX_MIN_SUPPORTED = (3, 6)
 
 # Directives that mark the text as a genuine Postfix main.cf, so unrelated bytes abstain.
 _POSTFIX_MARKERS = (
@@ -84,6 +97,18 @@ def parse_mail_inbound_tls_enforced(postfix_main_cf: str) -> bool | None:
 
 
 # One entry per (control_id, field): the evidence source it reads and the extractor.
+def parse_mail_eol_count(version_output: str) -> int | None:
+    """The number of end-of-life mail components (1 when the Postfix major.minor is below the supported
+    floor, else 0), or ``None`` to abstain when the version is unreadable. Reads the Postfix SERVER
+    version only (``postconf -h mail_version``, e.g. ``3.7.11``); a mail gateway's lifecycle is a
+    separate control. Mirrors the database-engine EOL control."""
+    match = re.search(r"(\d+)\.(\d+)", version_output or "")
+    if not match:
+        return None
+    version = (int(match.group(1)), int(match.group(2)))
+    return 1 if version < _POSTFIX_MIN_SUPPORTED else 0
+
+
 _FIELD_EXTRACTORS = {
     ("mail.auth.legacy", "legacy_smtp_auth_enabled"): (
         SOURCE_POSTFIX,
@@ -92,6 +117,10 @@ _FIELD_EXTRACTORS = {
     ("mail.tls.inbound_not_enforced", "inbound_tls_enforced"): (
         SOURCE_POSTFIX,
         parse_mail_inbound_tls_enforced,
+    ),
+    ("mail.lifecycle.unsupported_gateway", "end_of_life_mail_components"): (
+        SOURCE_POSTFIX_VERSION,
+        parse_mail_eol_count,
     ),
 }
 

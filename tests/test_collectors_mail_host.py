@@ -62,3 +62,28 @@ def test_routing_and_collection() -> None:
         "inbound_tls_enforced": True
     }
     assert mail_host.collect_control_fields(sources, "net.management.telnet") is None
+
+
+# ── postfix lifecycle (mail.lifecycle.unsupported_gateway) ─────────────────────────────────────────
+def test_mail_eol_counts_a_version_below_the_floor() -> None:
+    assert mail_host.parse_mail_eol_count("3.5.0") == 1  # below 3.6 -> EOL
+    assert mail_host.parse_mail_eol_count("2.11.0") == 1  # old major -> EOL
+
+
+def test_mail_eol_supported_version_reads_zero() -> None:
+    assert mail_host.parse_mail_eol_count("3.7.11") == 0  # the lab's version, still supported
+    assert mail_host.parse_mail_eol_count("3.6.0") == 0  # exactly at the floor
+    assert mail_host.parse_mail_eol_count("3.9.1") == 0
+
+
+def test_mail_eol_abstains_on_unreadable_version() -> None:
+    assert mail_host.parse_mail_eol_count("") is None
+    assert mail_host.parse_mail_eol_count("not a version") is None
+
+
+def test_mail_lifecycle_served_and_field() -> None:
+    assert mail_host.serves("mail.lifecycle.unsupported_gateway") is True
+    fields = mail_host.collect_control_fields(
+        {"postfix_version": "3.5.9"}, "mail.lifecycle.unsupported_gateway"
+    )
+    assert fields == {"end_of_life_mail_components": 1}
