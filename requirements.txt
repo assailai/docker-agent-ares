@@ -41,3 +41,9 @@ asyncssh==2.24.1
 # extra build toolchain and the wheel is platform-independent. Transitive: scramp (SCRAM auth) and
 # asn1crypto, both pure-Python.
 pg8000==1.31.2
+
+# LDAP client for the credentialed IDENTITY collect tier (agent/collectors/ldap_query.py): a
+# read-only LDAPS bind + scoped search of an Active Directory domain controller under a reader login
+# from the local vault. Deliberately ldap3, the PURE-PYTHON client (depends only on pyasn1, also
+# pure-Python), so the Alpine image needs no OpenLDAP C libraries, unlike python-ldap.
+ldap3==2.9.1
