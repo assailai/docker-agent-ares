@@ -108,8 +108,11 @@ def _read_bucket_posture(host: str, port: int, credential: Credential, timeout: 
             object_lock_enabled = False
         encryption_enabled = False
         try:
-            client.get_bucket_encryption(bucket.name)
-            encryption_enabled = True
+            config = client.get_bucket_encryption(bucket.name)
+            # A non-exception does NOT prove encryption: real S3/MinIO raise when none is configured,
+            # but some stores (SeaweedFS) return an empty config (``None`` / no rule) without raising.
+            # Encryption is enabled only when the returned config actually carries an SSE rule.
+            encryption_enabled = config is not None and getattr(config, "rule", None) is not None
         except Exception:  # noqa: BLE001 - "no encryption configuration" is read as False
             encryption_enabled = False
         posture.append(
