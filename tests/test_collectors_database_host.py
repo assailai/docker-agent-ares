@@ -76,15 +76,54 @@ def test_socket_only_pg_hba_abstains() -> None:
     assert database_host.parse_db_listener_unrestricted("not a pg_hba file\n") is None
 
 
+# ── my.cnf (MySQL / MariaDB) ──────────────────────────────────────────────────────────────────────
+def test_mysql_require_secure_transport_on_is_tls_required() -> None:
+    assert (
+        database_host.parse_mysql_client_tls_required("[mysqld]\nrequire_secure_transport = ON\n")
+        is True
+    )
+    assert (
+        database_host.parse_mysql_client_tls_required("[mysqld]\nrequire_secure_transport = OFF\n")
+        is False
+    )
+
+
+def test_mysql_bind_all_interfaces_is_unrestricted() -> None:
+    assert database_host.parse_mysql_listener_unrestricted("[mysqld]\nbind-address = 0.0.0.0\n") is False
+    assert database_host.parse_mysql_listener_unrestricted("[mysqld]\nbind-address = 127.0.0.1\n") is True
+    # skip-networking disables TCP entirely: the listener is not network-reachable (restricted).
+    assert database_host.parse_mysql_listener_unrestricted("[mysqld]\nskip-networking\n") is True
+
+
+def test_mysql_abstains_outside_mysqld_section_or_when_absent() -> None:
+    # A bind-address in [client] is a tool default, not the server posture: abstain.
+    assert database_host.parse_mysql_listener_unrestricted("[client]\nbind-address = 0.0.0.0\n") is None
+    assert database_host.parse_mysql_listener_unrestricted("[mysqld]\nmax_connections = 100\n") is None
+    assert database_host.parse_mysql_client_tls_required("not a my.cnf\n") is None
+
+
 def test_routing_and_collection() -> None:
     assert database_host.serves("database.audit.logging_disabled") is True
     assert database_host.serves("database.listener.unrestricted") is True
     assert database_host.serves("database.client.tls") is True
     assert database_host.serves("server.ssh.password") is False
     assert database_host.source_for("database.audit.logging_disabled") == database_host.SOURCE_PG_CONF
-    assert database_host.source_for("database.client.tls") == database_host.SOURCE_PG_HBA
-    sources = {database_host.SOURCE_PG_HBA: "host all all 0.0.0.0/0 md5\n"}
-    assert database_host.collect_control_fields(sources, "database.client.tls") == {
+    # The shared controls read from BOTH engines' sources; whichever engine's config is present wins.
+    assert database_host.sources_for_control("database.client.tls") == {
+        database_host.SOURCE_PG_HBA,
+        database_host.SOURCE_MY_CNF,
+    }
+    assert database_host.sources_for_control("database.audit.logging_disabled") == {
+        database_host.SOURCE_PG_CONF
+    }
+    # Postgres host (only pg_hba present): answered by the pg parser.
+    pg_only = {database_host.SOURCE_PG_HBA: "host all all 0.0.0.0/0 md5\n"}
+    assert database_host.collect_control_fields(pg_only, "database.client.tls") == {
         "client_tls_required": False
     }
-    assert database_host.collect_control_fields(sources, "net.management.telnet") is None
+    # MySQL host (only my.cnf present): the pg parser abstains, the mysql parser answers.
+    mysql_only = {database_host.SOURCE_MY_CNF: "[mysqld]\nrequire_secure_transport = ON\n"}
+    assert database_host.collect_control_fields(mysql_only, "database.client.tls") == {
+        "client_tls_required": True
+    }
+    assert database_host.collect_control_fields(pg_only, "net.management.telnet") is None

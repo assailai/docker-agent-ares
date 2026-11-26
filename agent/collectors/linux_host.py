@@ -547,6 +547,13 @@ def source_for(control_id: str) -> str | None:
     return extractors[0][1] if extractors else None
 
 
+def sources_for_control(control_id: str) -> set[str]:
+    """The evidence sources ``control_id`` reads (one for this collector; the host tier aggregates the
+    set across families, where a control may read more than one)."""
+    source = source_for(control_id)
+    return {source} if source is not None else set()
+
+
 def sources_for(control_ids: list[str]) -> set[str]:
     """The distinct evidence sources needed to collect the host controls among ``control_ids``, so the
     agent runs each host command at most once."""

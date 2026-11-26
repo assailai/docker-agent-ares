@@ -16,13 +16,18 @@ host-config tier. MySQL/MariaDB (a different config grammar) is a future sibling
 
 from __future__ import annotations
 
-# The two evidence sources this collector reads, and the ssh_collect readers that produce them.
+# The evidence sources this collector reads, and the ssh_collect readers that produce them. PostgreSQL
+# and MySQL/MariaDB are different engines with different config grammars, so each has its own source;
+# a host runs at most one, and the other source simply reads empty (the engine's files are absent), so
+# the engine-specific parser for the missing engine abstains and the present one answers.
 SOURCE_PG_CONF = "pg_conf"
 SOURCE_PG_HBA = "pg_hba"
+SOURCE_MY_CNF = "my_cnf"
 
 SOURCE_READERS = {
     SOURCE_PG_CONF: "collect_postgres_conf",
     SOURCE_PG_HBA: "collect_postgres_hba",
+    SOURCE_MY_CNF: "collect_mysql_conf",
 }
 
 # A directive that marks the text as a genuine postgresql.conf, so unrelated bytes abstain rather than
@@ -142,53 +147,123 @@ def parse_db_client_tls_required(pg_hba: str) -> bool | None:
     return not any(row[0].lower() in _PG_HBA_PLAINTEXT_TYPES for row in tcp_rows)
 
 
-# One entry per (control_id, field): the evidence source it reads and the extractor.
-_FIELD_EXTRACTORS = {
-    ("database.audit.logging_disabled", "privilege_and_ddl_auditing_enabled"): (
-        SOURCE_PG_CONF,
-        parse_db_audit_logging_enabled,
-    ),
-    ("database.listener.unrestricted", "listener_restricted_to_intended_clients"): (
-        SOURCE_PG_HBA,
-        parse_db_listener_unrestricted,
-    ),
-    ("database.client.tls", "client_tls_required"): (
-        SOURCE_PG_HBA,
-        parse_db_client_tls_required,
-    ),
+# ── my.cnf (MySQL / MariaDB server config) ────────────────────────────────────────────────────────
+# INI-style with a [mysqld] section. These controls read that section only ([client]/[mysql] are tool
+# defaults, not the server posture). A host with no my.cnf reads empty and every MySQL parser abstains,
+# so a PostgreSQL host is answered by the pg parsers instead (and vice versa).
+_MYSQL_MARKER_SECTION = "[mysqld]"
+_MYSQL_TRUEY = frozenset({"on", "1", "true", "yes"})
+_MYSQL_ALL_INTERFACES = frozenset({"0.0.0.0", "::", "*"})
+
+
+def _mysqld_values(my_cnf: str) -> dict[str, str]:
+    """The ``[mysqld]`` section of my.cnf as a ``{key: value}`` map, keys lower-cased with ``-``
+    normalized to ``_`` (my.cnf treats them alike), inline comments stripped, a bare flag mapping to
+    the empty string. Returns an empty map when the text has no ``[mysqld]`` section, which makes every
+    field abstain."""
+    values: dict[str, str] = {}
+    in_mysqld = False
+    seen_mysqld = False
+    for raw in my_cnf.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";", "!")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            in_mysqld = line.lower() == _MYSQL_MARKER_SECTION
+            seen_mysqld = seen_mysqld or in_mysqld
+            continue
+        if not in_mysqld:
+            continue
+        key, sep, rest = line.partition("=")
+        key = key.strip().lower().replace("-", "_")
+        value = rest.split("#", 1)[0].strip().strip("'\"") if sep else ""
+        if key:
+            values[key] = value
+    return values if seen_mysqld else {}
+
+
+def parse_mysql_client_tls_required(my_cnf: str) -> bool | None:
+    """Whether MySQL requires clients to use TLS (``require_secure_transport = ON``), or ``None`` to
+    abstain when the directive is not in ``[mysqld]`` (the effective value may be SET PERSISTed, which
+    this file read cannot see). The field is the required sense, so OFF reads ``False`` (a finding)."""
+    value = _mysqld_values(my_cnf).get("require_secure_transport")
+    return None if value is None else value.lower() in _MYSQL_TRUEY
+
+
+def parse_mysql_listener_unrestricted(my_cnf: str) -> bool | None:
+    """Whether the MySQL listener is restricted to intended clients, or ``None`` to abstain when
+    neither ``bind-address`` nor ``skip-networking`` is set. ``skip_networking`` on (TCP disabled), or
+    a ``bind-address`` that is not an all-interfaces address, reads ``True`` (restricted); an
+    all-interfaces bind (``0.0.0.0`` / ``::`` / ``*``) reads ``False`` (open, a finding)."""
+    values = _mysqld_values(my_cnf)
+    skip = values.get("skip_networking")
+    if skip is not None and skip.lower() in _MYSQL_TRUEY | {""}:
+        return True
+    bind = values.get("bind_address")
+    if bind is None:
+        return None
+    return bind.lower() not in _MYSQL_ALL_INTERFACES
+
+
+# One entry per (control_id, field): the ordered evidence sources it can be read from. A control that
+# more than one engine expresses (listener, client TLS) lists each engine's (source, extractor); the
+# first source that yields a value wins, and the others abstain because their engine's files are absent
+# on this host. Audit logging is PostgreSQL-only here (MySQL's general_log is not a DDL audit).
+_FIELD_EXTRACTORS: dict[tuple[str, str], list[tuple[str, object]]] = {
+    ("database.audit.logging_disabled", "privilege_and_ddl_auditing_enabled"): [
+        (SOURCE_PG_CONF, parse_db_audit_logging_enabled),
+    ],
+    ("database.listener.unrestricted", "listener_restricted_to_intended_clients"): [
+        (SOURCE_PG_HBA, parse_db_listener_unrestricted),
+        (SOURCE_MY_CNF, parse_mysql_listener_unrestricted),
+    ],
+    ("database.client.tls", "client_tls_required"): [
+        (SOURCE_PG_HBA, parse_db_client_tls_required),
+        (SOURCE_MY_CNF, parse_mysql_client_tls_required),
+    ],
 }
 
 
-def _extractors_for(control_id: str) -> list[tuple[str, str, object]]:
-    """The ``(field, source, extractor)`` entries this parser has for ``control_id``."""
+def _fields_for(control_id: str) -> list[tuple[str, list[tuple[str, object]]]]:
+    """The ``(field, [(source, extractor), ...])`` entries this parser has for ``control_id``."""
     return [
-        (field, source, extractor)
-        for (ctrl, field), (source, extractor) in _FIELD_EXTRACTORS.items()
+        (field, source_extractors)
+        for (ctrl, field), source_extractors in _FIELD_EXTRACTORS.items()
         if ctrl == control_id
     ]
 
 
 def serves(control_id: str) -> bool:
     """Whether this collector reads the evidence for ``control_id``."""
-    return bool(_extractors_for(control_id))
+    return bool(_fields_for(control_id))
 
 
 def source_for(control_id: str) -> str | None:
-    """The single evidence source ``control_id`` is read from, or ``None`` if not served. Every
-    database control this collector serves reads from exactly one source."""
-    extractors = _extractors_for(control_id)
-    return extractors[0][1] if extractors else None
+    """The primary evidence source ``control_id`` is read from (the first of its candidate sources), or
+    ``None`` if not served. Prefer :func:`sources_for_control` when a control reads more than one."""
+    fields = _fields_for(control_id)
+    return fields[0][1][0][0] if fields else None
+
+
+def sources_for_control(control_id: str) -> set[str]:
+    """Every evidence source ``control_id`` may be read from across its fields and engines, so the host
+    tier reads each one the control needs (a control the stock engine expresses two ways reads both)."""
+    return {source for _, source_extractors in _fields_for(control_id) for source, _ in source_extractors}
 
 
 def collect_control_fields(sources: dict[str, str], control_id: str) -> dict[str, object] | None:
     """The typed field values this parser can read for ``control_id`` from the collected evidence, or
-    ``None`` if it does not serve that control. A field whose extractor abstains is left out."""
-    supported = _extractors_for(control_id)
+    ``None`` if it does not serve that control. For each field, the candidate sources are tried in
+    order and the FIRST that yields a non-abstaining value wins (the other engine's files are absent on
+    this host, so its parser abstains); a field all of whose sources abstain is left out."""
+    supported = _fields_for(control_id)
     if not supported:
         return None
     fields: dict[str, object] = {}
-    for field, source, extractor in supported:
-        value = extractor(sources.get(source, ""))
-        if value is not None:
-            fields[field] = value
+    for field, source_extractors in supported:
+        for source, extractor in source_extractors:
+            value = extractor(sources.get(source, ""))
+            if value is not None:
+                fields[field] = value
+                break
     return fields

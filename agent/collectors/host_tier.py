@@ -56,10 +56,22 @@ def source_for(control_id: str) -> str | None:
     return module.source_for(control_id) if module else None
 
 
+def sources_for_control(control_id: str) -> set[str]:
+    """Every evidence source ``control_id`` may be read from, delegated to its owning family (a control
+    an engine expresses two ways, like a database listener, reads more than one), or an empty set when
+    no host family serves it."""
+    module = _module_for(control_id)
+    return module.sources_for_control(control_id) if module else set()
+
+
 def sources_for(control_ids: list[str]) -> set[str]:
     """The distinct evidence sources needed to collect the host controls among ``control_ids``, so the
-    agent runs each host command at most once."""
-    return {src for cid in control_ids if (src := source_for(cid)) is not None}
+    agent runs each host command at most once (a control with more than one candidate source
+    contributes each)."""
+    sources: set[str] = set()
+    for control_id in control_ids:
+        sources |= sources_for_control(control_id)
+    return sources
 
 
 def collect_control_fields(sources: dict[str, str], control_id: str) -> dict[str, object] | None:

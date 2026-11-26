@@ -63,6 +63,14 @@ _POSTGRES_HBA_COMMAND = (
 # Postfix's main.cf. Read-only file read; a host with no Postfix yields empty output, which the parser
 # abstains on rather than reading as a mail server with a missing directive.
 _POSTFIX_MAIN_CF_COMMAND = "cat /etc/postfix/main.cf 2>/dev/null"
+# MySQL / MariaDB server config, from the common Debian/RHEL locations and their conf.d drop-ins (only
+# the ones that exist are read; the rest glob to nothing). Read-only file reads; a host with no MySQL
+# yields empty output, which the parser abstains on rather than reading as a database with a missing
+# directive.
+_MYSQL_CONF_COMMAND = (
+    "cat /etc/mysql/my.cnf /etc/my.cnf /etc/mysql/mysql.conf.d/*.cnf "
+    "/etc/mysql/mariadb.conf.d/*.cnf 2>/dev/null"
+)
 
 
 async def _run_show(
@@ -311,4 +319,22 @@ async def collect_postfix_main_cf(
     mail server with a missing directive."""
     return await _run_show(
         host, credential, _POSTFIX_MAIN_CF_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
+    )
+
+
+async def collect_mysql_conf(
+    host: str,
+    credential: Credential,
+    *,
+    port: int = 22,
+    timeout: float = 20.0,
+    max_bytes: int = 500_000,
+) -> str:
+    """MySQL / MariaDB server config from the common Debian/RHEL locations and conf.d drop-ins,
+    truncated. Read-only file reads: they print config and change nothing. Used for the host tier
+    (``database.listener.unrestricted`` / ``database.client.tls`` on MySQL); a host with no MySQL
+    yields empty output, which the parser abstains on rather than reading as a database with a missing
+    directive."""
+    return await _run_show(
+        host, credential, _MYSQL_CONF_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
     )

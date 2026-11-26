@@ -116,6 +116,13 @@ def source_for(control_id: str) -> str | None:
     return extractors[0][1] if extractors else None
 
 
+def sources_for_control(control_id: str) -> set[str]:
+    """The evidence sources ``control_id`` reads (one for this collector), for the host-tier
+    aggregation."""
+    source = source_for(control_id)
+    return {source} if source is not None else set()
+
+
 def collect_control_fields(sources: dict[str, str], control_id: str) -> dict[str, object] | None:
     """The typed field values this parser can read for ``control_id`` from the collected evidence, or
     ``None`` if it does not serve that control. A field whose extractor abstains is left out."""

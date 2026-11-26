@@ -1666,11 +1666,16 @@ async def _collect_host_controls(
     controls: list[dict] = []
     coverage: list[dict] = []
     for control_id in control_ids:
-        source = host_tier.source_for(control_id)
-        if source in failed:
+        # A control is UNAVAILABLE only when EVERY source it could be read from failed to read; if any
+        # candidate source succeeded, the control is collected from it (a control an engine expresses
+        # two ways, like a database listener, is answered by whichever engine's config is present).
+        control_sources = host_tier.sources_for_control(control_id)
+        if control_sources and control_sources <= failed.keys():
             coverage.append(
                 assessment_collect.coverage_entry(
-                    scope=f"{target}:{control_id}", state="unavailable", reason_code=failed[source]
+                    scope=f"{target}:{control_id}",
+                    state="unavailable",
+                    reason_code=failed[next(iter(control_sources))],
                 )
             )
             continue
