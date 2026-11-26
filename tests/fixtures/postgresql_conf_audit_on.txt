@@ -1,0 +1,5 @@
+# PostgreSQL configuration file
+listen_addresses = '*'
+port = 5432
+shared_buffers = 128MB
+log_statement = 'ddl'          # log all DDL statements

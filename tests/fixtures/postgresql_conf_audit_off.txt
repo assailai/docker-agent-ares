@@ -1,0 +1,4 @@
+# PostgreSQL configuration file
+listen_addresses = 'localhost'
+port = 5432
+log_statement = 'none'

@@ -49,6 +49,17 @@ _AUDITD_STATE_COMMAND = (
 # is not an NFS server has no such file and the read yields empty output, which the parser abstains on
 # (no exports is not a weakness we can assert) rather than reading as a host with no wildcard export.
 _NFS_EXPORTS_COMMAND = "cat /etc/exports 2>/dev/null; cat /etc/exports.d/*.exports 2>/dev/null"
+# PostgreSQL's on-disk config, from the common Debian/RHEL locations (only one exists on a given host;
+# the rest glob to nothing). Read-only file reads; a host with no PostgreSQL yields empty output, which
+# the parser abstains on rather than reading as a database with a missing setting.
+_POSTGRES_CONF_COMMAND = (
+    "cat /etc/postgresql/*/main/postgresql.conf /var/lib/pgsql/data/postgresql.conf "
+    "/var/lib/postgresql/data/postgresql.conf 2>/dev/null"
+)
+_POSTGRES_HBA_COMMAND = (
+    "cat /etc/postgresql/*/main/pg_hba.conf /var/lib/pgsql/data/pg_hba.conf "
+    "/var/lib/postgresql/data/pg_hba.conf 2>/dev/null"
+)
 
 
 async def _run_show(
@@ -246,4 +257,38 @@ async def collect_nfs_exports(
     output, which the parser abstains on rather than reading as a host with no wildcard export."""
     return await _run_show(
         host, credential, _NFS_EXPORTS_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
+    )
+
+
+async def collect_postgres_conf(
+    host: str,
+    credential: Credential,
+    *,
+    port: int = 22,
+    timeout: float = 20.0,
+    max_bytes: int = 500_000,
+) -> str:
+    """PostgreSQL's ``postgresql.conf`` from the common Debian/RHEL locations, truncated. Read-only
+    file read: it prints config and changes nothing. Used for the host tier (``database.*``); a host
+    with no PostgreSQL yields empty output, which the parser abstains on rather than reading as a
+    database with a missing setting."""
+    return await _run_show(
+        host, credential, _POSTGRES_CONF_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
+    )
+
+
+async def collect_postgres_hba(
+    host: str,
+    credential: Credential,
+    *,
+    port: int = 22,
+    timeout: float = 20.0,
+    max_bytes: int = 500_000,
+) -> str:
+    """PostgreSQL's ``pg_hba.conf`` (the client authentication rules) from the common Debian/RHEL
+    locations, truncated. Read-only file read. Used for the host tier (``database.listener.*`` /
+    ``database.client.tls``); a host with no PostgreSQL yields empty output, which the parser abstains
+    on rather than reading as a database with no restriction."""
+    return await _run_show(
+        host, credential, _POSTGRES_HBA_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
     )

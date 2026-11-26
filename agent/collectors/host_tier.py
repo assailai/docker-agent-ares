@@ -18,11 +18,11 @@ from __future__ import annotations
 
 from types import ModuleType
 
-from agent.collectors import linux_host, storage_host
+from agent.collectors import database_host, linux_host, storage_host
 
 # Every host collector family. A control_id is served by at most one of these (prefixes are disjoint),
 # so the iteration order is only a never-triggered tie-break.
-_HOST_COLLECTORS: tuple[ModuleType, ...] = (linux_host, storage_host)
+_HOST_COLLECTORS: tuple[ModuleType, ...] = (linux_host, storage_host, database_host)
 
 # The merged evidence-source -> ssh_collect reader-function-name map across every host family. Source
 # keys are globally unique, so the merge is loss-free; main.py reads each needed source once through

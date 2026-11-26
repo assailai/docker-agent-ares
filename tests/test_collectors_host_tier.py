@@ -4,13 +4,16 @@ sources are merged loss-free, and a control no host family serves falls through 
 
 from __future__ import annotations
 
-from agent.collectors import host_tier, linux_host, storage_host
+from agent.collectors import database_host, host_tier, linux_host, storage_host
+
+_FAMILIES = (linux_host, storage_host, database_host)
 
 
 def test_each_control_routes_to_its_owning_family() -> None:
     assert host_tier.serves("server.ssh.password") is True
     assert host_tier.serves("server.audit.security_logging_disabled") is True
     assert host_tier.serves("storage.nfs.wildcard_rw") is True
+    assert host_tier.serves("database.client.tls") is True
     # A device control (read from the running-config) is NOT a host control: it falls through.
     assert host_tier.serves("net.management.telnet") is False
 
@@ -18,17 +21,18 @@ def test_each_control_routes_to_its_owning_family() -> None:
 def test_source_for_delegates_to_the_owning_family() -> None:
     assert host_tier.source_for("server.ssh.password") == linux_host.SOURCE_SSHD
     assert host_tier.source_for("storage.nfs.wildcard_rw") == storage_host.SOURCE_NFS_EXPORTS
+    assert host_tier.source_for("database.client.tls") == database_host.SOURCE_PG_HBA
     assert host_tier.source_for("net.management.telnet") is None
 
 
 def test_source_readers_merge_every_family_loss_free() -> None:
     # Every family's sources are present, and the merge preserves each family's reader name.
-    for source, reader in linux_host.SOURCE_READERS.items():
-        assert host_tier.SOURCE_READERS[source] == reader
-    for source, reader in storage_host.SOURCE_READERS.items():
-        assert host_tier.SOURCE_READERS[source] == reader
+    total = 0
+    for family in _FAMILIES:
+        for source, reader in family.SOURCE_READERS.items():
+            assert host_tier.SOURCE_READERS[source] == reader
+            total += 1
     # Sources are globally unique, so no family's source was clobbered by the merge.
-    total = len(linux_host.SOURCE_READERS) + len(storage_host.SOURCE_READERS)
     assert len(host_tier.SOURCE_READERS) == total
 
 
