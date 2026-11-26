@@ -185,3 +185,72 @@ def test_kubelet_probe_field_and_serves() -> None:
     assert kc.kubelet_anonymous_field(True) == {"kubelet_anonymous_auth_enabled": True}
     assert kc.kubelet_anonymous_field(False) == {"kubelet_anonymous_auth_enabled": False}
     assert kc.kubelet_anonymous_field(None) is None
+
+
+# ── ClusterRoleBindings (kubernetes.rbac.cluster_admin_bindings, a baseline-comparison control) ────
+def _crb(name: str, role: str, subjects: list[dict]) -> dict:
+    return {
+        "metadata": {"name": name},
+        "roleRef": {"kind": "ClusterRole", "name": role},
+        "subjects": subjects,
+    }
+
+
+def test_parse_cluster_admin_members_lists_named_principals() -> None:
+    bindings = {
+        "items": [
+            _crb("admin-sa", "cluster-admin", [
+                {"kind": "ServiceAccount", "namespace": "kube-system", "name": "rogue"},
+            ]),
+            _crb("admin-user", "cluster-admin", [{"kind": "User", "name": "alice"}]),
+        ]
+    }
+    assert kube_collect.parse_cluster_admin_members(bindings) == [
+        "serviceaccount:kube-system:rogue",
+        "user:alice",
+    ]
+
+
+def test_system_masters_group_binding_is_excluded() -> None:
+    # The cluster's own built-in cluster-admin -> system:masters binding is a Group subject, not a
+    # named principal, so a stock cluster reports an empty set (no false member).
+    bindings = {
+        "items": [
+            _crb("cluster-admin", "cluster-admin", [{"kind": "Group", "name": "system:masters"}]),
+        ]
+    }
+    assert kube_collect.parse_cluster_admin_members(bindings) == []
+
+
+def test_non_cluster_admin_bindings_are_ignored() -> None:
+    bindings = {
+        "items": [
+            _crb("viewer", "view", [{"kind": "User", "name": "bob"}]),
+            {"metadata": {"name": "noref"}, "subjects": [{"kind": "User", "name": "x"}]},
+        ]
+    }
+    assert kube_collect.parse_cluster_admin_members(bindings) == []
+
+
+def test_cluster_admin_members_deduped_and_sorted() -> None:
+    bindings = {
+        "items": [
+            _crb("a", "cluster-admin", [{"kind": "User", "name": "zoe"}]),
+            _crb("b", "cluster-admin", [{"kind": "User", "name": "zoe"}, {"kind": "User", "name": "amy"}]),
+        ]
+    }
+    assert kube_collect.parse_cluster_admin_members(bindings) == ["user:amy", "user:zoe"]
+
+
+def test_cluster_admin_members_abstains_on_non_list() -> None:
+    assert kube_collect.parse_cluster_admin_members({}) is None
+    assert kube_collect.parse_cluster_admin_members({"items": "nope"}) is None
+
+
+def test_cluster_admin_members_field_and_serves() -> None:
+    assert kube_collect.serves("kubernetes.rbac.cluster_admin_bindings") is True
+    bindings = {"items": [_crb("a", "cluster-admin", [{"kind": "User", "name": "amy"}])]}
+    assert kube_collect.cluster_admin_members_field(bindings) == {
+        "observed_cluster_admin_members": ["user:amy"]
+    }
+    assert kube_collect.cluster_admin_members_field({"items": "nope"}) is None

@@ -29,7 +29,12 @@ from agent.kubeinfo import KubeApi
 POD_CONTROLS = frozenset({"kubernetes.workload.privileged"})
 NETPOL_CONTROLS = frozenset({"kubernetes.network.no_default_deny"})
 NAMESPACE_CONTROLS = frozenset({"kubernetes.admission.pod_security_disabled"})
-SERVES = POD_CONTROLS | NETPOL_CONTROLS | NAMESPACE_CONTROLS
+# A BASELINE-COMPARISON control: the agent sends the RAW observed cluster-admin member set and leaves
+# the `policy_approved` gate for the control plane, which diffs the set against the tenant's approved
+# baseline (the agent has none). Distinct from the factual-absolute controls above, whose field IS the
+# finding; here the agent never judges which members are "unapproved".
+RBAC_CONTROLS = frozenset({"kubernetes.rbac.cluster_admin_bindings"})
+SERVES = POD_CONTROLS | NETPOL_CONTROLS | NAMESPACE_CONTROLS | RBAC_CONTROLS
 # Probed WITHOUT the token, so NOT part of the authenticated LIST tier (SERVES): whether the API
 # server (and the kubelet) accept the anonymous identity at all. A separate `probes()` predicate so
 # the dispatcher runs these as no-credential probes, not through the k8s_token tier.
@@ -276,3 +281,71 @@ async def fetch_kubelet_anonymous(target: str, *, timeout: float) -> bool:
     async with httpx.AsyncClient(verify=ctx, timeout=timeout) as client:
         response = await client.get(url)
     return response.status_code != 401
+
+
+# The built-in ClusterRole whose binding to a named principal is a cluster-takeover grant. The
+# cluster's own `cluster-admin -> system:masters` Group binding is NOT a named principal and is
+# excluded by `_member_identity` (Group subjects return None), so a stock cluster reports an empty set.
+_CLUSTER_ADMIN_ROLE = "cluster-admin"
+
+
+def _member_identity(subject: object) -> str | None:
+    """A stable identifier for a named User/ServiceAccount subject, or ``None`` for a Group (including
+    the built-in ``system:masters``) or an unparseable subject. The format is what an operator approves
+    in the baseline: ``user:<name>`` or ``serviceaccount:<namespace>:<name>``."""
+    if not isinstance(subject, dict):
+        return None
+    name = subject.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    kind = subject.get("kind")
+    if kind == "User":
+        return f"user:{name}"
+    if kind == "ServiceAccount":
+        namespace = subject.get("namespace")
+        ns = namespace if isinstance(namespace, str) and namespace else "default"
+        return f"serviceaccount:{ns}:{name}"
+    return None
+
+
+def parse_cluster_admin_members(clusterrolebindings: dict) -> list[str] | None:
+    """The named User/ServiceAccount principals bound to the built-in ``cluster-admin`` ClusterRole, as
+    a sorted, de-duplicated list of stable identifiers, or ``None`` to abstain when the input is not a
+    binding list. This is the RAW OBSERVED SET: the agent does NOT judge which are "unapproved" (it has
+    no baseline); the control plane diffs this against the tenant's approved baseline. Group subjects
+    (the cluster's own ``cluster-admin -> system:masters`` binding among them) are excluded, so a stock
+    cluster reports ``[]`` rather than a false member."""
+    items = clusterrolebindings.get("items")
+    if not isinstance(items, list):
+        return None
+    members: set[str] = set()
+    for binding in items:
+        if not isinstance(binding, dict):
+            continue
+        role_ref = binding.get("roleRef") or {}
+        if role_ref.get("kind") != "ClusterRole" or role_ref.get("name") != _CLUSTER_ADMIN_ROLE:
+            continue
+        subjects = binding.get("subjects")
+        if not isinstance(subjects, list):
+            continue
+        for subject in subjects:
+            identity = _member_identity(subject)
+            if identity is not None:
+                members.add(identity)
+    return sorted(members)
+
+
+def cluster_admin_members_field(clusterrolebindings: dict) -> dict[str, object] | None:
+    """The observed-set field the agent sends for ``kubernetes.rbac.cluster_admin_bindings``: the raw
+    named principals bound to cluster-admin, under the wire key the control plane's approved-policy
+    normalizer reads (``observed_cluster_admin_members``). Abstains (``None``) when the input is not a
+    binding list."""
+    members = parse_cluster_admin_members(clusterrolebindings)
+    return None if members is None else {"observed_cluster_admin_members": members}
+
+
+async def fetch_clusterrolebindings(api: KubeApi) -> dict:
+    """The cluster's ClusterRoleBindings, paged read-only (bounded)."""
+    return await _fetch_list(
+        api, "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings", _MAX_PODS
+    )

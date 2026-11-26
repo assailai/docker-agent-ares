@@ -1712,10 +1712,13 @@ def _append_kube_control(
     field_fn,
     controls: list[dict],
     coverage: list[dict],
+    *,
+    include_policy_gate: bool = True,
 ) -> None:
     """Append one kubernetes control's facts (or an UNSUPPORTED coverage entry) when it was requested.
     ``field_fn`` maps the already-fetched resource LIST to the control's field dict, or ``None`` to
-    abstain (recorded UNSUPPORTED)."""
+    abstain (recorded UNSUPPORTED). ``include_policy_gate=False`` for a baseline-comparison control,
+    whose policy gate the control plane earns from the tenant baseline, not the agent."""
     if control_id not in requested_ids:
         return
     fields = field_fn(resource)
@@ -1727,7 +1730,9 @@ def _append_kube_control(
         )
         return
     controls.append(
-        assessment_collect.control_facts(control_id, fields, collection_complete=True)
+        assessment_collect.control_facts(
+            control_id, fields, collection_complete=True, include_policy_gate=include_policy_gate
+        )
     )
 
 
@@ -1787,6 +1792,23 @@ async def _collect_kube_controls(
             _append_kube_control(
                 target, "kubernetes.admission.pod_security_disabled", namespace_ids, namespaces,
                 kube_collect.pod_security_field, controls, coverage,
+            )
+    # The RBAC baseline-comparison control: LIST ClusterRoleBindings and send the RAW set of named
+    # principals bound to cluster-admin, with NO policy gate (include_policy_gate=False), so the
+    # control plane judges "unapproved" against the tenant baseline instead of the agent guessing.
+    rbac_ids = [cid for cid in control_ids if cid in kube_collect.RBAC_CONTROLS]
+    if rbac_ids:
+        try:
+            bindings = await kube_collect.fetch_clusterrolebindings(api)
+        except Exception as exc:  # noqa: BLE001 - a failed read is honest UNAVAILABLE, not a crash
+            coverage += _unavailable_coverage(
+                target, rbac_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            _append_kube_control(
+                target, "kubernetes.rbac.cluster_admin_bindings", rbac_ids, bindings,
+                kube_collect.cluster_admin_members_field, controls, coverage,
+                include_policy_gate=False,
             )
     return controls, coverage
 

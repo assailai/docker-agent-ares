@@ -53,22 +53,34 @@ def require_fields(job: dict) -> list[str]:
     return list(control_ids)
 
 
-def control_facts(control_id: str, fields: dict[str, object], *, collection_complete: bool) -> dict:
-    """The ``{status, value}`` facts for one control: the three gates plus the collected fields.
+def control_facts(
+    control_id: str,
+    fields: dict[str, object],
+    *,
+    collection_complete: bool,
+    include_policy_gate: bool = True,
+) -> dict:
+    """The ``{status, value}`` facts for one control: the gates plus the collected fields.
 
     The agent asserts ``applicable`` and ``collection_complete`` from what it observed (the device
     answered and the config was read). ``policy_approved`` is OBSERVED/true for v1, standing for the
     assessment the customer launched; binding a real approved policy at the control plane is the
     hardening that replaces this. A field the parser could not read is simply absent, so the control
-    evaluates NOT_ASSESSED rather than on a guessed value."""
+    evaluates NOT_ASSESSED rather than on a guessed value.
+
+    ``include_policy_gate=False`` is for a BASELINE-COMPARISON control (``unapproved_*``/``drift``):
+    the agent sends the RAW observed set and does NOT assert ``policy_approved``, leaving that gate for
+    the control plane to earn by diffing the observed set against the tenant's approved baseline. With
+    the gate absent the control is NOT_ASSESSED until a baseline exists, which is the honest default."""
     facts: dict[str, dict] = {
         "applicable": {"status": "OBSERVED", "value": True},
-        "policy_approved": {"status": "OBSERVED", "value": True},
         "collection_complete": {
             "status": "OBSERVED" if collection_complete else "PARTIAL",
             "value": bool(collection_complete),
         },
     }
+    if include_policy_gate:
+        facts["policy_approved"] = {"status": "OBSERVED", "value": True}
     for name, value in fields.items():
         facts[name] = {"status": "OBSERVED", "value": value}
     return {"control_id": control_id, "facts": facts, "evidence_sha256": None}
