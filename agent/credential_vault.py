@@ -29,7 +29,10 @@ class Credential:
     and never logged or sent. ``username`` is the login for the SSH kinds and is unused (``""``) for a
     bearer-token kind, where the token alone authenticates."""
 
-    kind: str  # ssh_password | ssh_key | k8s_token | db_login | ldap_bind | vsphere_login | mysql_login
+    # ssh_password | ssh_key | k8s_token | db_login | ldap_bind | vsphere_login | mysql_login |
+    # s3_login (an object-storage access key: username=access key id, secret=secret access key; the
+    # backup-repository posture tier reads an S3/object-lock backup repository with it)
+    kind: str
     username: str
     secret: str
 
@@ -62,6 +65,7 @@ class CredentialVault:
             "ldap_bind",
             "vsphere_login",
             "mysql_login",
+            "s3_login",
         ):
             return None
         # The SSH kinds need a login; a bearer token authenticates on its own, so its username is

@@ -60,3 +60,9 @@ pyvmomi==9.1.2.0
 # PyMySQL, the PURE-PYTHON driver (no C extension, no required deps for password auth), so the Alpine
 # image needs no build toolchain, unlike mysqlclient.
 pymysql==1.1.1
+
+# The backup-repository posture tier (backup.repository.immutable / backup.data.unencrypted) reads an
+# S3/object-lock backup repository under an s3_login access key from the local vault. Deliberately the
+# minio client, PURE-PYTHON (urllib3 + certifi + argon2/pycryptodome wheels), so the Alpine image
+# needs no C build.
+minio==7.2.20

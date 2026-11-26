@@ -46,6 +46,7 @@ from agent import (
     snmp,
 )
 from agent.collectors import (
+    backup_collect,
     db_query,
     host_tier,
     kube_collect,
@@ -1989,6 +1990,7 @@ async def _collect_controls(
     ldap_ids = [cid for cid in control_ids if ldap_query.serves(cid)]
     vsphere_ids = [cid for cid in control_ids if vsphere_collect.serves(cid)]
     mysql_ids = [cid for cid in control_ids if mysql_query.serves(cid)]
+    backup_ids = [cid for cid in control_ids if backup_collect.serves(cid)]
     network_ids = [
         cid
         for cid in control_ids
@@ -1998,6 +2000,7 @@ async def _collect_controls(
         and not ldap_query.serves(cid)
         and not vsphere_collect.serves(cid)
         and not mysql_query.serves(cid)
+        and not backup_collect.serves(cid)
     ]
     controls: list[dict] = []
     coverage: list[dict] = []
@@ -2044,7 +2047,44 @@ async def _collect_controls(
         )
         controls += mysql_controls
         coverage += mysql_coverage
+    if backup_ids:
+        backup_controls, backup_coverage = await _collect_backup_controls(
+            job, backup_ids, credential, timeout_s
+        )
+        controls += backup_controls
+        coverage += backup_coverage
     return controls, coverage, neighbours
+
+
+async def _collect_backup_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float
+) -> tuple[list[dict], list[dict]]:
+    """The backup-repository tier: open an S3/object-lock client to the target object store with the
+    ``s3_login`` reader access key, read each bucket's object-lock + encryption posture, and normalise
+    each requested control. A wrong credential kind (not s3_login), or a failed connect/list, makes
+    every requested control UNAVAILABLE; a control this tier does not support is UNSUPPORTED."""
+    target = job["target_address"]
+    if credential.kind != "s3_login":
+        return [], _unavailable_coverage(
+            target, control_ids, "wrong_credential_kind:expected_s3_login"
+        )
+    try:
+        posture = await backup_collect.fetch_bucket_posture(target, credential, timeout=timeout_s)
+    except Exception as exc:  # noqa: BLE001 - any connect/list failure is honest UNAVAILABLE
+        return [], _unavailable_coverage(
+            target, control_ids, f"collect_failed:{type(exc).__name__}"
+        )
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    for control_id in control_ids:
+        if control_id == "backup.repository.immutable":
+            fields = backup_collect.repository_immutable_field(posture)
+        elif control_id == "backup.data.unencrypted":
+            fields = backup_collect.backup_encrypted_field(posture)
+        else:
+            fields = None
+        _record_control(target, control_id, fields, controls, coverage)
+    return controls, coverage
 
 
 async def _run_assessment_collect(state: AgentState, token: str, task: dict) -> None:
