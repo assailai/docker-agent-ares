@@ -10,9 +10,10 @@ from agent.collectors import (
     linux_host,
     mail_host,
     storage_host,
+    web_host,
 )
 
-_FAMILIES = (linux_host, storage_host, database_host, mail_host)
+_FAMILIES = (linux_host, storage_host, database_host, mail_host, web_host)
 
 
 def test_each_control_routes_to_its_owning_family() -> None:

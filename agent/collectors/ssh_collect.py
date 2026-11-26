@@ -71,6 +71,13 @@ _MYSQL_CONF_COMMAND = (
     "cat /etc/mysql/my.cnf /etc/my.cnf /etc/mysql/mysql.conf.d/*.cnf "
     "/etc/mysql/mariadb.conf.d/*.cnf 2>/dev/null"
 )
+# The web server (nginx) effective config: the main file plus the enabled site/snippet includes
+# (only the locations that exist on a given host glob to anything). Read-only file reads; a host with
+# no nginx yields empty output, which the parser abstains on rather than reading as a web host with a
+# missing directive.
+_NGINX_CONF_COMMAND = (
+    "cat /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* 2>/dev/null"
+)
 
 
 async def _run_show(
@@ -337,4 +344,21 @@ async def collect_mysql_conf(
     directive."""
     return await _run_show(
         host, credential, _MYSQL_CONF_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
+    )
+
+
+async def collect_nginx_conf(
+    host: str,
+    credential: Credential,
+    *,
+    port: int = 22,
+    timeout: float = 20.0,
+    max_bytes: int = 500_000,
+) -> str:
+    """The web server's effective nginx configuration, truncated. Read-only file reads: they print
+    config and change nothing. Used for the host tier (``web.tls.client_facing_not_enforced`` /
+    ``web.admin.public``); a host with no nginx yields empty output, which the parser abstains on
+    rather than reading as a web host with a missing directive."""
+    return await _run_show(
+        host, credential, _NGINX_CONF_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
     )
