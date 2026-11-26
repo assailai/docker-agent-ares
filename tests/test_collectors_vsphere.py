@@ -38,3 +38,40 @@ def test_serves_and_field_dict() -> None:
         "host_lockdown_mode_enabled": False
     }
     assert vsphere_collect.host_lockdown_field([]) is None
+
+
+# ── promiscuous mode (virtualization.network.promiscuous_allowed) ──────────────────────────────────
+def test_promiscuous_allowed_when_any_segment_allows_it() -> None:
+    # effective readings (inheritance already resolved by the fetch): one True anywhere is the finding.
+    assert vsphere_collect.parse_promiscuous_allowed([False, False, True]) is True
+
+
+def test_promiscuous_rejected_everywhere_is_clean() -> None:
+    assert vsphere_collect.parse_promiscuous_allowed([False, False, False]) is False
+
+
+def test_promiscuous_abstains_without_readings() -> None:
+    assert vsphere_collect.parse_promiscuous_allowed([]) is None
+    assert vsphere_collect.parse_promiscuous_allowed("nope") is None
+    assert vsphere_collect.parse_promiscuous_allowed(["off"]) is None  # no bools -> abstain
+
+
+def test_promiscuous_field_and_serves() -> None:
+    assert vsphere_collect.serves("virtualization.network.promiscuous_allowed") is True
+    assert vsphere_collect.promiscuous_allowed_field([True]) == {"promiscuous_mode_allowed": True}
+    assert vsphere_collect.promiscuous_allowed_field([False]) == {"promiscuous_mode_allowed": False}
+    assert vsphere_collect.promiscuous_allowed_field([]) is None
+
+
+def test_allow_promiscuous_reads_the_security_policy() -> None:
+    class _Sec:
+        allowPromiscuous = True
+
+    class _Pol:
+        security = _Sec()
+
+    class _Spec:
+        policy = _Pol()
+
+    assert vsphere_collect._allow_promiscuous(_Spec()) is True
+    assert vsphere_collect._allow_promiscuous(None) is None

@@ -2008,22 +2008,41 @@ async def _collect_vsphere_controls(
         return [], _unavailable_coverage(
             target, control_ids, "wrong_credential_kind:expected_vsphere_login"
         )
-    try:
-        lockdown_modes = await vsphere_collect.fetch_host_lockdown_modes(
-            target, credential, timeout=timeout_s
-        )
-    except Exception as exc:  # noqa: BLE001 - any login/read failure is honest UNAVAILABLE
-        return [], _unavailable_coverage(
-            target, control_ids, f"collect_failed:{type(exc).__name__}"
-        )
+    # Read each vSphere property only when a requested control needs it, once; a failed read makes
+    # only that property's controls UNAVAILABLE.
+    lockdown_modes: object = None
+    lockdown_failed: str | None = None
+    if "virtualization.host.lockdown_disabled" in control_ids:
+        try:
+            lockdown_modes = await vsphere_collect.fetch_host_lockdown_modes(
+                target, credential, timeout=timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - any login/read failure is honest UNAVAILABLE
+            lockdown_failed = f"collect_failed:{type(exc).__name__}"
+    promiscuous_readings: object = None
+    promiscuous_failed: str | None = None
+    if "virtualization.network.promiscuous_allowed" in control_ids:
+        try:
+            promiscuous_readings = await vsphere_collect.fetch_promiscuous_readings(
+                target, credential, timeout=timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - any login/read failure is honest UNAVAILABLE
+            promiscuous_failed = f"collect_failed:{type(exc).__name__}"
     controls: list[dict] = []
     coverage: list[dict] = []
     for control_id in control_ids:
-        fields = (
-            vsphere_collect.host_lockdown_field(lockdown_modes)
-            if control_id == "virtualization.host.lockdown_disabled"
-            else None
-        )
+        if control_id == "virtualization.host.lockdown_disabled":
+            if lockdown_failed:
+                coverage += _unavailable_coverage(target, [control_id], lockdown_failed)
+                continue
+            fields = vsphere_collect.host_lockdown_field(lockdown_modes)
+        elif control_id == "virtualization.network.promiscuous_allowed":
+            if promiscuous_failed:
+                coverage += _unavailable_coverage(target, [control_id], promiscuous_failed)
+                continue
+            fields = vsphere_collect.promiscuous_allowed_field(promiscuous_readings)
+        else:
+            fields = None
         _record_control(target, control_id, fields, controls, coverage)
     return controls, coverage
 

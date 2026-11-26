@@ -24,7 +24,9 @@ from pyVmomi import vim
 
 from agent.credential_vault import Credential
 
-SERVES = frozenset({"virtualization.host.lockdown_disabled"})
+SERVES = frozenset(
+    {"virtualization.host.lockdown_disabled", "virtualization.network.promiscuous_allowed"}
+)
 
 # The ESXi lockdown mode that means lockdown is OFF; "lockdownNormal" / "lockdownStrict" mean it is on.
 _LOCKDOWN_DISABLED = "lockdownDisabled"
@@ -105,3 +107,92 @@ async def fetch_host_lockdown_modes(
     thread so the event loop is not blocked. Raises on login/read failure, which the caller records as
     honest UNAVAILABLE."""
     return await asyncio.to_thread(_query_host_lockdown_modes, host, port, credential, timeout)
+
+
+# ── virtual-switch / port-group promiscuous mode ──────────────────────────────────────────────────
+# Promiscuous mode on a virtual switch or port group lets a VM attached to it sniff ALL traffic on the
+# segment, including its neighbours' - a lateral-movement and data-exposure surface. The secure default
+# is reject (allowPromiscuous=False). A port group with no explicit security policy INHERITS its
+# switch's, which the fetch resolves so the parser sees the EFFECTIVE value. The finding fires when any
+# switch or port group effectively allows promiscuous mode.
+
+
+def parse_promiscuous_allowed(promiscuous_readings: object) -> bool | None:
+    """Whether promiscuous mode is allowed on ANY virtual switch or port group (the effective policy,
+    port-group inheritance already resolved), or ``None`` to abstain when there are no boolean
+    readings. A single switch/port group that allows it makes the posture ``True`` (a finding)."""
+    if not isinstance(promiscuous_readings, list):
+        return None
+    bools = [reading for reading in promiscuous_readings if isinstance(reading, bool)]
+    if not bools:
+        return None
+    return any(bools)
+
+
+def promiscuous_allowed_field(promiscuous_readings: object) -> dict[str, object] | None:
+    """The ``virtualization.network.promiscuous_allowed`` field dict from a list of effective
+    promiscuous-mode booleans, or ``None`` to abstain."""
+    allowed = parse_promiscuous_allowed(promiscuous_readings)
+    return None if allowed is None else {"promiscuous_mode_allowed": allowed}
+
+
+def _query_promiscuous_readings(
+    host: str, port: int, credential: Credential, timeout: float
+) -> list[bool]:
+    """Log in over TLS and return the EFFECTIVE allowPromiscuous of every virtual switch and port group
+    across every host (a port group with no explicit policy inherits its switch's). Synchronous
+    (pyvmomi is), so the caller runs it in a thread. Read-only: property reads, no reconfigure."""
+    service_instance = SmartConnect(
+        host=host,
+        port=port,
+        user=credential.username,
+        pwd=credential.secret,
+        sslContext=_tls_context(),
+        connectionPoolTimeout=int(timeout),
+    )
+    try:
+        content = service_instance.RetrieveContent()
+        view = content.viewManager.CreateContainerView(content.rootFolder, [vim.HostSystem], True)
+        try:
+            readings: list[bool] = []
+            for host_system in view.view:
+                network = host_system.config.network if host_system.config else None
+                if network is None:
+                    continue
+                switch_default: dict[str, bool] = {}
+                for switch in getattr(network, "vswitch", None) or []:
+                    allowed = _allow_promiscuous(getattr(switch, "spec", None))
+                    if allowed is not None:
+                        switch_default[switch.name] = allowed
+                        readings.append(allowed)
+                for portgroup in getattr(network, "portgroup", None) or []:
+                    spec = getattr(portgroup, "spec", None)
+                    allowed = _allow_promiscuous(spec)
+                    if allowed is not None:
+                        readings.append(allowed)
+                    else:
+                        inherited = switch_default.get(getattr(spec, "vswitchName", None))
+                        if inherited is not None:
+                            readings.append(inherited)
+            return readings
+        finally:
+            view.Destroy()
+    finally:
+        Disconnect(service_instance)
+
+
+def _allow_promiscuous(spec: object) -> bool | None:
+    """The allowPromiscuous of a vSwitch/port-group spec's security policy, or ``None`` when unset (the
+    port group then inherits its switch, resolved by the caller)."""
+    policy = getattr(spec, "policy", None)
+    security = getattr(policy, "security", None)
+    allowed = getattr(security, "allowPromiscuous", None)
+    return allowed if isinstance(allowed, bool) else None
+
+
+async def fetch_promiscuous_readings(
+    host: str, credential: Credential, *, timeout: float, port: int = _DEFAULT_PORT
+) -> list[bool]:
+    """The effective promiscuous-mode policy of every virtual switch and port group, read over TLS.
+    Runs the synchronous pyvmomi login+read in a thread. Raises on login/read failure (UNAVAILABLE)."""
+    return await asyncio.to_thread(_query_promiscuous_readings, host, port, credential, timeout)
