@@ -36,6 +36,12 @@ CAPABILITIES = [
     # off, stop re-probing reachability and reuse the stored answer across restarts. ares reads its
     # absence as "this build still re-probes on its own" and says so next to the setting.
     "auto_rescan",
+    # the signed Network Assessment protocol (discover + credentialed collect). The agent ships the
+    # handlers for network_assessment_discover_v1 / network_assessment_collect_v1 (see
+    # main._HANDLED_TASK_TYPES), and the control plane will only dispatch either task type to an agent
+    # that advertised this. Collect needs a provisioned local vault; without a matching credential_ref
+    # it reports honest UNAVAILABLE coverage rather than guessing, so advertising this is always safe.
+    "network_assessment",
 ]
 # read Services, EndpointSlices and workloads from a cluster API. Reported only when the operator
 # turned it on, unlike the list above, which is what the build can do. The distinction is the
