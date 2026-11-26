@@ -1698,8 +1698,15 @@ async def _collect_host_controls(
                 )
             )
             continue
+        # A baseline-comparison host control (server.localadmin.unapproved) sends the RAW observed set
+        # and leaves the policy gate for the control plane to earn from the tenant baseline.
         controls.append(
-            assessment_collect.control_facts(control_id, fields, collection_complete=True)
+            assessment_collect.control_facts(
+                control_id,
+                fields,
+                collection_complete=True,
+                include_policy_gate=not host_tier.is_baseline_control(control_id),
+            )
         )
     return controls, coverage
 

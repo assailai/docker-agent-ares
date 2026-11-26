@@ -85,3 +85,12 @@ def collect_control_fields(sources: dict[str, str], control_id: str) -> dict[str
     collector that owns it, or ``None`` if no host family serves it."""
     module = _module_for(control_id)
     return module.collect_control_fields(sources, control_id) if module else None
+
+
+def is_baseline_control(control_id: str) -> bool:
+    """Whether ``control_id`` is a baseline-comparison host control: the agent sends the RAW observed
+    set and leaves the ``policy_approved`` gate for the control plane to earn by diffing it against the
+    tenant's approved baseline, rather than asserting a pre-judged value. The owning family declares
+    these in its optional ``BASELINE_CONTROLS`` set; a family without one has no baseline controls."""
+    module = _module_for(control_id)
+    return bool(module and control_id in getattr(module, "BASELINE_CONTROLS", frozenset()))

@@ -30,6 +30,9 @@ _SYSCTL_COMMAND = "sysctl -a"
 # The account database (name:passwd:uid:gid:gecos:home:shell). Read-only enumeration; getent reads
 # the resolved database (files + any directory source) without the shadow hashes.
 _PASSWD_COMMAND = "getent passwd"
+# The account database plus the group database, separated by a marker, for the local-administrator
+# observed set (uid-0 accounts + admin-group members). Read-only enumeration, no root and no shadow.
+_LOCALADMIN_COMMAND = "getent passwd; echo '===GROUPS==='; getent group"
 # The dnf package-manager configuration (rpm/dnf hosts). Read-only file read; a non-dnf host has no
 # such file and the read simply fails, recorded as honest UNAVAILABLE coverage.
 _PKG_CONFIG_COMMAND = "cat /etc/dnf/dnf.conf"
@@ -189,6 +192,23 @@ async def collect_passwd_database(
     UNAVAILABLE coverage."""
     return await _run_show(
         host, credential, _PASSWD_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
+    )
+
+
+async def collect_localadmin_sources(
+    host: str,
+    credential: Credential,
+    *,
+    port: int = 22,
+    timeout: float = 20.0,
+    max_bytes: int = 500_000,
+) -> str:
+    """The Linux host's account + group databases (``getent passwd`` then ``getent group``, split by a
+    marker), truncated. Read-only enumeration, no root and no password hashes. Used for the host tier's
+    baseline-comparison control ``server.localadmin.unapproved`` (the observed local-administrator set);
+    a network device has no ``getent`` and the read simply fails, recorded as honest UNAVAILABLE."""
+    return await _run_show(
+        host, credential, _LOCALADMIN_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
     )
 
 

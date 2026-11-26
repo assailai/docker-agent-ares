@@ -33,6 +33,13 @@ SOURCE_PKG = "pkg"
 SOURCE_FIREWALL = "firewall"
 SOURCE_PKG_AUTO = "pkg_auto"
 SOURCE_AUDIT = "audit"
+SOURCE_LOCALADMIN = "localadmin"
+
+# Baseline-comparison controls this family serves: the agent sends the RAW observed set (here the local
+# administrators) and leaves the `policy_approved` gate for the control plane to earn by diffing it
+# against the tenant's approved baseline. The host tier reads this to omit the policy gate for these,
+# unlike a factual-absolute control whose field IS the finding.
+BASELINE_CONTROLS = frozenset({"server.localadmin.unapproved"})
 
 # Each evidence source -> the ssh_collect reader function (named, not imported, so a test that
 # monkeypatches ssh_collect still reaches it: it is resolved off the module at call time). The host
@@ -46,6 +53,7 @@ SOURCE_READERS = {
     SOURCE_FIREWALL: "collect_firewall_state",
     SOURCE_PKG_AUTO: "collect_pkg_auto_config",
     SOURCE_AUDIT: "collect_auditd_state",
+    SOURCE_LOCALADMIN: "collect_localadmin_sources",
 }
 
 
@@ -448,7 +456,50 @@ def parse_security_logging_enabled(audit_output: str) -> bool | None:
 # One entry per (control_id, field): the evidence source it reads and the extractor. A control whose
 # extractor abstains (returns None) is omitted from the collected fields, so the control plane
 # evaluates it NOT_ASSESSED rather than on a guess.
+# ── getent passwd + getent group (the local administrators) ───────────────────────────────────────
+# The RAW observed set of local administrators, for the baseline-comparison control
+# server.localadmin.unapproved: the agent reports WHO has admin, and the control plane diffs that
+# against the tenant's approved baseline (the agent never judges which are "unapproved"). Observed =
+# uid-0 accounts UNION the members of the admin groups (sudo / wheel / admin). Readable without root
+# over `getent`; sudoers-file direct grants and nested group membership are a documented limitation
+# (the catalog says so), not read here, so this never OVER-reports an admin it cannot prove.
+_ADMIN_GROUPS = frozenset({"sudo", "wheel", "admin"})
+_LOCALADMIN_GROUPS_MARKER = "===GROUPS==="
+
+
+def parse_local_admins(localadmin_output: str) -> list[str] | None:
+    """The local-administrator principals (uid-0 accounts plus members of the sudo/wheel/admin groups)
+    as a sorted, de-duplicated list, or ``None`` to abstain when the text is not a passwd dump. This is
+    the RAW observed set: the agent does NOT decide which are unapproved; the control plane diffs it
+    against the approved baseline. The ``===GROUPS===`` marker separates the ``getent passwd`` half from
+    the ``getent group`` half of the one combined read."""
+    passwd_part, _, group_part = localadmin_output.partition(_LOCALADMIN_GROUPS_MARKER)
+    admins: set[str] = set()
+    saw_passwd = False
+    for line in passwd_part.splitlines():
+        fields = line.split(":")
+        if len(fields) < 4 or not fields[2].isdigit():
+            continue
+        saw_passwd = True
+        if int(fields[2]) == 0 and fields[0]:
+            admins.add(fields[0])
+    if not saw_passwd:
+        return None
+    for line in group_part.splitlines():
+        fields = line.split(":")
+        if len(fields) < 4 or fields[0].lower() not in _ADMIN_GROUPS:
+            continue
+        for member in fields[3].split(","):
+            if member.strip():
+                admins.add(member.strip())
+    return sorted(admins)
+
+
 _FIELD_EXTRACTORS = {
+    ("server.localadmin.unapproved", "observed_local_admins"): (
+        SOURCE_LOCALADMIN,
+        parse_local_admins,
+    ),
     ("server.ssh.password", "ssh_password_authentication"): (
         SOURCE_SSHD,
         parse_password_authentication,

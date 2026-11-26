@@ -58,3 +58,11 @@ def test_collect_control_fields_delegates_and_abstains() -> None:
         "wildcard_read_write_export": True
     }
     assert host_tier.collect_control_fields(sources, "net.management.telnet") is None
+
+
+def test_is_baseline_control_marks_only_the_baseline_comparison_controls() -> None:
+    assert host_tier.is_baseline_control("server.localadmin.unapproved") is True
+    # a factual-absolute host control is NOT a baseline control (its field IS the finding).
+    assert host_tier.is_baseline_control("server.ssh.password") is False
+    # a control no host family serves is not a baseline control either.
+    assert host_tier.is_baseline_control("net.management.telnet") is False

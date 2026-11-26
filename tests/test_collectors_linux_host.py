@@ -343,3 +343,53 @@ def test_serves_only_host_controls() -> None:
     assert linux_host.serves("server.sysctl.ip_forwarding") is True
     assert linux_host.serves("net.management.telnet") is False
     assert linux_host.serves("server.firewall.enabled") is False
+
+
+# ── getent passwd + getent group (server.localadmin.unapproved, a baseline-comparison control) ─────
+def _localadmin(passwd: str, groups: str) -> str:
+    return f"{passwd}\n===GROUPS===\n{groups}"
+
+
+def test_parse_local_admins_collects_uid0_and_admin_group_members() -> None:
+    passwd = "root:x:0:0:root:/root:/bin/bash\nbackdoor:x:0:0::/root:/bin/bash\nalice:x:1001:1001::/home/alice:/bin/bash\nbob:x:1002:1002::/home/bob:/bin/bash"
+    groups = "sudo:x:27:alice\nwheel:x:10:bob\nusers:x:100:alice,bob"
+    assert linux_host.parse_local_admins(_localadmin(passwd, groups)) == [
+        "alice",
+        "backdoor",
+        "bob",
+        "root",
+    ]
+
+
+def test_a_clean_host_reports_only_root() -> None:
+    passwd = "root:x:0:0:root:/root:/bin/bash\nalice:x:1001:1001::/home/alice:/bin/bash"
+    groups = "sudo:x:27:\nusers:x:100:alice"
+    assert linux_host.parse_local_admins(_localadmin(passwd, groups)) == ["root"]
+
+
+def test_non_admin_groups_are_ignored() -> None:
+    passwd = "root:x:0:0:root:/root:/bin/bash"
+    groups = "docker:x:999:alice\nadm:x:4:bob"
+    assert linux_host.parse_local_admins(_localadmin(passwd, groups)) == ["root"]
+
+
+def test_admin_group_name_matches_admin_too() -> None:
+    passwd = "root:x:0:0:root:/root:/bin/bash"
+    groups = "admin:x:50:carol,dave"
+    assert linux_host.parse_local_admins(_localadmin(passwd, groups)) == ["carol", "dave", "root"]
+
+
+def test_local_admins_abstains_on_non_passwd_text() -> None:
+    assert linux_host.parse_local_admins("not a passwd dump") is None
+    assert linux_host.parse_local_admins("") is None
+
+
+def test_local_admins_control_served_and_baseline() -> None:
+    assert linux_host.serves("server.localadmin.unapproved") is True
+    assert "server.localadmin.unapproved" in linux_host.BASELINE_CONTROLS
+    # the field it emits is the OBSERVED set, not a pre-judged count.
+    fields = linux_host.collect_control_fields(
+        {"localadmin": _localadmin("root:x:0:0::/root:/bin/sh\neve:x:0:0::/root:/bin/sh", "")},
+        "server.localadmin.unapproved",
+    )
+    assert fields == {"observed_local_admins": ["eve", "root"]}
