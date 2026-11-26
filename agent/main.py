@@ -51,6 +51,7 @@ from agent.collectors import (
     host_tier,
     kube_collect,
     ldap_query,
+    mail_dns,
     mysql_query,
     ssh_collect,
     vendor,
@@ -1991,6 +1992,7 @@ async def _collect_controls(
     vsphere_ids = [cid for cid in control_ids if vsphere_collect.serves(cid)]
     mysql_ids = [cid for cid in control_ids if mysql_query.serves(cid)]
     backup_ids = [cid for cid in control_ids if backup_collect.serves(cid)]
+    mail_dns_ids = [cid for cid in control_ids if mail_dns.serves(cid)]
     network_ids = [
         cid
         for cid in control_ids
@@ -2001,6 +2003,7 @@ async def _collect_controls(
         and not vsphere_collect.serves(cid)
         and not mysql_query.serves(cid)
         and not backup_collect.serves(cid)
+        and not mail_dns.serves(cid)
     ]
     controls: list[dict] = []
     coverage: list[dict] = []
@@ -2053,7 +2056,50 @@ async def _collect_controls(
         )
         controls += backup_controls
         coverage += backup_coverage
+    if mail_dns_ids:
+        mail_dns_controls, mail_dns_coverage = await _collect_mail_dns_controls(
+            job, mail_dns_ids, credential, timeout_s, max_bytes
+        )
+        controls += mail_dns_controls
+        coverage += mail_dns_coverage
     return controls, coverage, neighbours
+
+
+async def _collect_mail_dns_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float, max_bytes: int
+) -> tuple[list[dict], list[dict]]:
+    """The mail-domain DNS tier: derive the mail host's domain from its Postfix ``main.cf`` (read over
+    SSH, the same evidence the host tier uses), then resolve that domain's SPF / DMARC TXT records and
+    normalise each requested control. No credential beyond the SSH login that reads the config; the DNS
+    records are public. A host with no Postfix config (no derivable domain), or a read that fails,
+    makes every requested control UNAVAILABLE."""
+    target = job["target_address"]
+    try:
+        main_cf = await ssh_collect.collect_postfix_main_cf(
+            target, credential, timeout=timeout_s, max_bytes=max_bytes
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed read is honest UNAVAILABLE
+        return [], _unavailable_coverage(target, control_ids, f"collect_failed:{type(exc).__name__}")
+    domain = mail_dns.domain_from_postfix(main_cf)
+    if not domain:
+        return [], _unavailable_coverage(target, control_ids, "no_mail_domain_in_config")
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    for control_id in control_ids:
+        try:
+            if control_id == "mail.spf.not_enforced":
+                fields = mail_dns.spf_field(await mail_dns.fetch_spf_txt(domain, timeout=timeout_s))
+            elif control_id == "mail.dmarc.not_enforced":
+                fields = mail_dns.dmarc_field(
+                    await mail_dns.fetch_dmarc_txt(domain, timeout=timeout_s)
+                )
+            else:
+                fields = None
+        except Exception as exc:  # noqa: BLE001 - a failed resolve is honest UNAVAILABLE
+            coverage += _unavailable_coverage(target, [control_id], f"dns_failed:{type(exc).__name__}")
+            continue
+        _record_control(target, control_id, fields, controls, coverage)
+    return controls, coverage
 
 
 async def _collect_backup_controls(

@@ -66,3 +66,8 @@ pymysql==1.1.1
 # minio client, PURE-PYTHON (urllib3 + certifi + argon2/pycryptodome wheels), so the Alpine image
 # needs no C build.
 minio==7.2.20
+
+# DNS resolver for the mail-domain posture tier (mail.spf.not_enforced / mail.dmarc.not_enforced):
+# resolves the mail host's own domain's SPF / DMARC TXT records (unauthenticated, no credential).
+# Deliberately dnspython, PURE-PYTHON, so the Alpine image needs no C build.
+dnspython==2.7.0
