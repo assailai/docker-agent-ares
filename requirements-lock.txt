@@ -354,6 +354,9 @@ python-dotenv==1.0.1 \
     # via
     #   -r requirements.txt
     #   pydantic-settings
+pyvmomi==9.1.2.0 \
+    --hash=sha256:530c872550c68776498b63c382214fc36d5cf4b8af4053ca96cf266feec415b0
+    # via -r requirements.txt
 scramp==1.5.0 \
     --hash=sha256:21b88a54bc4b656f57de9f0f6be531ca99f7efe49220bbd083b84cf88748e395 \
     --hash=sha256:8280608f568e81da9e9c9d69cac1331b836622d9b48bf5c5e400e16129c6d1fa

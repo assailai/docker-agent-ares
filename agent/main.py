@@ -52,6 +52,7 @@ from agent.collectors import (
     ldap_query,
     ssh_collect,
     vendor,
+    vsphere_collect,
 )
 from agent.credential_vault import CredentialVault
 from agent.state import AgentState, fingerprint, load_state, save_state
@@ -1837,6 +1838,38 @@ def _record_control(
     )
 
 
+async def _collect_vsphere_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float
+) -> tuple[list[dict], list[dict]]:
+    """The virtualization (vSphere) tier: log in to the target vCenter/ESXi endpoint over TLS with the
+    ``vsphere_login`` reader credential, read a host property, and normalise each requested control. A
+    wrong credential kind (not vsphere_login), or a failed login/read, makes every requested control
+    UNAVAILABLE; a control this tier does not support is UNSUPPORTED."""
+    target = job["target_address"]
+    if credential.kind != "vsphere_login":
+        return [], _unavailable_coverage(
+            target, control_ids, "wrong_credential_kind:expected_vsphere_login"
+        )
+    try:
+        lockdown_modes = await vsphere_collect.fetch_host_lockdown_modes(
+            target, credential, timeout=timeout_s
+        )
+    except Exception as exc:  # noqa: BLE001 - any login/read failure is honest UNAVAILABLE
+        return [], _unavailable_coverage(
+            target, control_ids, f"collect_failed:{type(exc).__name__}"
+        )
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    for control_id in control_ids:
+        fields = (
+            vsphere_collect.host_lockdown_field(lockdown_modes)
+            if control_id == "virtualization.host.lockdown_disabled"
+            else None
+        )
+        _record_control(target, control_id, fields, controls, coverage)
+    return controls, coverage
+
+
 async def _collect_ldap_controls(
     job: dict, control_ids: list[str], credential, timeout_s: float
 ) -> tuple[list[dict], list[dict]]:
@@ -1910,6 +1943,7 @@ async def _collect_controls(
     kube_ids = [cid for cid in control_ids if kube_collect.serves(cid)]
     db_query_ids = [cid for cid in control_ids if db_query.serves(cid)]
     ldap_ids = [cid for cid in control_ids if ldap_query.serves(cid)]
+    vsphere_ids = [cid for cid in control_ids if vsphere_collect.serves(cid)]
     network_ids = [
         cid
         for cid in control_ids
@@ -1917,6 +1951,7 @@ async def _collect_controls(
         and not kube_collect.serves(cid)
         and not db_query.serves(cid)
         and not ldap_query.serves(cid)
+        and not vsphere_collect.serves(cid)
     ]
     controls: list[dict] = []
     coverage: list[dict] = []
@@ -1951,6 +1986,12 @@ async def _collect_controls(
         )
         controls += ldap_controls
         coverage += ldap_coverage
+    if vsphere_ids:
+        vsphere_controls, vsphere_coverage = await _collect_vsphere_controls(
+            job, vsphere_ids, credential, timeout_s
+        )
+        controls += vsphere_controls
+        coverage += vsphere_coverage
     return controls, coverage, neighbours
 
 

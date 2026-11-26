@@ -47,3 +47,10 @@ pg8000==1.31.2
 # from the local vault. Deliberately ldap3, the PURE-PYTHON client (depends only on pyasn1, also
 # pure-Python), so the Alpine image needs no OpenLDAP C libraries, unlike python-ldap.
 ldap3==2.9.1
+
+# vSphere client for the credentialed VIRTUALIZATION collect tier (agent/collectors/vsphere_collect.py):
+# a read-only SOAP login + property read (e.g. ESXi host lockdown mode) of a vCenter/ESXi endpoint
+# under a reader login from the local vault. pyvmomi is PURE-PYTHON; the base package has no required
+# deps (the cryptography/lxml it names are only the optional `sso` extra, which simple user/pass auth
+# does not use), so the Alpine image needs no extra build toolchain.
+pyvmomi==9.1.2.0
