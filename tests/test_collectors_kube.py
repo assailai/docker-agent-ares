@@ -127,3 +127,44 @@ def test_netpol_serves_and_field() -> None:
         "default_deny_network_policy_present": True
     }
     assert kube_collect.default_deny_field({"items": "nope"}) is None
+
+
+# ── Namespace Pod Security admission (kubernetes.admission.pod_security_disabled) ──────────────────
+def _ns(name: str, enforce: str | None = None) -> dict:
+    labels = {"pod-security.kubernetes.io/enforce": enforce} if enforce else {}
+    return {"metadata": {"name": name, "labels": labels}}
+
+
+def test_all_user_namespaces_enforcing_reads_enforced() -> None:
+    nss = {"items": [_ns("kube-system"), _ns("team-a", "restricted"), _ns("team-b", "baseline")]}
+    assert kube_collect.parse_pod_security_enforced(nss) is True
+
+
+def test_a_user_namespace_without_enforce_label_reads_not_enforced() -> None:
+    nss = {"items": [_ns("team-a", "restricted"), _ns("default")]}
+    assert kube_collect.parse_pod_security_enforced(nss) is False
+
+
+def test_privileged_enforce_level_is_not_enforcing() -> None:
+    nss = {"items": [_ns("team-a", "privileged")]}
+    assert kube_collect.parse_pod_security_enforced(nss) is False
+
+
+def test_system_namespaces_are_excluded_and_only_system_abstains() -> None:
+    # Only Kubernetes-owned namespaces: nothing user-facing to assess, so abstain.
+    nss = {"items": [_ns("kube-system"), _ns("kube-public"), _ns("kube-node-lease")]}
+    assert kube_collect.parse_pod_security_enforced(nss) is None
+
+
+def test_namespaces_not_a_list_abstains() -> None:
+    assert kube_collect.parse_pod_security_enforced({}) is None
+    assert kube_collect.parse_pod_security_enforced({"items": "nope"}) is None
+
+
+def test_namespace_serves_and_field() -> None:
+    assert kube_collect.serves("kubernetes.admission.pod_security_disabled") is True
+    assert "kubernetes.admission.pod_security_disabled" in kube_collect.NAMESPACE_CONTROLS
+    assert kube_collect.pod_security_field({"items": [_ns("team-a", "restricted")]}) == {
+        "pod_security_admission_enforced": True
+    }
+    assert kube_collect.pod_security_field({"items": "nope"}) is None

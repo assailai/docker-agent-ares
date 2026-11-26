@@ -24,7 +24,13 @@ from agent.kubeinfo import KubeApi
 # each one LISTs so the tier fetches a resource only when a control needs it.
 POD_CONTROLS = frozenset({"kubernetes.workload.privileged"})
 NETPOL_CONTROLS = frozenset({"kubernetes.network.no_default_deny"})
-SERVES = POD_CONTROLS | NETPOL_CONTROLS
+NAMESPACE_CONTROLS = frozenset({"kubernetes.admission.pod_security_disabled"})
+SERVES = POD_CONTROLS | NETPOL_CONTROLS | NAMESPACE_CONTROLS
+
+# Pod Security admission enforce levels that actually restrict workloads; "privileged" (or an absent
+# label) does not enforce.
+_PSA_ENFORCING_LEVELS = frozenset({"baseline", "restricted"})
+_PSA_ENFORCE_LABEL = "pod-security.kubernetes.io/enforce"
 
 # The Kubernetes-owned namespaces: privileged system pods (CNI, kube-proxy) live here and are expected
 # platform components, so a privileged-workload finding counts USER namespaces only to avoid a false
@@ -118,6 +124,38 @@ def default_deny_field(netpols: dict) -> dict[str, object] | None:
     return None if present is None else {"default_deny_network_policy_present": present}
 
 
+def parse_pod_security_enforced(namespaces: dict) -> bool | None:
+    """Whether Pod Security admission is enforced across the cluster: every USER namespace carries a
+    ``pod-security.kubernetes.io/enforce`` label of baseline or restricted. ``None`` to abstain when
+    the input is not a namespace list or there are no user namespaces. A single user namespace without
+    an enforcing level (absent, or ``privileged``) makes the posture not-enforced (a finding), because
+    an unconstrained namespace is where an attacker lands; the Kubernetes-owned namespaces are
+    excluded."""
+    items = namespaces.get("items")
+    if not isinstance(items, list):
+        return None
+    user_namespaces = [
+        ns
+        for ns in items
+        if isinstance(ns, dict)
+        and (ns.get("metadata") or {}).get("name") not in _SYSTEM_NAMESPACES
+    ]
+    if not user_namespaces:
+        return None
+    for namespace in user_namespaces:
+        labels = (namespace.get("metadata") or {}).get("labels") or {}
+        if labels.get(_PSA_ENFORCE_LABEL) not in _PSA_ENFORCING_LEVELS:
+            return False
+    return True
+
+
+def pod_security_field(namespaces: dict) -> dict[str, object] | None:
+    """The ``kubernetes.admission.pod_security_disabled`` field dict from a namespace list, or ``None``
+    to abstain."""
+    enforced = parse_pod_security_enforced(namespaces)
+    return None if enforced is None else {"pod_security_admission_enforced": enforced}
+
+
 async def _fetch_list(api: KubeApi, path: str, max_items: int) -> dict:
     """Page through a read-only LIST GET and return one ``{"items": [...]}`` document, bounded by
     ``max_items`` (build-for-scale). A LIST GET only, no watch, no write. Raises on connect/auth/HTTP
@@ -149,6 +187,11 @@ async def fetch_pods(api: KubeApi) -> dict:
 async def fetch_networkpolicies(api: KubeApi) -> dict:
     """The cluster's NetworkPolicies across all namespaces, paged read-only (bounded)."""
     return await _fetch_list(api, "/apis/networking.k8s.io/v1/networkpolicies", _MAX_PODS)
+
+
+async def fetch_namespaces(api: KubeApi) -> dict:
+    """The cluster's namespaces (metadata + labels), paged read-only (bounded)."""
+    return await _fetch_list(api, "/api/v1/namespaces", _MAX_PODS)
 
 
 def api_for(target: str, token: str, *, timeout: float, verify: str | bool = False) -> KubeApi:

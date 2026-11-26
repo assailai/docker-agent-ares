@@ -1772,6 +1772,19 @@ async def _collect_kube_controls(
                 target, "kubernetes.network.no_default_deny", netpol_ids, netpols,
                 kube_collect.default_deny_field, controls, coverage,
             )
+    namespace_ids = [cid for cid in control_ids if cid in kube_collect.NAMESPACE_CONTROLS]
+    if namespace_ids:
+        try:
+            namespaces = await kube_collect.fetch_namespaces(api)
+        except Exception as exc:  # noqa: BLE001 - a failed read is honest UNAVAILABLE, not a crash
+            coverage += _unavailable_coverage(
+                target, namespace_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            _append_kube_control(
+                target, "kubernetes.admission.pod_security_disabled", namespace_ids, namespaces,
+                kube_collect.pod_security_field, controls, coverage,
+            )
     return controls, coverage
 
 
