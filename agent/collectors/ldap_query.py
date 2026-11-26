@@ -29,7 +29,8 @@ from agent.credential_vault import Credential
 
 DELEGATION_CONTROLS = frozenset({"identity.delegation.unconstrained"})
 KRBTGT_CONTROLS = frozenset({"identity.krbtgt.rotation_stale"})
-SERVES = DELEGATION_CONTROLS | KRBTGT_CONTROLS
+STALE_CONTROLS = frozenset({"identity.stale.privileged_principals"})
+SERVES = DELEGATION_CONTROLS | KRBTGT_CONTROLS | STALE_CONTROLS
 
 # userAccountControl bit flags (Microsoft AD): a principal TRUSTED_FOR_DELEGATION (unconstrained) is
 # the finding; a SERVER_TRUST_ACCOUNT (a domain controller) holds that flag legitimately and is
@@ -215,3 +216,101 @@ async def fetch_krbtgt_pwdlastset(
     """The krbtgt account's pwdLastSet, read over LDAPS. Runs the synchronous ldap3 bind in a thread.
     Raises on bind/search failure, which the caller records as honest UNAVAILABLE."""
     return await asyncio.to_thread(_query_krbtgt_pwdlastset, host, port, credential, timeout)
+
+
+# ── inactive privileged principals ────────────────────────────────────────────────────────────────
+# A privileged credential nobody uses is a standing attack surface: it is unlikely to be monitored and
+# its compromise is quiet. Privileged principals are identified by adminCount=1, which AD stamps on
+# members of the protected admin groups (Domain/Enterprise/Schema Admins, Administrators) and their
+# service/computer accounts. INACTIVE = lastLogonTimestamp present AND older than a documented fixed
+# threshold (90 days, a standard benchmark, like the EOL floor); the agent applies it, so the field is
+# already a count. A never-logged-in account (lastLogonTimestamp unset) is NOT counted: absence does
+# not prove inactivity (it may be newly provisioned), so this never false-positives a fresh account.
+_STALE_FILTER = "(adminCount=1)"
+_STALE_THRESHOLD_DAYS = 90
+
+
+def _filetime_to_datetime(value: object) -> datetime | None:
+    """A Windows lastLogon/pwdLastSet value (a FILETIME integer, or a datetime ldap3 may present
+    schema-aware) as a timezone-aware datetime, or ``None`` when unset (``0``) or unreadable."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    try:
+        filetime = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if filetime <= 0:
+        return None
+    return _FILETIME_EPOCH + timedelta(microseconds=filetime // 10)
+
+
+def parse_inactive_privileged(lastlogon_values: object, now: datetime) -> int | None:
+    """The number of privileged principals whose last logon is older than the inactivity threshold, or
+    ``None`` to abstain when the input is not a list. Only a principal with a PRESENT lastLogonTimestamp
+    older than the threshold counts; a never-logged-in account (unset/0) is excluded (absence is not
+    proof of inactivity). ``now`` is injected so the computation is deterministic and testable. An
+    adminCount=1 straggler (membership cleared but the flag not reset) is a documented limitation."""
+    if not isinstance(lastlogon_values, list):
+        return None
+    cutoff = now - timedelta(days=_STALE_THRESHOLD_DAYS)
+    count = 0
+    for value in lastlogon_values:
+        last = _filetime_to_datetime(value)
+        if last is not None and last < cutoff:
+            count += 1
+    return count
+
+
+def inactive_privileged_field(lastlogon_values: object, now: datetime) -> dict[str, object] | None:
+    """The ``identity.stale.privileged_principals`` field dict from a list of lastLogonTimestamp
+    values, or ``None`` to abstain."""
+    count = parse_inactive_privileged(lastlogon_values, now)
+    return None if count is None else {"inactive_privileged_principals": count}
+
+
+def _query_privileged_lastlogon(
+    host: str, port: int, credential: Credential, timeout: float
+) -> list[object]:
+    """Bind to the DC over LDAPS, search for the privileged principals (adminCount=1), and return their
+    lastLogonTimestamp values (``None`` for an account that has none). Synchronous (ldap3 is)."""
+    timeout = max(1, int(timeout))  # ldap3 needs an int timeout (see _query_delegation_uac)
+    server = ldap3.Server(
+        host, port=port, use_ssl=True, tls=_tls(), get_info=ldap3.DSA, connect_timeout=timeout
+    )
+    connection = ldap3.Connection(
+        server,
+        user=credential.username,
+        password=credential.secret,
+        auto_bind=True,
+        receive_timeout=timeout,
+    )
+    try:
+        base = ""
+        if server.info and server.info.other:
+            contexts = server.info.other.get("defaultNamingContext") or server.info.naming_contexts
+            if contexts:
+                base = str(contexts[0])
+        if not base:
+            raise ldap3.core.exceptions.LDAPException("no defaultNamingContext on the directory")
+        connection.search(
+            base,
+            _STALE_FILTER,
+            attributes=["lastLogonTimestamp"],
+            size_limit=_MAX_PRINCIPALS,
+        )
+        values: list[object] = []
+        for entry in connection.entries:
+            attrs = entry.entry_attributes_as_dict
+            found = attrs.get("lastLogonTimestamp")
+            values.append(found[0] if found else None)
+        return values
+    finally:
+        connection.unbind()
+
+
+async def fetch_privileged_lastlogon(
+    host: str, credential: Credential, *, timeout: float, port: int = _LDAPS_PORT
+) -> list[object]:
+    """The lastLogonTimestamp values of the privileged principals, read over LDAPS. Runs the
+    synchronous ldap3 bind+search in a thread. Raises on bind/search failure (honest UNAVAILABLE)."""
+    return await asyncio.to_thread(_query_privileged_lastlogon, host, port, credential, timeout)

@@ -133,3 +133,42 @@ def test_float_timeout_is_coerced_to_int_for_ldap3(monkeypatch) -> None:
 
 def _cred() -> Credential:
     return Credential(kind="ldap_bind", username="Administrator@LAB.LOCAL", secret="pw")
+
+
+# ── inactive privileged principals (identity.stale.privileged_principals) ──────────────────────────
+from datetime import UTC, datetime, timedelta  # noqa: E402
+
+_NOW = datetime(2026, 11, 26, tzinfo=UTC)
+
+
+def test_counts_only_privileged_principals_inactive_beyond_the_threshold() -> None:
+    values = [
+        _NOW - timedelta(days=200),  # stale -> counts
+        _NOW - timedelta(days=30),  # recently active -> does not count
+        None,  # never logged in -> NOT counted (absence is not inactivity)
+        _NOW - timedelta(days=91),  # just past the 90-day threshold -> counts
+    ]
+    assert ldap_query.parse_inactive_privileged(values, _NOW) == 2
+
+
+def test_never_logged_in_privileged_account_is_not_a_false_positive() -> None:
+    assert ldap_query.parse_inactive_privileged([None, 0], _NOW) == 0
+
+
+def test_inactive_privileged_accepts_filetime_integers() -> None:
+    # a FILETIME for 2020-01-01 (well past the threshold) counts; 0 (unset) does not.
+    old_ft = int((datetime(2020, 1, 1, tzinfo=UTC) - datetime(1601, 1, 1, tzinfo=UTC)).total_seconds() * 10_000_000)
+    assert ldap_query.parse_inactive_privileged([old_ft, 0], _NOW) == 1
+
+
+def test_inactive_privileged_abstains_on_non_list() -> None:
+    assert ldap_query.parse_inactive_privileged("nope", _NOW) is None
+    assert ldap_query.parse_inactive_privileged(None, _NOW) is None
+
+
+def test_inactive_privileged_field_and_serves() -> None:
+    assert ldap_query.serves("identity.stale.privileged_principals") is True
+    assert ldap_query.inactive_privileged_field([_NOW - timedelta(days=120)], _NOW) == {
+        "inactive_privileged_principals": 1
+    }
+    assert ldap_query.inactive_privileged_field("nope", _NOW) is None

@@ -2079,6 +2079,25 @@ async def _collect_ldap_controls(
                     else None
                 )
                 _record_control(target, control_id, fields, controls, coverage)
+    stale_ids = [cid for cid in control_ids if cid in ldap_query.STALE_CONTROLS]
+    if stale_ids:
+        try:
+            lastlogon = await ldap_query.fetch_privileged_lastlogon(
+                target, credential, timeout=timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - any bind/search failure is honest UNAVAILABLE
+            coverage += _unavailable_coverage(
+                target, stale_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            now = datetime.now(UTC)
+            for control_id in stale_ids:
+                fields = (
+                    ldap_query.inactive_privileged_field(lastlogon, now)
+                    if control_id == "identity.stale.privileged_principals"
+                    else None
+                )
+                _record_control(target, control_id, fields, controls, coverage)
     return controls, coverage
 
 
