@@ -31,9 +31,13 @@ NETPOL_CONTROLS = frozenset({"kubernetes.network.no_default_deny"})
 NAMESPACE_CONTROLS = frozenset({"kubernetes.admission.pod_security_disabled"})
 SERVES = POD_CONTROLS | NETPOL_CONTROLS | NAMESPACE_CONTROLS
 # Probed WITHOUT the token, so NOT part of the authenticated LIST tier (SERVES): whether the API
-# server accepts the anonymous identity at all. A separate `probes()` predicate so the dispatcher
-# runs it as a no-credential probe, not through the k8s_token tier.
-PROBE_CONTROLS = frozenset({"kubernetes.api.anonymous"})
+# server (and the kubelet) accept the anonymous identity at all. A separate `probes()` predicate so
+# the dispatcher runs these as no-credential probes, not through the k8s_token tier.
+PROBE_CONTROLS = frozenset({"kubernetes.api.anonymous", "kubernetes.kubelet.unauthenticated"})
+
+# The kubelet's read-only/authenticated API port. An anonymous request reaching a non-401 answer here
+# means the kubelet accepts unauthenticated callers (a node-takeover surface).
+_KUBELET_PORT = 10250
 
 # Pod Security admission enforce levels that actually restrict workloads; "privileged" (or an absent
 # label) does not enforce.
@@ -248,4 +252,27 @@ async def fetch_anonymous_auth(target: str, *, timeout: float, verify: str | boo
         verify_arg = ctx
     async with httpx.AsyncClient(verify=verify_arg, timeout=timeout) as client:
         response = await client.get(url, headers={"Accept": "application/json"})
+    return response.status_code != 401
+
+
+def kubelet_anonymous_field(anonymous_enabled: object) -> dict[str, object] | None:
+    """The ``kubernetes.kubelet.unauthenticated`` field dict from the kubelet anonymous-auth probe, or
+    ``None`` to abstain when the probe did not return a boolean."""
+    if not isinstance(anonymous_enabled, bool):
+        return None
+    return {"kubelet_anonymous_auth_enabled": anonymous_enabled}
+
+
+async def fetch_kubelet_anonymous(target: str, *, timeout: float) -> bool:
+    """Whether the kubelet accepts the ANONYMOUS identity, probed WITHOUT a token: a GET to the
+    kubelet's ``/pods`` with no Authorization header. ``401 Unauthorized`` means anonymous is rejected
+    (``--anonymous-auth=false``, the hardened default); any other status means the kubelet served an
+    unauthenticated caller (enabled, a node-takeover surface). TLS without verification (the kubelet
+    serves its own cert); the probe sends no credential. Raises on connect failure (UNAVAILABLE)."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    url = f"https://{target}:{_KUBELET_PORT}/pods"
+    async with httpx.AsyncClient(verify=ctx, timeout=timeout) as client:
+        response = await client.get(url)
     return response.status_code != 401

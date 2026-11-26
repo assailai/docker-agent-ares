@@ -176,3 +176,12 @@ def test_anonymous_auth_field_and_serves() -> None:
     assert kc.anonymous_auth_field(True) == {"anonymous_auth_enabled": True}
     assert kc.anonymous_auth_field(False) == {"anonymous_auth_enabled": False}
     assert kc.anonymous_auth_field("x") is None
+
+
+def test_kubelet_probe_field_and_serves() -> None:
+    from agent.collectors import kube_collect as kc
+    assert kc.probes("kubernetes.kubelet.unauthenticated") is True
+    assert kc.serves("kubernetes.kubelet.unauthenticated") is False
+    assert kc.kubelet_anonymous_field(True) == {"kubelet_anonymous_auth_enabled": True}
+    assert kc.kubelet_anonymous_field(False) == {"kubelet_anonymous_auth_enabled": False}
+    assert kc.kubelet_anonymous_field(None) is None

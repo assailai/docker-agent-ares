@@ -1805,6 +1805,9 @@ async def _collect_kube_probe_controls(
             if control_id == "kubernetes.api.anonymous":
                 enabled = await kube_collect.fetch_anonymous_auth(target, timeout=timeout_s)
                 fields = kube_collect.anonymous_auth_field(enabled)
+            elif control_id == "kubernetes.kubelet.unauthenticated":
+                enabled = await kube_collect.fetch_kubelet_anonymous(target, timeout=timeout_s)
+                fields = kube_collect.kubelet_anonymous_field(enabled)
             else:
                 fields = None
         except Exception as exc:  # noqa: BLE001 - a failed probe is honest UNAVAILABLE
