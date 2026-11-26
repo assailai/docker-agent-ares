@@ -34,6 +34,20 @@ SOURCE_FIREWALL = "firewall"
 SOURCE_PKG_AUTO = "pkg_auto"
 SOURCE_AUDIT = "audit"
 
+# Each evidence source -> the ssh_collect reader function (named, not imported, so a test that
+# monkeypatches ssh_collect still reaches it: it is resolved off the module at call time). The host
+# tier merges this map across every host collector, so adding a source is one entry here plus its
+# reader. Source keys are globally unique across the host collectors, so the merge never clobbers.
+SOURCE_READERS = {
+    SOURCE_SSHD: "collect_sshd_effective_config",
+    SOURCE_SYSCTL: "collect_sysctl_config",
+    SOURCE_PASSWD: "collect_passwd_database",
+    SOURCE_PKG: "collect_pkg_config",
+    SOURCE_FIREWALL: "collect_firewall_state",
+    SOURCE_PKG_AUTO: "collect_pkg_auto_config",
+    SOURCE_AUDIT: "collect_auditd_state",
+}
+
 
 # ── sshd -T (effective SSH daemon configuration) ──────────────────────────────────────────────────
 # A handful of directives every real ``sshd -T`` dump carries. If none appear, the text is not an

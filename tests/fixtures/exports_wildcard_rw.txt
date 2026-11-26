@@ -1,0 +1,3 @@
+# /etc/exports - NFS export table
+/srv/nfs/public   *(rw,sync,no_root_squash)
+/srv/nfs/team     10.0.0.0/24(rw,sync)

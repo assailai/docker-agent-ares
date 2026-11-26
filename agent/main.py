@@ -45,7 +45,7 @@ from agent import (
     protocols,
     snmp,
 )
-from agent.collectors import linux_host, ssh_collect, vendor
+from agent.collectors import host_tier, ssh_collect, vendor
 from agent.credential_vault import CredentialVault
 from agent.state import AgentState, fingerprint, load_state, save_state
 from agent.tunnel import (
@@ -1643,20 +1643,6 @@ async def _collect_network_controls(
     return controls, coverage, neighbours
 
 
-# The ssh_collect function that reads each host evidence source, named (not bound) so a test that
-# monkeypatches ssh_collect still reaches it: it is resolved off the module at call time. A new host
-# source is one entry here plus its collect function; the parser decides which source a control reads.
-_HOST_SOURCE_COLLECTOR_NAMES = {
-    linux_host.SOURCE_SSHD: "collect_sshd_effective_config",
-    linux_host.SOURCE_SYSCTL: "collect_sysctl_config",
-    linux_host.SOURCE_PASSWD: "collect_passwd_database",
-    linux_host.SOURCE_PKG: "collect_pkg_config",
-    linux_host.SOURCE_FIREWALL: "collect_firewall_state",
-    linux_host.SOURCE_PKG_AUTO: "collect_pkg_auto_config",
-    linux_host.SOURCE_AUDIT: "collect_auditd_state",
-}
-
-
 async def _collect_host_controls(
     job: dict, control_ids: list[str], credential, timeout_s: float, max_bytes: int
 ) -> tuple[list[dict], list[dict]]:
@@ -1669,8 +1655,8 @@ async def _collect_host_controls(
     target = job["target_address"]
     sources: dict[str, str] = {}
     failed: dict[str, str] = {}
-    for source in linux_host.sources_for(control_ids):
-        collect = getattr(ssh_collect, _HOST_SOURCE_COLLECTOR_NAMES[source])
+    for source in host_tier.sources_for(control_ids):
+        collect = getattr(ssh_collect, host_tier.SOURCE_READERS[source])
         try:
             sources[source] = await collect(
                 target, credential, timeout=timeout_s, max_bytes=max_bytes
@@ -1680,7 +1666,7 @@ async def _collect_host_controls(
     controls: list[dict] = []
     coverage: list[dict] = []
     for control_id in control_ids:
-        source = linux_host.source_for(control_id)
+        source = host_tier.source_for(control_id)
         if source in failed:
             coverage.append(
                 assessment_collect.coverage_entry(
@@ -1688,7 +1674,7 @@ async def _collect_host_controls(
                 )
             )
             continue
-        fields = linux_host.collect_control_fields(sources, control_id)
+        fields = host_tier.collect_control_fields(sources, control_id)
         if fields is None:
             coverage.append(
                 assessment_collect.coverage_entry(
@@ -1717,8 +1703,8 @@ async def _collect_controls(
     if credential is None:
         return [], _unavailable_coverage(target, control_ids, "no_local_credential"), []
     timeout_s, max_bytes = _effective_collect_budget(job)
-    host_ids = [cid for cid in control_ids if linux_host.serves(cid)]
-    network_ids = [cid for cid in control_ids if not linux_host.serves(cid)]
+    host_ids = [cid for cid in control_ids if host_tier.serves(cid)]
+    network_ids = [cid for cid in control_ids if not host_tier.serves(cid)]
     controls: list[dict] = []
     coverage: list[dict] = []
     neighbours: list[dict] = []

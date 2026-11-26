@@ -45,6 +45,10 @@ _PKG_AUTO_COMMAND = "cat /etc/dnf/automatic.conf"
 _AUDITD_STATE_COMMAND = (
     "systemctl is-enabled auditd 2>&1; echo '===ACTIVE==='; systemctl is-active auditd 2>&1"
 )
+# The NFS server's export table (``/etc/exports`` plus any drop-ins). Read-only file read; a host that
+# is not an NFS server has no such file and the read yields empty output, which the parser abstains on
+# (no exports is not a weakness we can assert) rather than reading as a host with no wildcard export.
+_NFS_EXPORTS_COMMAND = "cat /etc/exports 2>/dev/null; cat /etc/exports.d/*.exports 2>/dev/null"
 
 
 async def _run_show(
@@ -225,4 +229,21 @@ async def collect_auditd_state(
     logging disabled (it may ship its logs through journald/rsyslog to a SIEM instead)."""
     return await _run_show(
         host, credential, _AUDITD_STATE_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
+    )
+
+
+async def collect_nfs_exports(
+    host: str,
+    credential: Credential,
+    *,
+    port: int = 22,
+    timeout: float = 20.0,
+    max_bytes: int = 500_000,
+) -> str:
+    """The host's NFS export table (``/etc/exports`` plus ``/etc/exports.d/*.exports``), truncated.
+    Read-only file read: it prints the exports and changes nothing. Used for the host tier
+    (``storage.nfs.*``); a host that is not an NFS server has no such file and the read yields empty
+    output, which the parser abstains on rather than reading as a host with no wildcard export."""
+    return await _run_show(
+        host, credential, _NFS_EXPORTS_COMMAND, port=port, timeout=timeout, max_bytes=max_bytes
     )
