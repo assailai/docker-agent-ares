@@ -50,6 +50,7 @@ from agent.collectors import (
     host_tier,
     kube_collect,
     ldap_query,
+    mysql_query,
     ssh_collect,
     vendor,
     vsphere_collect,
@@ -1851,6 +1852,36 @@ def _record_control(
     )
 
 
+async def _collect_mysql_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float
+) -> tuple[list[dict], list[dict]]:
+    """The MySQL/MariaDB query tier: open ONE read-only TLS session with the ``mysql_login`` reader
+    credential, run a fixed account query, and normalise each requested control. A wrong credential
+    kind, or a failed connect/query, makes every requested control UNAVAILABLE; a control this tier
+    does not support is UNSUPPORTED."""
+    target = job["target_address"]
+    if credential.kind != "mysql_login":
+        return [], _unavailable_coverage(
+            target, control_ids, "wrong_credential_kind:expected_mysql_login"
+        )
+    try:
+        usernames = await mysql_query.fetch_usernames(target, credential, timeout=timeout_s)
+    except Exception as exc:  # noqa: BLE001 - any connect/auth/query failure is honest UNAVAILABLE
+        return [], _unavailable_coverage(
+            target, control_ids, f"collect_failed:{type(exc).__name__}"
+        )
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    for control_id in control_ids:
+        fields = (
+            mysql_query.default_accounts_field(usernames)
+            if control_id == "database.auth.default_accounts"
+            else None
+        )
+        _record_control(target, control_id, fields, controls, coverage)
+    return controls, coverage
+
+
 async def _collect_vsphere_controls(
     job: dict, control_ids: list[str], credential, timeout_s: float
 ) -> tuple[list[dict], list[dict]]:
@@ -1957,6 +1988,7 @@ async def _collect_controls(
     db_query_ids = [cid for cid in control_ids if db_query.serves(cid)]
     ldap_ids = [cid for cid in control_ids if ldap_query.serves(cid)]
     vsphere_ids = [cid for cid in control_ids if vsphere_collect.serves(cid)]
+    mysql_ids = [cid for cid in control_ids if mysql_query.serves(cid)]
     network_ids = [
         cid
         for cid in control_ids
@@ -1965,6 +1997,7 @@ async def _collect_controls(
         and not db_query.serves(cid)
         and not ldap_query.serves(cid)
         and not vsphere_collect.serves(cid)
+        and not mysql_query.serves(cid)
     ]
     controls: list[dict] = []
     coverage: list[dict] = []
@@ -2005,6 +2038,12 @@ async def _collect_controls(
         )
         controls += vsphere_controls
         coverage += vsphere_coverage
+    if mysql_ids:
+        mysql_controls, mysql_coverage = await _collect_mysql_controls(
+            job, mysql_ids, credential, timeout_s
+        )
+        controls += mysql_controls
+        coverage += mysql_coverage
     return controls, coverage, neighbours
 
 

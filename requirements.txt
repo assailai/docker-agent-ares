@@ -54,3 +54,9 @@ ldap3==2.9.1
 # deps (the cryptography/lxml it names are only the optional `sso` extra, which simple user/pass auth
 # does not use), so the Alpine image needs no extra build toolchain.
 pyvmomi==9.1.2.0
+
+# MySQL/MariaDB client for the credentialed DATABASE query tier (agent/collectors/mysql_query.py): a
+# read-only catalog query (the account list) under a reader login from the local vault. Deliberately
+# PyMySQL, the PURE-PYTHON driver (no C extension, no required deps for password auth), so the Alpine
+# image needs no build toolchain, unlike mysqlclient.
+pymysql==1.1.1
