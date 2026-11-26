@@ -1951,9 +1951,12 @@ def _record_control(
     fields: dict | None,
     controls: list[dict],
     coverage: list[dict],
+    *,
+    include_policy_gate: bool = True,
 ) -> None:
     """Append a control's facts, or an UNSUPPORTED coverage entry when the parser abstained (``fields``
-    is ``None``)."""
+    is ``None``). ``include_policy_gate=False`` for a baseline-comparison control, whose policy gate the
+    control plane earns from the tenant baseline rather than the agent asserting it."""
     if fields is None:
         coverage.append(
             assessment_collect.coverage_entry(
@@ -1962,7 +1965,9 @@ def _record_control(
         )
         return
     controls.append(
-        assessment_collect.control_facts(control_id, fields, collection_complete=True)
+        assessment_collect.control_facts(
+            control_id, fields, collection_complete=True, include_policy_gate=include_policy_gate
+        )
     )
 
 
@@ -2117,6 +2122,25 @@ async def _collect_ldap_controls(
                     else None
                 )
                 _record_control(target, control_id, fields, controls, coverage)
+    repl_ids = [cid for cid in control_ids if cid in ldap_query.REPLICATION_CONTROLS]
+    if repl_ids:
+        try:
+            replication_sd = await ldap_query.fetch_replication_sd(
+                target, credential, timeout=timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - any bind/search failure is honest UNAVAILABLE
+            coverage += _unavailable_coverage(
+                target, repl_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            for control_id in repl_ids:
+                fields = (
+                    ldap_query.replication_trustees_field(replication_sd)
+                    if control_id == "identity.replication.unapproved"
+                    else None
+                )
+                # baseline-comparison: leave the policy gate for the control plane to earn.
+                _record_control(target, control_id, fields, controls, coverage, include_policy_gate=False)
     return controls, coverage
 
 

@@ -172,3 +172,64 @@ def test_inactive_privileged_field_and_serves() -> None:
         "inactive_privileged_principals": 1
     }
     assert ldap_query.inactive_privileged_field("nope", _NOW) is None
+
+
+# ── domain replication rights (identity.replication.unapproved) ────────────────────────────────────
+import struct as _struct  # noqa: E402
+import uuid as _uuid  # noqa: E402
+
+_REPL_GUID = "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2"
+_OTHER_GUID = "00000000-0000-0000-0000-000000000000"
+
+
+def _ace(guid_str: str, sid_subs: list[int]) -> bytes:
+    guid = _uuid.UUID(guid_str).bytes_le
+    sid = bytes([1, len(sid_subs)]) + (5).to_bytes(6, "big") + b"".join(
+        s.to_bytes(4, "little") for s in sid_subs
+    )
+    body = _struct.pack("<I", 0x100) + _struct.pack("<I", 0x1) + guid + sid  # mask, flags(OBJ), guid, sid
+    return bytes([0x05, 0x00]) + _struct.pack("<H", 4 + len(body)) + body
+
+
+def _make_sd(aces: list[bytes]) -> bytes:
+    acl_body = b"".join(aces)
+    acl = (
+        bytes([4, 0])
+        + _struct.pack("<H", 8 + len(acl_body))
+        + _struct.pack("<H", len(aces))
+        + _struct.pack("<H", 0)
+        + acl_body
+    )
+    header = bytes([1, 0]) + _struct.pack("<H", 0x8004) + _struct.pack("<I", 0) * 3 + _struct.pack("<I", 20)
+    return header + acl
+
+
+def test_replication_trustees_detects_the_replication_right() -> None:
+    sd = _make_sd([_ace(_REPL_GUID, [21, 100, 200, 300, 1105])])
+    assert ldap_query.parse_replication_trustees(sd) == ["S-1-5-21-100-200-300-1105"]
+
+
+def test_non_replication_ace_is_ignored() -> None:
+    sd = _make_sd([_ace(_OTHER_GUID, [32, 544])])
+    assert ldap_query.parse_replication_trustees(sd) == []
+
+
+def test_replication_collects_only_the_replication_aces_and_dedups() -> None:
+    sd = _make_sd([_ace(_OTHER_GUID, [1]), _ace(_REPL_GUID, [5, 9]), _ace(_REPL_GUID, [5, 9])])
+    assert ldap_query.parse_replication_trustees(sd) == ["S-1-5-5-9"]
+
+
+def test_replication_abstains_on_garbage() -> None:
+    assert ldap_query.parse_replication_trustees(b"too short") is None
+    assert ldap_query.parse_replication_trustees("not bytes") is None
+    assert ldap_query.parse_replication_trustees(None) is None
+
+
+def test_replication_field_served_and_baseline() -> None:
+    assert ldap_query.serves("identity.replication.unapproved") is True
+    assert "identity.replication.unapproved" in ldap_query.BASELINE_CONTROLS
+    sd = _make_sd([_ace(_REPL_GUID, [21, 1, 2, 3, 512])])
+    assert ldap_query.replication_trustees_field(sd) == {
+        "observed_replication_principals": ["S-1-5-21-1-2-3-512"]
+    }
+    assert ldap_query.replication_trustees_field(b"x") is None

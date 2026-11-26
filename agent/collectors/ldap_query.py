@@ -21,16 +21,25 @@ from __future__ import annotations
 
 import asyncio
 import ssl
+import struct
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import ldap3
+from ldap3.protocol.microsoft import security_descriptor_control
 
 from agent.credential_vault import Credential
 
 DELEGATION_CONTROLS = frozenset({"identity.delegation.unconstrained"})
 KRBTGT_CONTROLS = frozenset({"identity.krbtgt.rotation_stale"})
 STALE_CONTROLS = frozenset({"identity.stale.privileged_principals"})
-SERVES = DELEGATION_CONTROLS | KRBTGT_CONTROLS | STALE_CONTROLS
+REPLICATION_CONTROLS = frozenset({"identity.replication.unapproved"})
+SERVES = DELEGATION_CONTROLS | KRBTGT_CONTROLS | STALE_CONTROLS | REPLICATION_CONTROLS
+# A BASELINE-COMPARISON control: the agent sends the RAW set of principals holding domain-replication
+# rights and leaves the `policy_approved` gate for the control plane, which diffs it against the
+# tenant's approved baseline (the built-in replicators - DCs, Enterprise DCs, Administrators - are
+# approved; anything else is the DCSync-rights finding).
+BASELINE_CONTROLS = frozenset({"identity.replication.unapproved"})
 
 # userAccountControl bit flags (Microsoft AD): a principal TRUSTED_FOR_DELEGATION (unconstrained) is
 # the finding; a SERVER_TRUST_ACCOUNT (a domain controller) holds that flag legitimately and is
@@ -314,3 +323,143 @@ async def fetch_privileged_lastlogon(
     """The lastLogonTimestamp values of the privileged principals, read over LDAPS. Runs the
     synchronous ldap3 bind+search in a thread. Raises on bind/search failure (honest UNAVAILABLE)."""
     return await asyncio.to_thread(_query_privileged_lastlogon, host, port, credential, timeout)
+
+
+# ── domain replication rights (identity.replication.unapproved, a baseline-comparison control) ─────
+# A principal granted the DS-Replication-Get-Changes[-All] extended rights on the domain object can
+# pull every secret in the directory (DCSync) - a total-compromise primitive. We read the domain's
+# nTSecurityDescriptor and collect the trustees (SIDs) of the ACEs that grant exactly those extended
+# rights. The built-in replicators (Domain Controllers, Enterprise DCs, Administrators) hold them by
+# design, so this is a BASELINE control: the observed set is diffed against the tenant-approved set at
+# the control plane; a principal outside it is the finding. Pure-Python parse (struct + uuid), so the
+# agent keeps its ldap3+pyasn1-only footprint. Limitation: reads the DIRECT replication-right ACEs; a
+# broader GenericAll/WriteDacl grant that also confers DCSync is a separate control.
+_REPLICATION_RIGHTS = frozenset(
+    {
+        "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2",  # DS-Replication-Get-Changes
+        "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2",  # DS-Replication-Get-Changes-All
+    }
+)
+_ACCESS_ALLOWED_OBJECT_ACE = 0x05
+_ACE_OBJECT_TYPE_PRESENT = 0x1
+_ACE_INHERITED_OBJECT_TYPE_PRESENT = 0x2
+
+
+def _guid_le(raw: bytes) -> str | None:
+    """A 16-byte Windows GUID (mixed-endian) as its canonical string, or ``None`` if not 16 bytes."""
+    if len(raw) != 16:
+        return None
+    return str(uuid.UUID(bytes_le=raw))
+
+
+def _parse_sid(sd: bytes, offset: int) -> str | None:
+    """The SID at ``offset`` as ``S-1-...``, or ``None`` when it runs past the buffer."""
+    if offset + 8 > len(sd):
+        return None
+    sub_count = sd[offset + 1]
+    end = offset + 8 + 4 * sub_count
+    if end > len(sd):
+        return None
+    authority = int.from_bytes(sd[offset + 2 : offset + 8], "big")
+    subs = [
+        int.from_bytes(sd[offset + 8 + 4 * i : offset + 12 + 4 * i], "little")
+        for i in range(sub_count)
+    ]
+    return "S-1-%d-%s" % (authority, "-".join(str(s) for s in subs))
+
+
+def parse_replication_trustees(sd_bytes: object) -> list[str] | None:
+    """The sorted, de-duplicated SIDs of principals granted a domain-replication extended right, read
+    from the domain nTSecurityDescriptor bytes, or ``None`` to abstain when the descriptor is missing
+    or unparseable (fail-closed: the control reads NOT_ASSESSED rather than a wrong set). This is the
+    RAW observed set; the control plane diffs it against the approved baseline."""
+    if not isinstance(sd_bytes, (bytes, bytearray)):
+        return None
+    sd = bytes(sd_bytes)
+    if len(sd) < 20:
+        return None
+    try:
+        dacl_offset = struct.unpack_from("<I", sd, 16)[0]
+        if dacl_offset == 0 or dacl_offset + 8 > len(sd):
+            return None
+        ace_count = struct.unpack_from("<H", sd, dacl_offset + 4)[0]
+        pos = dacl_offset + 8
+        trustees: set[str] = set()
+        for _ in range(ace_count):
+            if pos + 4 > len(sd):
+                break
+            ace_type = sd[pos]
+            ace_size = struct.unpack_from("<H", sd, pos + 2)[0]
+            if ace_size < 4 or pos + ace_size > len(sd):
+                break
+            if ace_type == _ACCESS_ALLOWED_OBJECT_ACE:
+                flags = struct.unpack_from("<I", sd, pos + 8)[0]
+                cursor = pos + 12
+                object_guid = None
+                if flags & _ACE_OBJECT_TYPE_PRESENT:
+                    object_guid = _guid_le(sd[cursor : cursor + 16])
+                    cursor += 16
+                if flags & _ACE_INHERITED_OBJECT_TYPE_PRESENT:
+                    cursor += 16
+                if object_guid in _REPLICATION_RIGHTS:
+                    sid = _parse_sid(sd, cursor)
+                    if sid is not None:
+                        trustees.add(sid)
+            pos += ace_size
+        return sorted(trustees)
+    except (struct.error, ValueError, IndexError):
+        return None
+
+
+def replication_trustees_field(sd_bytes: object) -> dict[str, object] | None:
+    """The observed-set field the agent sends for ``identity.replication.unapproved``: the SIDs with a
+    domain-replication right, under the wire key the control plane's approved-policy normalizer reads.
+    Abstains (``None``) when the descriptor is missing or unparseable."""
+    trustees = parse_replication_trustees(sd_bytes)
+    return None if trustees is None else {"observed_replication_principals": trustees}
+
+
+def _query_replication_sd(host: str, port: int, credential: Credential, timeout: float) -> object:
+    """Bind to the DC over LDAPS and return the domain object's nTSecurityDescriptor bytes (DACL only),
+    or ``None`` when absent. Synchronous (ldap3 is), so the caller runs it in a thread."""
+    timeout = max(1, int(timeout))
+    server = ldap3.Server(
+        host, port=port, use_ssl=True, tls=_tls(), get_info=ldap3.DSA, connect_timeout=timeout
+    )
+    connection = ldap3.Connection(
+        server,
+        user=credential.username,
+        password=credential.secret,
+        auto_bind=True,
+        receive_timeout=timeout,
+    )
+    try:
+        base = ""
+        if server.info and server.info.other:
+            contexts = server.info.other.get("defaultNamingContext") or server.info.naming_contexts
+            if contexts:
+                base = str(contexts[0])
+        if not base:
+            raise ldap3.core.exceptions.LDAPException("no defaultNamingContext on the directory")
+        connection.search(
+            base,
+            "(objectClass=*)",
+            search_scope=ldap3.BASE,
+            attributes=["nTSecurityDescriptor"],
+            controls=security_descriptor_control(sdflags=0x04),  # DACL_SECURITY_INFORMATION
+        )
+        for entry in connection.entries:
+            values = entry.nTSecurityDescriptor.raw_values
+            if values:
+                return values[0]
+        return None
+    finally:
+        connection.unbind()
+
+
+async def fetch_replication_sd(
+    host: str, credential: Credential, *, timeout: float, port: int = _LDAPS_PORT
+) -> object:
+    """The domain object's nTSecurityDescriptor, read over LDAPS (for the replication-rights control).
+    Runs the synchronous ldap3 bind+read in a thread. Raises on bind/search failure (UNAVAILABLE)."""
+    return await asyncio.to_thread(_query_replication_sd, host, port, credential, timeout)
