@@ -45,7 +45,7 @@ from agent import (
     protocols,
     snmp,
 )
-from agent.collectors import host_tier, ssh_collect, vendor
+from agent.collectors import host_tier, kube_collect, ssh_collect, vendor
 from agent.credential_vault import CredentialVault
 from agent.state import AgentState, fingerprint, load_state, save_state
 from agent.tunnel import (
@@ -1693,23 +1693,69 @@ async def _collect_host_controls(
     return controls, coverage
 
 
+async def _collect_kube_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float
+) -> tuple[list[dict], list[dict]]:
+    """The Kubernetes API tier: authenticate to the target's API server with the ``k8s_token``
+    credential and LIST read-only, normalising each requested control. A wrong credential kind (not a
+    k8s_token), or a failed read (unreachable / unauthorized), makes every requested control
+    UNAVAILABLE; a control the kube collector does not support is UNSUPPORTED. No SSH is opened: this
+    tier talks to the API server, not a host shell."""
+    target = job["target_address"]
+    if credential.kind != "k8s_token":
+        return [], _unavailable_coverage(
+            target, control_ids, "wrong_credential_kind:expected_k8s_token"
+        )
+    try:
+        api = kube_collect.api_for(target, credential.secret, timeout=timeout_s)
+        pods = await kube_collect.fetch_pods(api)
+    except Exception as exc:  # noqa: BLE001 - any connect/auth/read failure is honest UNAVAILABLE
+        return [], _unavailable_coverage(
+            target, control_ids, f"collect_failed:{type(exc).__name__}"
+        )
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    for control_id in control_ids:
+        fields = (
+            kube_collect.privileged_workloads_field(pods)
+            if control_id == "kubernetes.workload.privileged"
+            else None
+        )
+        if fields is None:
+            coverage.append(
+                assessment_collect.coverage_entry(
+                    scope=f"{target}:{control_id}", state="unsupported", reason_code="no_parser"
+                )
+            )
+            continue
+        controls.append(
+            assessment_collect.control_facts(control_id, fields, collection_complete=True)
+        )
+    return controls, coverage
+
+
 async def _collect_controls(
     job: dict, control_ids: list[str], credential
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """Normalise each requested control from its evidence source, and read the device's neighbours.
     Returns (controls, coverage, neighbours).
 
-    A collect job's controls are partitioned by evidence source: a ``server.ssh.*`` control is read
-    from the host's ``sshd -T`` effective config, every other control from the device running-config.
-    Each source is opened at most once and only when a control needs it, so a host-only job never
-    dials for a running-config it would not use and a device-only job behaves exactly as before. No
+    A collect job's controls are partitioned by evidence source: a host control is read over SSH from
+    the host's own config, a ``kubernetes.*`` control from the API server (token-authenticated LIST),
+    every other control from the device running-config. Each transport is opened at most once and only
+    when a control needs it, so a host-only job never dials for a running-config it would not use. No
     local credential makes every requested control UNAVAILABLE (honest coverage), never a guess."""
     target = job["target_address"]
     if credential is None:
         return [], _unavailable_coverage(target, control_ids, "no_local_credential"), []
     timeout_s, max_bytes = _effective_collect_budget(job)
     host_ids = [cid for cid in control_ids if host_tier.serves(cid)]
-    network_ids = [cid for cid in control_ids if not host_tier.serves(cid)]
+    kube_ids = [cid for cid in control_ids if kube_collect.serves(cid)]
+    network_ids = [
+        cid
+        for cid in control_ids
+        if not host_tier.serves(cid) and not kube_collect.serves(cid)
+    ]
     controls: list[dict] = []
     coverage: list[dict] = []
     neighbours: list[dict] = []
@@ -1725,6 +1771,12 @@ async def _collect_controls(
         )
         controls += host_controls
         coverage += host_coverage
+    if kube_ids:
+        kube_controls, kube_coverage = await _collect_kube_controls(
+            job, kube_ids, credential, timeout_s
+        )
+        controls += kube_controls
+        coverage += kube_coverage
     return controls, coverage, neighbours
 
 

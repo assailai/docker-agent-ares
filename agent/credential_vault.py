@@ -24,11 +24,12 @@ _FILE_MODE = 0o600
 
 @dataclass(frozen=True, slots=True)
 class Credential:
-    """One resolved credential for a read-only device session. ``secret`` is a password or a private
-    key depending on ``kind``; it is held only in memory for the length of one collection and never
-    logged or sent."""
+    """One resolved credential for a read-only collection. ``secret`` is a password, a private key, or
+    a bearer token depending on ``kind``; it is held only in memory for the length of one collection
+    and never logged or sent. ``username`` is the login for the SSH kinds and is unused (``""``) for a
+    bearer-token kind, where the token alone authenticates."""
 
-    kind: str  # "ssh_password" | "ssh_key"
+    kind: str  # "ssh_password" | "ssh_key" | "k8s_token"
     username: str
     secret: str
 
@@ -53,7 +54,13 @@ class CredentialVault:
         if not isinstance(entry, dict):
             return None
         kind, username, secret = entry.get("kind"), entry.get("username"), entry.get("secret")
-        if kind not in ("ssh_password", "ssh_key") or not isinstance(username, str):
+        if kind not in ("ssh_password", "ssh_key", "k8s_token"):
+            return None
+        # The SSH kinds need a login; a bearer token authenticates on its own, so its username is
+        # optional and defaults to empty.
+        if kind == "k8s_token":
+            username = username if isinstance(username, str) else ""
+        elif not isinstance(username, str):
             return None
         if not isinstance(secret, str) or not secret:
             return None
