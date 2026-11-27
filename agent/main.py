@@ -2289,6 +2289,30 @@ async def _collect_ldap_controls(
     return controls, coverage
 
 
+def _partition_host_tiers(
+    control_ids: list[str], *, is_winrm: bool
+) -> tuple[list[str], list[str]]:
+    """Split the host controls between the SSH (Linux) and WinRM (Windows) tiers by credential kind,
+    returning ``(host_ids, windows_ids)``.
+
+    A `server.*` control is read over SSH or WinRM depending on the job's credential. The one control
+    both tiers serve, `server.localadmin.unapproved`, is routed by that kind: to the Windows tier for a
+    winrm_login job, to the SSH host tier otherwise, so it never gets double coverage. A Windows-only
+    control always goes to the Windows tier, which reports UNAVAILABLE for a non-winrm credential
+    (honest: a Windows control needs a Windows credential)."""
+    host_ids = [
+        cid
+        for cid in control_ids
+        if host_tier.serves(cid) and not (is_winrm and windows_host.serves(cid))
+    ]
+    windows_ids = [
+        cid
+        for cid in control_ids
+        if windows_host.serves(cid) and (is_winrm or not host_tier.serves(cid))
+    ]
+    return host_ids, windows_ids
+
+
 async def _collect_controls(
     job: dict, control_ids: list[str], credential
 ) -> tuple[list[dict], list[dict], list[dict]]:
@@ -2320,18 +2344,9 @@ async def _collect_controls(
         coverage += _unavailable_coverage(target, credentialed_ids, "no_local_credential")
         return controls, coverage, neighbours
     control_ids = credentialed_ids
-    # A `server.*` host control is read over SSH (Linux) or WinRM (Windows) depending on the job's
-    # credential kind. The one control both tiers serve, `server.localadmin.unapproved`, is routed by
-    # that kind: to the Windows tier for a winrm_login job, to the SSH host tier otherwise, so it never
-    # gets double coverage. Windows-only controls always go to the Windows tier, which reports
-    # UNAVAILABLE when the credential is not a winrm_login (honest: a Windows control needs a Windows
-    # credential).
-    is_winrm = credential.kind == "winrm_login"
-    host_ids = [
-        cid
-        for cid in control_ids
-        if host_tier.serves(cid) and not (is_winrm and windows_host.serves(cid))
-    ]
+    host_ids, windows_ids = _partition_host_tiers(
+        control_ids, is_winrm=credential.kind == "winrm_login"
+    )
     kube_ids = [cid for cid in control_ids if kube_collect.serves(cid)]
     db_query_ids = [cid for cid in control_ids if db_query.serves(cid)]
     ldap_ids = [cid for cid in control_ids if ldap_query.serves(cid)]
@@ -2339,11 +2354,6 @@ async def _collect_controls(
     mysql_ids = [cid for cid in control_ids if mysql_query.serves(cid)]
     backup_ids = [cid for cid in control_ids if backup_collect.serves(cid)]
     storage_ids = [cid for cid in control_ids if storage_mgmt.serves(cid)]
-    windows_ids = [
-        cid
-        for cid in control_ids
-        if windows_host.serves(cid) and (is_winrm or not host_tier.serves(cid))
-    ]
     mail_dns_ids = [cid for cid in control_ids if mail_dns.serves(cid)]
     network_ids = [
         cid
