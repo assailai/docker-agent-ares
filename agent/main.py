@@ -1946,10 +1946,6 @@ async def _collect_windows_controls(
             windows_host.smb_signing_field, controls, coverage,
         )
         _append_resource_control(
-            target, "server.boot.disk_unencrypted", posture_ids, posture,
-            windows_host.disk_encryption_field, controls, coverage,
-        )
-        _append_resource_control(
             target, "server.firewall.enabled", posture_ids, posture,
             windows_host.firewall_enabled_field, controls, coverage,
         )

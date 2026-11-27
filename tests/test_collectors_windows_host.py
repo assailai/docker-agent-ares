@@ -13,7 +13,6 @@ def _posture(
     rdp_ua: int = 1,
     smb1: bool = False,
     smb_signing: bool = True,
-    bitlocker: int = 1,
     firewall_enabled: bool = True,
     firewall_inbound: str = "Block",
     admins: list[str] | None = None,
@@ -24,7 +23,6 @@ def _posture(
         "rdp_user_authentication": rdp_ua,
         "smb1_enabled": smb1,
         "smb_signing_required": smb_signing,
-        "bitlocker_protection": bitlocker,
         "firewall_enabled": firewall_enabled,
         "firewall_default_inbound": firewall_inbound,
         "local_admins": ["BUILTIN\\Administrator"] if admins is None else admins,
@@ -48,14 +46,6 @@ def test_smbv1_and_signing_booleans() -> None:
     assert windows_host.parse_smbv1_enabled({"smb1_enabled": "no"}) is None
 
 
-def test_bitlocker_protection_status() -> None:
-    assert windows_host.parse_full_disk_encryption_enabled(_posture(bitlocker=1)) is True
-    assert windows_host.parse_full_disk_encryption_enabled(_posture(bitlocker=0)) is False  # finding
-    # BitLocker feature absent -> null -> abstain (not a false "unencrypted")
-    assert windows_host.parse_full_disk_encryption_enabled({"bitlocker_protection": None}) is None
-    assert windows_host.parse_full_disk_encryption_enabled({"bitlocker_protection": True}) is None
-
-
 def test_firewall_enabled_and_permissive() -> None:
     assert windows_host.parse_firewall_enabled(_posture(firewall_enabled=True)) is True
     assert windows_host.parse_firewall_enabled(_posture(firewall_enabled=False)) is False  # finding
@@ -69,15 +59,13 @@ def test_firewall_enabled_and_permissive() -> None:
 
 
 def test_posture_field_dicts_and_abstain() -> None:
-    p = _posture(rdp_ua=0, smb1=True, smb_signing=False, bitlocker=0, firewall_enabled=False, firewall_inbound="Allow")
+    p = _posture(rdp_ua=0, smb1=True, smb_signing=False, firewall_enabled=False, firewall_inbound="Allow")
     assert windows_host.rdp_nla_field(p) == {"rdp_network_level_auth_enforced": False}
     assert windows_host.smbv1_field(p) == {"smbv1_enabled": True}
     assert windows_host.smb_signing_field(p) == {"smb_signing_required": False}
-    assert windows_host.disk_encryption_field(p) == {"full_disk_encryption_enabled": False}
     assert windows_host.firewall_enabled_field(p) == {"active_profile_enabled": False}
     assert windows_host.firewall_permissive_field(p) == {"firewall_permissive_default": True}
     assert windows_host.rdp_nla_field({}) is None
-    assert windows_host.disk_encryption_field({"bitlocker_protection": None}) is None
 
 
 # ── local Administrators (the baseline control, SAME wire key as Linux) ────────────────────────────
@@ -105,7 +93,6 @@ def test_serves_the_windows_controls_only() -> None:
         "server.remote.rdp_nla_disabled",
         "server.service.smbv1_enabled",
         "server.share.smb_signing_not_required",
-        "server.boot.disk_unencrypted",
         "server.firewall.enabled",
         "server.firewall.permissive",
         "server.localadmin.unapproved",

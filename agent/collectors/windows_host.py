@@ -15,9 +15,13 @@ over WinRM; the NTLM message layer seals the payload even on the plaintext 5985 
 (HTTPS) is used when the port says so, with the host's self-signed certificate not verified (the agent
 has no store for it, exactly as the kube / storage tiers).
 
-This pass serves the unambiguous Windows controls. The `server.audit.security_logging_disabled` read is
-deferred (its honest form needs a locale-independent audit-policy read, not the locale-sensitive
-`auditpol` text), and the definition-gated Windows controls (`patch.critical_missing`, `edr.unhealthy`,
+This pass serves the Windows controls that read reliably over a WinRM network logon.
+`server.boot.disk_unencrypted` is deferred: BitLocker status (Get-BitLockerVolume and the
+Win32_EncryptableVolume CIM namespace alike) is not readable from a WinRM network-logon token, which
+lacks the integrity level the BitLocker WMI provider requires; it needs CredSSP delegation or a
+local-agent read. `server.audit.security_logging_disabled` is deferred too (its honest form needs a
+locale-independent audit-policy read, not the locale-sensitive `auditpol` text), and the
+definition-gated Windows controls (`patch.critical_missing`, `edr.unhealthy`,
 `credential.insecure_storage`) are out of scope until their meaning is settled.
 
 The parse functions are PURE (the gather script's JSON in, typed value out); the networked WinRM run is
@@ -38,7 +42,6 @@ POSTURE_CONTROLS = frozenset(
         "server.remote.rdp_nla_disabled",
         "server.service.smbv1_enabled",
         "server.share.smb_signing_not_required",
-        "server.boot.disk_unencrypted",
         "server.firewall.enabled",
         "server.firewall.permissive",
     }
@@ -68,20 +71,30 @@ _GATHER_SCRIPT = r"""
 $ErrorActionPreference='SilentlyContinue'
 $rdp=(Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication).UserAuthentication
 $smb=Get-SmbServerConfiguration
-$bl=Get-BitLockerVolume -MountPoint $env:SystemDrive
 $admins=@(Get-LocalGroupMember -Group 'Administrators' | ForEach-Object { "$($_.Name)" })
-$active=(Get-NetConnectionProfile | Select-Object -ExpandProperty NetworkCategory -First 1)
-$fwAll=Get-NetFirewallProfile
-$fw=$null
-if($active){ $fw=$fwAll | Where-Object { $_.Name -eq $active } | Select-Object -First 1 }
+# Firewall across all profiles via Get-NetFirewallProfile (reliable over WinRM, unlike
+# Get-NetConnectionProfile, which returns nothing from a network logon). The active profile cannot be
+# singled out remotely, so a server is read across all three: enabled only if every profile is on,
+# permissive if any default-allows inbound. Compute into variables first, since PowerShell 5.1 does
+# not evaluate an inline if/else in a hashtable value position.
+$fwAll=@(Get-NetFirewallProfile)
+$fwEn=$null; $fwIn=$null
+if($fwAll.Count -gt 0){
+  $allEnabled=$true; $anyPermissive=$false
+  foreach($f in $fwAll){
+    if("$($f.Enabled)" -ne 'True'){ $allEnabled=$false }
+    if("$($f.DefaultInboundAction)" -eq 'Allow'){ $anyPermissive=$true }
+  }
+  $fwEn=$allEnabled
+  if($anyPermissive){ $fwIn='Allow' }else{ $fwIn='Block' }
+}
 [pscustomobject]@{
   rdp_user_authentication = $rdp
   smb1_enabled = $smb.EnableSMB1Protocol
   smb_signing_required = $smb.RequireSecuritySignature
-  bitlocker_protection = if($bl){[int]$bl.ProtectionStatus}else{$null}
   local_admins = $admins
-  firewall_enabled = if($fw){[bool]$fw.Enabled}else{$null}
-  firewall_default_inbound = if($fw){"$($fw.DefaultInboundAction)"}else{$null}
+  firewall_enabled = $fwEn
+  firewall_default_inbound = $fwIn
 } | ConvertTo-Json -Compress
 """.strip()
 
@@ -121,23 +134,11 @@ def parse_smb_signing_required(posture: object) -> bool | None:
     return _bool(posture.get("smb_signing_required")) if isinstance(posture, dict) else None
 
 
-def parse_full_disk_encryption_enabled(posture: object) -> bool | None:
-    """Whether the system drive is BitLocker-protected (``ProtectionStatus`` == On, which is 1), or
-    ``None`` to abstain when BitLocker could not be read (feature absent). ``False`` is the finding
-    (system drive unencrypted)."""
-    if not isinstance(posture, dict):
-        return None
-    value = posture.get("bitlocker_protection")
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value == 1
-
-
 def parse_firewall_enabled(posture: object) -> bool | None:
-    """Whether the Windows Firewall is enabled for the active network profile (Domain / Private /
-    Public), or ``None`` to abstain when no active profile could be resolved (honest: "which profile is
-    active" is unknowable then, not a finding). ``False`` is the finding (firewall off on the active
-    profile)."""
+    """Whether the Windows Firewall is enabled across the host's profiles, or ``None`` to abstain when
+    no firewall profile could be read. Read from the registry across Domain / Private / Public (the
+    active profile is not reliably resolvable over a WinRM network logon), so the value is True only
+    when every profile is enabled; ``False`` (any profile off) is the finding."""
     return _bool(posture.get("firewall_enabled")) if isinstance(posture, dict) else None
 
 
@@ -188,12 +189,6 @@ def smb_signing_field(posture: object) -> dict[str, object] | None:
     """The ``server.share.smb_signing_not_required`` field dict, or ``None`` to abstain."""
     value = parse_smb_signing_required(posture)
     return None if value is None else {"smb_signing_required": value}
-
-
-def disk_encryption_field(posture: object) -> dict[str, object] | None:
-    """The ``server.boot.disk_unencrypted`` field dict, or ``None`` to abstain."""
-    value = parse_full_disk_encryption_enabled(posture)
-    return None if value is None else {"full_disk_encryption_enabled": value}
 
 
 def firewall_enabled_field(posture: object) -> dict[str, object] | None:
