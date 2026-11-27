@@ -41,6 +41,11 @@ POSTURE_CONTROLS = frozenset(
         "storage.audit.data_access_logging_disabled",
         "storage.snapshot.unprotected",
         "storage.immutability.bypassable",
+        "storage.volume.encryption",
+        "storage.replication.untrusted",
+        "storage.lifecycle.unsupported_firmware",
+        "storage.multipath.inconsistent_access",
+        "storage.recovery.unseparated_evidence",
     }
 )
 # A BASELINE-COMPARISON control: the agent sends the RAW observed administrator set and leaves the
@@ -78,6 +83,20 @@ def _bool_at(posture: object, *path: str) -> bool | None:
             return None
         node = node.get(key)
     return node if isinstance(node, bool) else None
+
+
+def _int_at(posture: object, *path: str) -> int | None:
+    """The non-negative integer at a fixed nested path, or ``None`` to abstain when the path is absent
+    or the value is not an int. ``bool`` is excluded explicitly (``True``/``False`` are ints in Python),
+    so a mis-typed boolean never reads as a count."""
+    node: object = posture
+    for key in path:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    if isinstance(node, bool) or not isinstance(node, int) or node < 0:
+        return None
+    return node
 
 
 def parse_management_encryption_enforced(posture: object) -> bool | None:
@@ -140,6 +159,70 @@ def immutability_bypass_field(posture: object) -> dict[str, object] | None:
     """The ``storage.immutability.bypassable`` field dict, or ``None`` to abstain."""
     value = parse_immutability_bypass_possible(posture)
     return None if value is None else {"immutability_privileged_bypass_possible": value}
+
+
+def parse_volume_encryption_enabled(posture: object) -> bool | None:
+    """Whether the array enforces volume encryption at rest (``volumes.encryption_enabled``), or
+    ``None`` to abstain. ``False`` is the finding (a volume unencrypted at rest)."""
+    return _bool_at(posture, "volumes", "encryption_enabled")
+
+
+def parse_untrusted_replication_targets(posture: object) -> int | None:
+    """The count of replication targets the array reports as unencrypted or to an untrusted peer
+    (``replication.unencrypted_or_untrusted_targets``), or ``None`` to abstain. ``gt 0`` is the
+    finding. The array classifies its own targets; the collector reports the count, it does not
+    define trust."""
+    return _int_at(posture, "replication", "unencrypted_or_untrusted_targets")
+
+
+def parse_end_of_life_components(posture: object) -> int | None:
+    """The count of storage components (controller, shelf, drive, protocol firmware) the array reports
+    as end-of-life (``lifecycle.end_of_life_components``), or ``None`` to abstain. ``gt 0`` is the
+    finding."""
+    return _int_at(posture, "lifecycle", "end_of_life_components")
+
+
+def parse_multipath_inconsistencies(posture: object) -> int | None:
+    """The count of multipath / zoning / host-access inconsistencies the array reports
+    (``multipath.inconsistencies``), or ``None`` to abstain. ``gt 0`` is the finding."""
+    return _int_at(posture, "multipath", "inconsistencies")
+
+
+def parse_recovery_evidence_separated(posture: object) -> bool | None:
+    """Whether recoverability evidence is kept separate from the configured-backup evidence
+    (``recovery.evidence_separated``), or ``None`` to abstain. ``False`` is the finding (recovery
+    evidence not independently separated)."""
+    return _bool_at(posture, "recovery", "evidence_separated")
+
+
+def volume_encryption_field(posture: object) -> dict[str, object] | None:
+    """The ``storage.volume.encryption`` field dict, or ``None`` to abstain."""
+    value = parse_volume_encryption_enabled(posture)
+    return None if value is None else {"volume_encryption_enabled": value}
+
+
+def replication_untrusted_field(posture: object) -> dict[str, object] | None:
+    """The ``storage.replication.untrusted`` field dict, or ``None`` to abstain."""
+    value = parse_untrusted_replication_targets(posture)
+    return None if value is None else {"unencrypted_or_untrusted_replication_targets": value}
+
+
+def lifecycle_firmware_field(posture: object) -> dict[str, object] | None:
+    """The ``storage.lifecycle.unsupported_firmware`` field dict, or ``None`` to abstain."""
+    value = parse_end_of_life_components(posture)
+    return None if value is None else {"end_of_life_storage_components": value}
+
+
+def multipath_inconsistency_field(posture: object) -> dict[str, object] | None:
+    """The ``storage.multipath.inconsistent_access`` field dict, or ``None`` to abstain."""
+    value = parse_multipath_inconsistencies(posture)
+    return None if value is None else {"multipath_or_zoning_inconsistencies": value}
+
+
+def recovery_evidence_field(posture: object) -> dict[str, object] | None:
+    """The ``storage.recovery.unseparated_evidence`` field dict, or ``None`` to abstain."""
+    value = parse_recovery_evidence_separated(posture)
+    return None if value is None else {"recoverability_evidence_separated": value}
 
 
 def parse_admin_members(admins_doc: object) -> list[str] | None:

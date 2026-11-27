@@ -15,6 +15,11 @@ def _posture(
     logging: bool = True,
     snapshot_protected: bool = True,
     immutability_bypass: bool = False,
+    volume_encrypted: bool = True,
+    untrusted_replication: int = 0,
+    eol_components: int = 0,
+    multipath_issues: int = 0,
+    recovery_separated: bool = True,
 ) -> dict:
     """A full posture document. The defaults are the HARDENED array (no finding on any control); a
     test flips one field to the insecure value to assert that control's finding polarity."""
@@ -24,6 +29,11 @@ def _posture(
         "audit": {"data_access_logging_enabled": logging},
         "snapshots": {"deletion_protection_enabled": snapshot_protected},
         "immutability": {"enabled": True, "privileged_bypass_possible": immutability_bypass},
+        "volumes": {"encryption_enabled": volume_encrypted},
+        "replication": {"unencrypted_or_untrusted_targets": untrusted_replication},
+        "lifecycle": {"end_of_life_components": eol_components},
+        "multipath": {"inconsistencies": multipath_issues},
+        "recovery": {"evidence_separated": recovery_separated},
     }
 
 
@@ -75,6 +85,50 @@ def test_posture_field_dicts_and_abstain() -> None:
     assert storage_mgmt.admin_mfa_field({}) is None
 
 
+# ── the five additional posture controls (same storage_mgmt kind) ─────────────────────────────────
+def test_volume_encryption_reads_the_enabled_flag() -> None:
+    assert storage_mgmt.parse_volume_encryption_enabled(_posture(volume_encrypted=True)) is True
+    assert storage_mgmt.parse_volume_encryption_enabled(_posture(volume_encrypted=False)) is False
+
+
+def test_recovery_evidence_reads_the_separated_flag() -> None:
+    assert storage_mgmt.parse_recovery_evidence_separated(_posture(recovery_separated=True)) is True
+    assert storage_mgmt.parse_recovery_evidence_separated(_posture(recovery_separated=False)) is False
+
+
+def test_integer_count_fields_read_the_reported_count() -> None:
+    p = _posture(untrusted_replication=2, eol_components=3, multipath_issues=1)
+    assert storage_mgmt.parse_untrusted_replication_targets(p) == 2
+    assert storage_mgmt.parse_end_of_life_components(p) == 3
+    assert storage_mgmt.parse_multipath_inconsistencies(p) == 1
+    clean = _posture()
+    assert storage_mgmt.parse_untrusted_replication_targets(clean) == 0
+    assert storage_mgmt.parse_end_of_life_components(clean) == 0
+    assert storage_mgmt.parse_multipath_inconsistencies(clean) == 0
+
+
+def test_integer_fields_reject_bool_and_negative_and_missing() -> None:
+    # bool is an int subclass in Python; it must NOT read as a count.
+    assert storage_mgmt.parse_untrusted_replication_targets({"replication": {"unencrypted_or_untrusted_targets": True}}) is None
+    assert storage_mgmt.parse_end_of_life_components({"lifecycle": {"end_of_life_components": -1}}) is None
+    assert storage_mgmt.parse_multipath_inconsistencies({"multipath": {}}) is None
+    assert storage_mgmt.parse_untrusted_replication_targets("nope") is None
+
+
+def test_additional_posture_field_dicts_and_abstain() -> None:
+    p = _posture(
+        volume_encrypted=False, untrusted_replication=1, eol_components=1,
+        multipath_issues=1, recovery_separated=False,
+    )
+    assert storage_mgmt.volume_encryption_field(p) == {"volume_encryption_enabled": False}
+    assert storage_mgmt.replication_untrusted_field(p) == {"unencrypted_or_untrusted_replication_targets": 1}
+    assert storage_mgmt.lifecycle_firmware_field(p) == {"end_of_life_storage_components": 1}
+    assert storage_mgmt.multipath_inconsistency_field(p) == {"multipath_or_zoning_inconsistencies": 1}
+    assert storage_mgmt.recovery_evidence_field(p) == {"recoverability_evidence_separated": False}
+    assert storage_mgmt.volume_encryption_field({}) is None
+    assert storage_mgmt.lifecycle_firmware_field({}) is None
+
+
 # ── baseline-comparison control (storage.rbac.unapproved_admins) ──────────────────────────────────
 def _admins(*names: str) -> dict:
     return {"administrators": [{"name": n, "role": "storage_admin"} for n in names]}
@@ -117,6 +171,11 @@ def test_serves_the_six_storage_mgmt_controls_only() -> None:
         "storage.audit.data_access_logging_disabled",
         "storage.snapshot.unprotected",
         "storage.immutability.bypassable",
+        "storage.volume.encryption",
+        "storage.replication.untrusted",
+        "storage.lifecycle.unsupported_firmware",
+        "storage.multipath.inconsistent_access",
+        "storage.recovery.unseparated_evidence",
         "storage.rbac.unapproved_admins",
     ):
         assert storage_mgmt.serves(control) is True

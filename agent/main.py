@@ -1869,6 +1869,26 @@ async def _collect_storage_controls(
                 target, "storage.immutability.bypassable", posture_ids, posture,
                 storage_mgmt.immutability_bypass_field, controls, coverage,
             )
+            _append_resource_control(
+                target, "storage.volume.encryption", posture_ids, posture,
+                storage_mgmt.volume_encryption_field, controls, coverage,
+            )
+            _append_resource_control(
+                target, "storage.replication.untrusted", posture_ids, posture,
+                storage_mgmt.replication_untrusted_field, controls, coverage,
+            )
+            _append_resource_control(
+                target, "storage.lifecycle.unsupported_firmware", posture_ids, posture,
+                storage_mgmt.lifecycle_firmware_field, controls, coverage,
+            )
+            _append_resource_control(
+                target, "storage.multipath.inconsistent_access", posture_ids, posture,
+                storage_mgmt.multipath_inconsistency_field, controls, coverage,
+            )
+            _append_resource_control(
+                target, "storage.recovery.unseparated_evidence", posture_ids, posture,
+                storage_mgmt.recovery_evidence_field, controls, coverage,
+            )
     # The RBAC baseline-comparison control: GET the administrators document and send the RAW observed
     # admin set, with NO policy gate (include_policy_gate=False), so the control plane judges
     # "unapproved" against the tenant baseline instead of the agent guessing.
