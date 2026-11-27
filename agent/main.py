@@ -57,6 +57,7 @@ from agent.collectors import (
     storage_mgmt,
     vendor,
     vsphere_collect,
+    windows_host,
 )
 from agent.credential_vault import CredentialVault
 from agent.state import AgentState, fingerprint, load_state, save_state
@@ -1909,6 +1910,65 @@ async def _collect_storage_controls(
     return controls, coverage
 
 
+async def _collect_windows_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float
+) -> tuple[list[dict], list[dict]]:
+    """The Windows host tier: authenticate to the target over WinRM with the ``winrm_login`` credential
+    and run ONE fixed read-only PowerShell gather, normalising each requested control from the single
+    posture document it returns. A wrong credential kind (not winrm_login), or a failed read
+    (unreachable / unauthorized), makes every requested control UNAVAILABLE; a control the collector
+    does not support is UNSUPPORTED. No SSH is opened: this tier talks WinRM, not a host shell."""
+    target = job["target_address"]
+    if credential.kind != "winrm_login":
+        return [], _unavailable_coverage(
+            target, control_ids, "wrong_credential_kind:expected_winrm_login"
+        )
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    # Every Windows control reads the one posture document: fetch it once, and a failed fetch makes
+    # every requested control UNAVAILABLE.
+    try:
+        posture = await windows_host.fetch_posture(target, credential, timeout=timeout_s)
+    except Exception as exc:  # noqa: BLE001 - a failed read is honest UNAVAILABLE, not a crash
+        return [], _unavailable_coverage(target, control_ids, f"collect_failed:{type(exc).__name__}")
+    posture_ids = [cid for cid in control_ids if cid in windows_host.POSTURE_CONTROLS]
+    if posture_ids:
+        _append_resource_control(
+            target, "server.remote.rdp_nla_disabled", posture_ids, posture,
+            windows_host.rdp_nla_field, controls, coverage,
+        )
+        _append_resource_control(
+            target, "server.service.smbv1_enabled", posture_ids, posture,
+            windows_host.smbv1_field, controls, coverage,
+        )
+        _append_resource_control(
+            target, "server.share.smb_signing_not_required", posture_ids, posture,
+            windows_host.smb_signing_field, controls, coverage,
+        )
+        _append_resource_control(
+            target, "server.boot.disk_unencrypted", posture_ids, posture,
+            windows_host.disk_encryption_field, controls, coverage,
+        )
+        _append_resource_control(
+            target, "server.firewall.enabled", posture_ids, posture,
+            windows_host.firewall_enabled_field, controls, coverage,
+        )
+        _append_resource_control(
+            target, "server.firewall.permissive", posture_ids, posture,
+            windows_host.firewall_permissive_field, controls, coverage,
+        )
+    # The local-admins baseline control: send the RAW observed set with NO policy gate, so the control
+    # plane diffs it against the tenant baseline (the same control, and the same wire key, as Linux).
+    rbac_ids = [cid for cid in control_ids if cid in windows_host.BASELINE_CONTROLS]
+    if rbac_ids:
+        _append_resource_control(
+            target, "server.localadmin.unapproved", rbac_ids, posture,
+            windows_host.local_admins_field, controls, coverage,
+            include_policy_gate=False,
+        )
+    return controls, coverage
+
+
 async def _collect_kube_probe_controls(
     job: dict, control_ids: list[str], timeout_s: float
 ) -> tuple[list[dict], list[dict]]:
@@ -2264,7 +2324,18 @@ async def _collect_controls(
         coverage += _unavailable_coverage(target, credentialed_ids, "no_local_credential")
         return controls, coverage, neighbours
     control_ids = credentialed_ids
-    host_ids = [cid for cid in control_ids if host_tier.serves(cid)]
+    # A `server.*` host control is read over SSH (Linux) or WinRM (Windows) depending on the job's
+    # credential kind. The one control both tiers serve, `server.localadmin.unapproved`, is routed by
+    # that kind: to the Windows tier for a winrm_login job, to the SSH host tier otherwise, so it never
+    # gets double coverage. Windows-only controls always go to the Windows tier, which reports
+    # UNAVAILABLE when the credential is not a winrm_login (honest: a Windows control needs a Windows
+    # credential).
+    is_winrm = credential.kind == "winrm_login"
+    host_ids = [
+        cid
+        for cid in control_ids
+        if host_tier.serves(cid) and not (is_winrm and windows_host.serves(cid))
+    ]
     kube_ids = [cid for cid in control_ids if kube_collect.serves(cid)]
     db_query_ids = [cid for cid in control_ids if db_query.serves(cid)]
     ldap_ids = [cid for cid in control_ids if ldap_query.serves(cid)]
@@ -2272,6 +2343,11 @@ async def _collect_controls(
     mysql_ids = [cid for cid in control_ids if mysql_query.serves(cid)]
     backup_ids = [cid for cid in control_ids if backup_collect.serves(cid)]
     storage_ids = [cid for cid in control_ids if storage_mgmt.serves(cid)]
+    windows_ids = [
+        cid
+        for cid in control_ids
+        if windows_host.serves(cid) and (is_winrm or not host_tier.serves(cid))
+    ]
     mail_dns_ids = [cid for cid in control_ids if mail_dns.serves(cid)]
     network_ids = [
         cid
@@ -2284,6 +2360,7 @@ async def _collect_controls(
         and not mysql_query.serves(cid)
         and not backup_collect.serves(cid)
         and not storage_mgmt.serves(cid)
+        and not windows_host.serves(cid)
         and not mail_dns.serves(cid)
     ]
     if network_ids:
@@ -2341,6 +2418,12 @@ async def _collect_controls(
         )
         controls += storage_controls
         coverage += storage_coverage
+    if windows_ids:
+        windows_controls, windows_coverage = await _collect_windows_controls(
+            job, windows_ids, credential, timeout_s
+        )
+        controls += windows_controls
+        coverage += windows_coverage
     if mail_dns_ids:
         mail_dns_controls, mail_dns_coverage = await _collect_mail_dns_controls(
             job, mail_dns_ids, credential, timeout_s, max_bytes

@@ -71,3 +71,11 @@ minio==7.2.20
 # resolves the mail host's own domain's SPF / DMARC TXT records (unauthenticated, no credential).
 # Deliberately dnspython, PURE-PYTHON, so the Alpine image needs no C build.
 dnspython==2.7.0
+
+# WinRM client for the credentialed WINDOWS host collect tier (agent/collectors/windows_host.py): a
+# read-only WinRM session (fixed PowerShell / registry / WMI reads, never arbitrary input) to a
+# Windows server under a winrm_login credential from the local vault. pywinrm's only non-pure-python
+# dependency is cryptography, which the image already pins at the same version for Ed25519 signing, so
+# the Alpine builder (gcc + openssl-dev) needs nothing new. NTLM auth via pyspnego (pure-python);
+# Kerberos (libkrb5) is deliberately not used.
+pywinrm==0.5.0
