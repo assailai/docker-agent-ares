@@ -185,6 +185,27 @@ def normalize_host(host: str) -> str:
     return host.strip().rstrip(".").lower()
 
 
+def parse_llm_host(entry: str) -> tuple[str, int] | None:
+    """Parse one pushed model endpoint (``host:port``), or None when malformed.
+
+    ares pushes exactly one endpoint per local BYOM provider on a live hunt
+    (ARES-2424). A malformed entry widens nothing: it is dropped here, and the
+    registered-network rule remains the only way in.
+    """
+    raw = entry.strip().lower().rstrip(".")
+    host, sep, port_raw = raw.rpartition(":")
+    if not sep or not host:
+        return None
+    host = host.strip("[]")
+    try:
+        port = int(port_raw)
+    except ValueError:
+        return None
+    if not (0 < port < 65536):
+        return None
+    return normalize_host(host), port
+
+
 def is_ip_literal(value: str) -> bool:
     """Whether ``value`` is already an address, so nothing needs resolving."""
     try:
@@ -356,6 +377,7 @@ class TunnelClient:
         allowed_hosts: set[str],
         *,
         scoped_hosts: set[str] | None = None,
+        llm_hosts: set[tuple[str, int]] | None = None,
         ssl_context: ssl.SSLContext | None,
         pins: HostPins | None = None,
     ) -> None:
@@ -367,6 +389,9 @@ class TunnelClient:
         # Shared with the manager and mutated in place, exactly like ``allowed_hosts``: an address
         # added in the dashboard reaches a live tunnel on the next beat, without a reconnect.
         self._scoped_hosts = scoped_hosts if scoped_hosts is not None else set()
+        # Exact local-model endpoints (host, port) ares pushed for live hunts.
+        # Shared and mutated in place like the sets above (ARES-2424).
+        self._llm_hosts = llm_hosts if llm_hosts is not None else set()
         self._pins = pins if pins is not None else HostPins()
         self._writers: dict[int, asyncio.StreamWriter] = {}
         # One in-flight OPEN per stream id, so a slow dial no longer blocks the frames behind it:
@@ -406,6 +431,42 @@ class TunnelClient:
         in the scope ares pushed.
         """
         return is_ip_literal(host) and self._in_allowed_networks(host)
+
+    def _is_llm_destination(self, host: str, port: int) -> bool:
+        return (normalize_host(host), port) in self._llm_hosts
+
+    async def _llm_addresses(self, host: str, port: int) -> list[str]:
+        """Re-vet one pushed model endpoint at dial time (ARES-2424).
+
+        The push names one host on one port for one hunt; this agent still
+        decides whether that endpoint may be dialled. The dial guard runs
+        first (no loopback, link-local, metadata, multicast, however pushed),
+        then every surviving address must sit inside this agent's own
+        registered networks: a model outside them was never this agent's to
+        reach, and the push alone does not widen that. Nothing beyond the
+        exact pushed host and port is authorized by this path.
+        """
+        if is_ip_literal(host):
+            forbidden = dial_guard.forbidden_class(host)
+            if forbidden is Forbidden.LOOPBACK and self._loopback_permitted(host):
+                forbidden = None
+            if forbidden is not None:
+                raise Refused(dial_guard.literal_refusal(host, forbidden))
+            if not self._in_allowed_networks(host):
+                raise Refused(
+                    f"model endpoint {host} is outside this agent's registered networks"
+                )
+            return [str(dial_guard.canonical_address(host))]
+        vetted = dial_guard.vet(host, await self._resolve(host, port))
+        outside = [a for a in vetted.addresses if not self._in_allowed_networks(a)]
+        if outside:
+            raise Refused(
+                f"model endpoint {host} resolves to {summarize_addresses(outside)}, outside "
+                "this agent's registered networks; refusing the pushed model host"
+            )
+        if vetted.dropped:
+            self._refusals.record(host, vetted.drop_note(host))
+        return list(vetted.addresses)
 
     async def _approved_addresses(self, host: str, port: int) -> list[str]:
         """Every address that may be dialled for ``host``, in resolution order, or raise
@@ -455,6 +516,8 @@ class TunnelClient:
         record leads a v4-only agent nowhere, used to cost the whole dial on that one address and
         then fail, while the record that would have answered sat untried right behind it.
         """
+        if self._is_llm_destination(host, port):
+            return await self._llm_addresses(host, port)
         if is_ip_literal(host):
             forbidden = dial_guard.forbidden_class(host)
             if forbidden is Forbidden.LOOPBACK and self._loopback_permitted(host):
@@ -694,10 +757,14 @@ class TunnelManager:
         *,
         ssl_context: ssl.SSLContext | None,
         pins: HostPins | None = None,
+        idle_seconds: float = 120.0,
     ) -> None:
         self._url = url
         self._token = token
         self._allowed_networks = allowed_networks
+        self._idle_seconds = idle_seconds
+        self._stop_task: asyncio.Task[None] | None = None
+        self._llm_hosts: set[tuple[str, int]] = set()
         self._allowed_hosts: set[str] = set()
         # The addresses an operator put in this agent's scope in the dashboard. Held apart from
         # _allowed_hosts because they authorize differently: this set is matched exactly and holds
@@ -725,6 +792,7 @@ class TunnelManager:
         required: bool,
         allowed_hosts: Iterable[str] = (),
         scoped_hosts: Iterable[str] = (),
+        llm_hosts: Iterable[str] = (),
     ) -> None:
         scoped = {normalize_host(h) for h in scoped_hosts if h and h.strip()}
         if scoped != self._scoped_hosts:
@@ -743,15 +811,45 @@ class TunnelManager:
             logger.info("tunnel hostname destinations: %s", shown)
         self._allowed_hosts.clear()
         self._allowed_hosts.update(pushed)
+        llm = {parsed for raw in llm_hosts if (parsed := parse_llm_host(raw)) is not None}
+        if llm != self._llm_hosts:
+            logger.info(
+                "tunnel model endpoints: %s",
+                ", ".join(sorted(f"{h}:{p}" for h, p in llm)) or "none",
+            )
+        self._llm_hosts.clear()
+        self._llm_hosts.update(llm)
         running = self._task is not None and not self._task.done()
-        if required and not running:
-            logger.info("internal hunt active; opening data-plane tunnel")
-            self._task = asyncio.create_task(self._supervise())
-        elif not required and running:
-            logger.info("no internal hunt active; closing data-plane tunnel")
-            self.stop()
+        if required:
+            if self._stop_task is not None and not self._stop_task.done():
+                self._stop_task.cancel()
+                self._stop_task = None
+            if not running:
+                logger.info("internal hunt active; opening data-plane tunnel")
+                self._task = asyncio.create_task(self._supervise())
+        elif running:
+            # Idle grace (ARES-2424): an LLM-only hunt dials in bursts, so the
+            # tunnel is held briefly after the last hunt requiring it ends
+            # rather than torn down and reopened between model calls. A new
+            # requirement cancels the pending close.
+            if self._stop_task is None or self._stop_task.done():
+                logger.info(
+                    "no hunt active; closing data-plane tunnel in %.0fs unless needed again",
+                    self._idle_seconds,
+                )
+                try:
+                    self._stop_task = asyncio.create_task(self._stop_after_idle())
+                except RuntimeError:
+                    self.stop()
+
+    async def _stop_after_idle(self) -> None:
+        await asyncio.sleep(self._idle_seconds)
+        self.stop()
 
     def stop(self) -> None:
+        if self._stop_task is not None and not self._stop_task.done():
+            self._stop_task.cancel()
+        self._stop_task = None
         if self._task is not None:
             self._task.cancel()
             self._task = None
@@ -766,6 +864,7 @@ class TunnelManager:
                     self._allowed_networks,
                     self._allowed_hosts,
                     scoped_hosts=self._scoped_hosts,
+                    llm_hosts=self._llm_hosts,
                     ssl_context=self._ssl_context,
                     pins=self._pins,
                 ).run()

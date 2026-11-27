@@ -31,7 +31,7 @@ services:
     # that script and to bootstrap.sh, naming an image to verify. Compose prefers the shell
     # environment over .env, so sharing a name would let an exported override silently outrank the
     # digest the script just checked - starting the socket-holding updater from a mutable tag.
-    image: ${ARES_AGENT_DIGEST:?run scripts/verify-images.sh first - it verifies docker.io/assailai/ares-agent:3.15.1 and writes the digest it checked to .env}
+    image: ${ARES_AGENT_DIGEST:?run scripts/verify-images.sh first - it verifies docker.io/assailai/ares-agent:3.16.0 and writes the digest it checked to .env}
     container_name: ares-agent
     hostname: ares-agent
     volumes:
@@ -84,7 +84,7 @@ services:
     # Same as the agent, and this is the container it matters most for: it is the one handed
     # the Docker socket below, so an image substituted here is root on this host - and it would
     # then be the thing deciding every later verification.
-    image: ${ARES_UPDATER_DIGEST:?run scripts/verify-images.sh first - it verifies docker.io/assailai/ares-updater:3.15.1 and writes the digest it checked to .env}
+    image: ${ARES_UPDATER_DIGEST:?run scripts/verify-images.sh first - it verifies docker.io/assailai/ares-updater:3.16.0 and writes the digest it checked to .env}
     container_name: ares-updater
     volumes:
       - ares-agent-data:/data:ro                  # reads the agent's update-target.json

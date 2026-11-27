@@ -468,6 +468,9 @@ async def _heartbeat_loop(state: AgentState, tunnel: TunnelManager) -> None:
                 # parsed by the same fail-closed helper: a malformed field must cost the tunnel
                 # nothing and widen it by nothing.
                 _allowed_hosts(resp.get("scoped_hosts")),
+                # Local BYOM model endpoints (host:port) for live hunts on this
+                # agent, parsed the same fail-closed way (ARES-2424).
+                _allowed_hosts(resp.get("llm_hosts")),
             )
             _apply_operational_mode(resp.get("operational_mode"))
             if resp.get("restart_requested"):
