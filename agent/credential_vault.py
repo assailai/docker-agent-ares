@@ -31,7 +31,10 @@ class Credential:
 
     # ssh_password | ssh_key | k8s_token | db_login | ldap_bind | vsphere_login | mysql_login |
     # s3_login (an object-storage access key: username=access key id, secret=secret access key; the
-    # backup-repository posture tier reads an S3/object-lock backup repository with it)
+    # backup-repository posture tier reads an S3/object-lock backup repository with it) |
+    # storage_mgmt (a bearer token for a storage array's management API; the storage-management tier
+    # reads the array's snapshot / MFA / logging / RBAC posture over HTTPS, read-only, with it.
+    # Approved 2026-11-27 as the first group-B management credential kind.)
     kind: str
     username: str
     secret: str
@@ -66,11 +69,12 @@ class CredentialVault:
             "vsphere_login",
             "mysql_login",
             "s3_login",
+            "storage_mgmt",
         ):
             return None
-        # The SSH kinds need a login; a bearer token authenticates on its own, so its username is
-        # optional and defaults to empty.
-        if kind == "k8s_token":
+        # The SSH and login kinds need a username; a bearer token authenticates on its own, so its
+        # username is optional and defaults to empty (k8s_token, storage_mgmt).
+        if kind in ("k8s_token", "storage_mgmt"):
             username = username if isinstance(username, str) else ""
         elif not isinstance(username, str):
             return None

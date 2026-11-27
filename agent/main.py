@@ -54,6 +54,7 @@ from agent.collectors import (
     mail_dns,
     mysql_query,
     ssh_collect,
+    storage_mgmt,
     vendor,
     vsphere_collect,
 )
@@ -1711,7 +1712,7 @@ async def _collect_host_controls(
     return controls, coverage
 
 
-def _append_kube_control(
+def _append_resource_control(
     target: str,
     control_id: str,
     requested_ids: list[str],
@@ -1722,10 +1723,11 @@ def _append_kube_control(
     *,
     include_policy_gate: bool = True,
 ) -> None:
-    """Append one kubernetes control's facts (or an UNSUPPORTED coverage entry) when it was requested.
-    ``field_fn`` maps the already-fetched resource LIST to the control's field dict, or ``None`` to
-    abstain (recorded UNSUPPORTED). ``include_policy_gate=False`` for a baseline-comparison control,
-    whose policy gate the control plane earns from the tenant baseline, not the agent."""
+    """Append one control's facts (or an UNSUPPORTED coverage entry) when it was requested. Generic
+    across the fetch-once tiers (Kubernetes LIST, storage management-API GET): ``field_fn`` maps the
+    already-fetched resource document to the control's field dict, or ``None`` to abstain (recorded
+    UNSUPPORTED). ``include_policy_gate=False`` for a baseline-comparison control, whose policy gate the
+    control plane earns from the tenant baseline, not the agent."""
     if control_id not in requested_ids:
         return
     fields = field_fn(resource)
@@ -1770,7 +1772,7 @@ async def _collect_kube_controls(
                 target, pod_ids, f"collect_failed:{type(exc).__name__}"
             )
         else:
-            _append_kube_control(
+            _append_resource_control(
                 target, "kubernetes.workload.privileged", pod_ids, pods,
                 kube_collect.privileged_workloads_field, controls, coverage,
             )
@@ -1783,7 +1785,7 @@ async def _collect_kube_controls(
                 target, netpol_ids, f"collect_failed:{type(exc).__name__}"
             )
         else:
-            _append_kube_control(
+            _append_resource_control(
                 target, "kubernetes.network.no_default_deny", netpol_ids, netpols,
                 kube_collect.default_deny_field, controls, coverage,
             )
@@ -1796,7 +1798,7 @@ async def _collect_kube_controls(
                 target, namespace_ids, f"collect_failed:{type(exc).__name__}"
             )
         else:
-            _append_kube_control(
+            _append_resource_control(
                 target, "kubernetes.admission.pod_security_disabled", namespace_ids, namespaces,
                 kube_collect.pod_security_field, controls, coverage,
             )
@@ -1812,9 +1814,76 @@ async def _collect_kube_controls(
                 target, rbac_ids, f"collect_failed:{type(exc).__name__}"
             )
         else:
-            _append_kube_control(
+            _append_resource_control(
                 target, "kubernetes.rbac.cluster_admin_bindings", rbac_ids, bindings,
                 kube_collect.cluster_admin_members_field, controls, coverage,
+                include_policy_gate=False,
+            )
+    return controls, coverage
+
+
+async def _collect_storage_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float
+) -> tuple[list[dict], list[dict]]:
+    """The storage-management tier: authenticate to the target array's management API with the
+    ``storage_mgmt`` bearer token and GET read-only, normalising each requested control. A wrong
+    credential kind (not storage_mgmt), or a failed read (unreachable / unauthorized), makes every
+    requested control UNAVAILABLE; a control the storage collector does not support is UNSUPPORTED. No
+    SSH is opened: this tier talks to the array's management API, not a host shell."""
+    target = job["target_address"]
+    if credential.kind != "storage_mgmt":
+        return [], _unavailable_coverage(
+            target, control_ids, "wrong_credential_kind:expected_storage_mgmt"
+        )
+    secret = credential.secret
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    # The five factual-absolute posture controls all read the one posture document: fetch it once, only
+    # when a requested control needs it, and a failed fetch makes only those controls UNAVAILABLE.
+    posture_ids = [cid for cid in control_ids if cid in storage_mgmt.POSTURE_CONTROLS]
+    if posture_ids:
+        try:
+            posture = await storage_mgmt.fetch_posture(target, secret, timeout=timeout_s)
+        except Exception as exc:  # noqa: BLE001 - a failed read is honest UNAVAILABLE, not a crash
+            coverage += _unavailable_coverage(
+                target, posture_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            _append_resource_control(
+                target, "storage.mgmt.plaintext_protocol", posture_ids, posture,
+                storage_mgmt.management_encryption_field, controls, coverage,
+            )
+            _append_resource_control(
+                target, "storage.auth.mfa_not_enforced", posture_ids, posture,
+                storage_mgmt.admin_mfa_field, controls, coverage,
+            )
+            _append_resource_control(
+                target, "storage.audit.data_access_logging_disabled", posture_ids, posture,
+                storage_mgmt.data_access_logging_field, controls, coverage,
+            )
+            _append_resource_control(
+                target, "storage.snapshot.unprotected", posture_ids, posture,
+                storage_mgmt.snapshot_protection_field, controls, coverage,
+            )
+            _append_resource_control(
+                target, "storage.immutability.bypassable", posture_ids, posture,
+                storage_mgmt.immutability_bypass_field, controls, coverage,
+            )
+    # The RBAC baseline-comparison control: GET the administrators document and send the RAW observed
+    # admin set, with NO policy gate (include_policy_gate=False), so the control plane judges
+    # "unapproved" against the tenant baseline instead of the agent guessing.
+    rbac_ids = [cid for cid in control_ids if cid in storage_mgmt.RBAC_CONTROLS]
+    if rbac_ids:
+        try:
+            admins = await storage_mgmt.fetch_administrators(target, secret, timeout=timeout_s)
+        except Exception as exc:  # noqa: BLE001 - a failed read is honest UNAVAILABLE, not a crash
+            coverage += _unavailable_coverage(
+                target, rbac_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            _append_resource_control(
+                target, "storage.rbac.unapproved_admins", rbac_ids, admins,
+                storage_mgmt.admin_members_field, controls, coverage,
                 include_policy_gate=False,
             )
     return controls, coverage
@@ -2182,6 +2251,7 @@ async def _collect_controls(
     vsphere_ids = [cid for cid in control_ids if vsphere_collect.serves(cid)]
     mysql_ids = [cid for cid in control_ids if mysql_query.serves(cid)]
     backup_ids = [cid for cid in control_ids if backup_collect.serves(cid)]
+    storage_ids = [cid for cid in control_ids if storage_mgmt.serves(cid)]
     mail_dns_ids = [cid for cid in control_ids if mail_dns.serves(cid)]
     network_ids = [
         cid
@@ -2193,6 +2263,7 @@ async def _collect_controls(
         and not vsphere_collect.serves(cid)
         and not mysql_query.serves(cid)
         and not backup_collect.serves(cid)
+        and not storage_mgmt.serves(cid)
         and not mail_dns.serves(cid)
     ]
     if network_ids:
@@ -2244,6 +2315,12 @@ async def _collect_controls(
         )
         controls += backup_controls
         coverage += backup_coverage
+    if storage_ids:
+        storage_controls, storage_coverage = await _collect_storage_controls(
+            job, storage_ids, credential, timeout_s
+        )
+        controls += storage_controls
+        coverage += storage_coverage
     if mail_dns_ids:
         mail_dns_controls, mail_dns_coverage = await _collect_mail_dns_controls(
             job, mail_dns_ids, credential, timeout_s, max_bytes
