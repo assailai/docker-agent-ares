@@ -1,31 +1,21 @@
-"""Normalize a Windows server's read-only WinRM posture into executable-control facts (the credentialed
-Windows host tier).
+"""Normalize a Windows server's read-only WinRM posture into executable-control facts.
 
-A step beyond the SSH host tier (:mod:`linux_host`), which is Linux-only: Windows servers expose their
-configuration over WinRM, not SSH. This tier opens ONE read-only WinRM session with a ``winrm_login``
-credential from the agent's local vault, runs a SINGLE FIXED PowerShell gather script (no arbitrary
-command, no caller input interpolated, the WinRM analogue of the db-query tier's one fixed catalog
-query), and parses the JSON it returns into the Windows ``server.*`` fields. Like every collector it
+The Linux host tier reads config over SSH; Windows servers expose theirs over WinRM. This tier opens
+one WinRM session with a ``winrm_login`` vault credential and runs a single fixed PowerShell gather
+(read-only ``Get-*`` cmdlets and registry queries, no caller input interpolated, the WinRM analogue of
+the db-query tier's one fixed catalog query), then parses the JSON into the ``server.*`` fields. It
 ABSTAINS rather than invents: an unreachable host, a failed auth, or a field the script could not read
-leaves the control UNAVAILABLE / the field out, so it stays NOT_ASSESSED.
+leaves the control NOT_ASSESSED. NTLM over WinRM (the message layer seals the payload even on the
+plaintext 5985 transport); the host's self-signed cert is not verified, as in the kube / storage tiers.
 
-Read-only by construction: the gather script only ever reads (registry queries, ``Get-*`` cmdlets); it
-never writes, installs, or runs anything the caller supplies. NTLM auth (pure-python, via pyspnego)
-over WinRM; the NTLM message layer seals the payload even on the plaintext 5985 transport, and 5986
-(HTTPS) is used when the port says so, with the host's self-signed certificate not verified (the agent
-has no store for it, exactly as the kube / storage tiers).
+Only the controls that read reliably over a WinRM network logon are served here. ``boot.disk_unencrypted``
+is out: BitLocker status (Get-BitLockerVolume and the Win32_EncryptableVolume CIM class alike) is not
+readable from a network-logon token, so it needs CredSSP or a local-agent read. ``audit.security_logging_disabled``
+needs a locale-independent read rather than ``auditpol`` text, and ``patch.critical_missing`` /
+``edr.unhealthy`` / ``credential.insecure_storage`` wait on a product definition.
 
-This pass serves the Windows controls that read reliably over a WinRM network logon.
-`server.boot.disk_unencrypted` is deferred: BitLocker status (Get-BitLockerVolume and the
-Win32_EncryptableVolume CIM namespace alike) is not readable from a WinRM network-logon token, which
-lacks the integrity level the BitLocker WMI provider requires; it needs CredSSP delegation or a
-local-agent read. `server.audit.security_logging_disabled` is deferred too (its honest form needs a
-locale-independent audit-policy read, not the locale-sensitive `auditpol` text), and the
-definition-gated Windows controls (`patch.critical_missing`, `edr.unhealthy`,
-`credential.insecure_storage`) are out of scope until their meaning is settled.
-
-The parse functions are PURE (the gather script's JSON in, typed value out); the networked WinRM run is
-a separate coroutine so the handler is testable by monkeypatching the fetch.
+The parse functions are pure (JSON in, typed value out); the networked run is a separate coroutine so
+the handler is testable by monkeypatching the fetch.
 """
 
 from __future__ import annotations
@@ -35,7 +25,7 @@ import json
 
 import winrm
 
-# The Windows host controls this collector reads, all from the one posture document the gather script
+# the Windows host controls this collector reads, all from the one posture document the gather script
 # returns. The factual-absolute posture controls:
 POSTURE_CONTROLS = frozenset(
     {
@@ -54,16 +44,19 @@ POSTURE_CONTROLS = frozenset(
 BASELINE_CONTROLS = frozenset({"server.localadmin.unapproved"})
 SERVES = POSTURE_CONTROLS | BASELINE_CONTROLS
 
-# The standard WinRM ports. 5985 is HTTP (the NTLM message layer still seals the payload); 5986 is
-# HTTPS. The collect target is the Windows host; the port decides the scheme.
+# the standard WinRM HTTP port; the NTLM message layer still seals the payload over it. A caller that
+# passes any other port (e.g. 5986) gets HTTPS instead. The collect target is the Windows host.
 _WINRM_HTTP_PORT = 5985
-_WINRM_HTTPS_PORT = 5986
 
-# Bound the admin read so a huge group cannot make one collection unbounded (build-for-scale). A larger
+# bound the admin read so a huge group cannot make one collection unbounded (build-for-scale). A larger
 # group still yields a lower-bound observed set, which only ever UNDER-reports a gt-0 finding.
 _MAX_ADMINS = 10_000
 
-# The ONE fixed, read-only PowerShell gather script. It interpolates NOTHING from the caller; it reads
+# how far the WS-Man read timeout sits above the operation timeout, so the client still polls once more
+# after the server's operation window closes rather than dropping the connection mid-gather.
+_READ_TIMEOUT_BUFFER_SEC = 5
+
+# the ONE fixed, read-only PowerShell gather script. It interpolates NOTHING from the caller; it reads
 # the registry and Get-* cmdlets and emits a single compact JSON object. `SilentlyContinue` means a
 # cmdlet the host cannot answer (e.g. BitLocker feature absent) yields a null field, which the parser
 # reads as abstain rather than a false posture.
@@ -72,7 +65,7 @@ $ErrorActionPreference='SilentlyContinue'
 $rdp=(Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication).UserAuthentication
 $smb=Get-SmbServerConfiguration
 $admins=@(Get-LocalGroupMember -Group 'Administrators' | ForEach-Object { "$($_.Name)" })
-# Firewall across all profiles via Get-NetFirewallProfile (reliable over WinRM, unlike
+# firewall across all profiles via Get-NetFirewallProfile (reliable over WinRM, unlike
 # Get-NetConnectionProfile, which returns nothing from a network logon). The active profile cannot be
 # singled out remotely, so a server is read across all three: enabled only if every profile is on,
 # permissive if any default-allows inbound. Compute into variables first, since PowerShell 5.1 does
@@ -212,17 +205,20 @@ def local_admins_field(posture: object) -> dict[str, object] | None:
     return None if members is None else {"observed_local_admins": members}
 
 
-def _run_gather(endpoint: str, username: str, password: str, *, verify: bool) -> str:
+def _run_gather(endpoint: str, username: str, password: str, *, verify: bool, timeout: float) -> str:
     """Open a WinRM session and run the ONE fixed gather script, returning its stdout (synchronous;
     pywinrm has no async API, so the caller runs this in a thread, exactly as the db-query tier runs
     pg8000). NTLM transport; the host's self-signed certificate is not verified on HTTPS (``verify``
-    False), the same inverse-trust the kube / storage tiers use. Raises on connect / auth / non-zero
-    exit, which the caller records as honest UNAVAILABLE."""
+    False), the same inverse-trust the kube / storage tiers use. ``timeout`` bounds the read so an
+    unresponsive host cannot hang the collection; the WS-Man operation timeout sits just under it.
+    Raises on connect / auth / non-zero exit, which the caller records as honest UNAVAILABLE."""
     session = winrm.Session(
         endpoint,
         auth=(username, password),
         transport="ntlm",
         server_cert_validation="validate" if verify else "ignore",
+        read_timeout_sec=int(timeout) + _READ_TIMEOUT_BUFFER_SEC,
+        operation_timeout_sec=int(timeout),
     )
     result = session.run_ps(_GATHER_SCRIPT)
     if result.status_code != 0:
@@ -235,17 +231,22 @@ async def fetch_posture(
     target: str,
     credential,
     *,
-    timeout: float,  # pywinrm manages its own transport timeout; kept for parity with the other tiers
+    timeout: float,
     port: int = _WINRM_HTTP_PORT,
     verify: bool = False,
 ) -> dict:
     """Run the read-only WinRM gather against the Windows host and return its parsed posture document,
-    or ``{}`` when the host returned nothing parseable. 5985 is HTTP, anything else (5986) is HTTPS.
-    Raises on connect / auth / run failure (UNAVAILABLE)."""
+    or ``{}`` when the host returned nothing parseable. The default port (5985) is HTTP; any other port
+    is HTTPS. Raises on connect / auth / run failure (UNAVAILABLE)."""
     scheme = "http" if port == _WINRM_HTTP_PORT else "https"
     endpoint = f"{scheme}://{target}:{port}/wsman"
     raw = await asyncio.to_thread(
-        _run_gather, endpoint, credential.username, credential.secret, verify=verify
+        _run_gather,
+        endpoint=endpoint,
+        username=credential.username,
+        password=credential.secret,
+        verify=verify,
+        timeout=timeout,
     )
     try:
         body = json.loads(raw)

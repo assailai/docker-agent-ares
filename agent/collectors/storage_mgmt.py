@@ -1,29 +1,24 @@
-"""Normalize a storage array's read-only management-API output into executable-control facts (the
-credentialed storage-management cohort slice).
+"""Normalize a storage array's read-only management-API output into executable-control facts.
 
-Read-only: authenticates to the array's management API with a bearer token from the agent's local
-vault (``storage_mgmt`` credential kind) and does GETs only (no create / modify / delete), then parses
-the returned security-posture document into the ``storage.*`` management fields. Like the device, host
-and Kubernetes collectors it ABSTAINS rather than invents: an endpoint the token is not authorized
-for, or an array not reachable, leaves the control UNAVAILABLE / the field out, so it stays
-NOT_ASSESSED.
+Authenticates to the array's management API with a bearer token from the agent's local vault
+(``storage_mgmt`` credential kind) and does GETs only, then parses the security-posture document into
+the ``storage.*`` management fields. It ABSTAINS rather than invents: an endpoint the token cannot
+read, or an unreachable array, leaves the control NOT_ASSESSED.
 
-This targets a GENERIC array-management REST contract (the shape a lab simulator serves, and the shape
-a per-vendor adapter -- NetApp ONTAP, Pure FlashArray, Dell PowerStore -- maps onto). The vendor
-adapters are their own breadth cohorts; this slice proves the credentialed storage-management
-transport and the six management-posture controls end to end against the generic contract. The two
-documents it reads:
+The contract is a generic array-management REST shape (what the lab simulator serves, and what a
+per-vendor adapter -- NetApp ONTAP, Pure FlashArray, Dell PowerStore -- maps onto); those adapters are
+their own breadth cohorts. Two documents:
 
-- ``GET /api/v1/security/posture`` -> the array's self-reported management-security posture (the
-  ``authenticated_native_configuration`` evidence class the controls require): management transport
-  encryption, admin MFA enforcement, data-access logging, snapshot deletion-protection, and whether a
-  privileged account can bypass immutability.
-- ``GET /api/v1/security/administrators`` -> the array's administrative accounts, sent as the RAW
-  observed set for the baseline-comparison control (the control plane diffs it against the tenant
-  baseline; the agent never judges which admins are "unapproved").
+- ``GET /api/v1/security/posture`` -> the array's self-reported posture (the
+  ``authenticated_native_configuration`` evidence class): transport encryption, admin MFA, data-access
+  logging, snapshot deletion-protection, immutability bypass, volume encryption, replication trust,
+  component lifecycle, multipath consistency, recovery-evidence separation.
+- ``GET /api/v1/security/administrators`` -> the admin accounts, sent as the RAW observed set for the
+  baseline control (the control plane diffs it against the tenant baseline; the agent never judges
+  which admins are unapproved).
 
-The parse functions are PURE (posture JSON in, typed value out); the networked GET is a separate
-coroutine so the handler is testable by monkeypatching the fetch.
+The parse functions are pure (JSON in, typed value out); the networked GET is a separate coroutine so
+the handler is testable by monkeypatching the fetch.
 """
 
 from __future__ import annotations
@@ -32,7 +27,7 @@ import ssl
 
 import httpx
 
-# The storage-management controls this collector reads, grouped by the management-API document each one
+# the storage-management controls this collector reads, grouped by the management-API document each one
 # needs so the tier fetches a document only when a requested control uses it.
 POSTURE_CONTROLS = frozenset(
     {
@@ -55,13 +50,13 @@ POSTURE_CONTROLS = frozenset(
 RBAC_CONTROLS = frozenset({"storage.rbac.unapproved_admins"})
 SERVES = POSTURE_CONTROLS | RBAC_CONTROLS
 
-# The array management API is served over TLS on the standard HTTPS port; the collect target is the
+# the array management API is served over TLS on the standard HTTPS port; the collect target is the
 # array's management endpoint.
 _API_PORT = 443
 _POSTURE_PATH = "/api/v1/security/posture"
 _ADMINS_PATH = "/api/v1/security/administrators"
 
-# Bound the admin read so a huge account directory cannot make one collection unbounded
+# bound the admin read so a huge account directory cannot make one collection unbounded
 # (build-for-scale). A set larger than this still yields a lower-bound observed set, which only ever
 # UNDER-reports a gt-0 unapproved-admins finding, never a false positive.
 _MAX_ADMINS = 10_000
