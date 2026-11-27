@@ -105,6 +105,16 @@ spec:
           # nothing here *enforces* it. kubectl will apply the bare tag quite happily. It is a
           # step in the documented install, not a gate (ARES-2351).
           image: docker.io/assailai/ares-agent:3.15.1   # pinned; the updater rolls this forward
+          # Raw-socket capability for the OPT-IN agent-origin packet capture
+          # (ARES_ASSESSMENT_PCAP, off by default; see agent/pcap_capture.py). Every other
+          # capability is dropped and the agent stays non-root, so this is a tighter posture
+          # than the default plus exactly the one capability tcpdump needs when capture is on.
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_RAW"]
           envFrom:
             - secretRef:
                 name: ares-agent

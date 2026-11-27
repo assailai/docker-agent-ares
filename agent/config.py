@@ -168,6 +168,12 @@ class Settings(BaseSettings):
         return self.data_dir / "agent-state.json"
 
     @property
+    def credential_vault_path(self) -> Path:
+        # the agent-local credential vault (0600): the operator provisions it, the agent only reads
+        # it to resolve a collect job's opaque credential_ref. Never sent anywhere.
+        return self.data_dir / "credentials.json"
+
+    @property
     def update_target_path(self) -> Path:
         # the companion updater reads this from the shared data dir; the agent only writes it.
         return self.data_dir / "update-target.json"

@@ -1,0 +1,13 @@
+Building configuration...
+
+Current configuration:
+!
+frr version 10.2.1_git
+frr defaults traditional
+hostname frr-access
+no ipv6 forwarding
+service integrated-vtysh-config
+!
+enable password weak-lab-secret
+!
+end

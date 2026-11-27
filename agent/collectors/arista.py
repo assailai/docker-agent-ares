@@ -1,0 +1,436 @@
+"""Normalize an Arista EOS running-config into executable-control facts.
+
+Read-only: the collector runs ``show running-config`` and this parser turns the text into the typed
+fields the control plane's executable-control evaluator consumes. It ABSTAINS rather than invents a
+value when the config does not clearly show a setting, so a control whose evidence is not in the
+config stays NOT_ASSESSED rather than becoming a false posture claim.
+
+Vendor-specific on purpose (Arista EOS): the config grammar differs per vendor, so each vendor has
+its own parser, and the executable control is the single cross-vendor contract they all normalise
+into. This is the EOS one; it covers the controls the §29.8 lane needs, and a new control is a new
+field extractor here plus its evaluator entry (already present) on the control plane.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterator
+
+# EOS enables SSH management by default and leaves Telnet off until explicitly configured, so a
+# `management telnet` block that is not shut down is a configured Telnet management transport.
+_MGMT_SERVICE = re.compile(r"^management (ssh|telnet)$")
+_TRANSPORT_INPUT = re.compile(r"^transport input (.+)$")
+_MANAGEMENT_PROTOCOL_WORDS = frozenset({"ssh", "telnet"})
+
+# An interface block header, used to walk each Ethernet interface's config block.
+_INTERFACE = re.compile(r"^interface (\S+)$")
+
+# An SNMP community declaration: `snmp-server community <name> [view <v>] [ro|rw] [<acl>]`. The
+# community string is the first token after the keyword. The well-known factory defaults below are
+# guessable from off the device, so a community that matches one is a default-credential weakness
+# regardless of its read/write scope.
+_SNMP_COMMUNITY = re.compile(r"^snmp-server community (\S+)")
+_DEFAULT_SNMP_COMMUNITIES = frozenset({"public", "private"})
+
+
+
+# BPDU guard protects an edge/access port from a rogue switch asserting a spanning-tree root. EOS
+# applies it per-port with `spanning-tree bpduguard enable`, or fleet-wide to edge ports with a
+# global `spanning-tree ... bpduguard default`. An access-mode port covered by neither is left
+# unprotected against an L2 topology attack from the user edge.
+_BPDUGUARD_DEFAULT = re.compile(r"^spanning-tree .*bpduguard default$")
+_BPDUGUARD_ENABLE = re.compile(r"^spanning-tree bpduguard enable$")
+
+# EOS does not render the default `switchport mode access`, so an access-mode port is identified
+# by the ABSENCE of a routed (`no switchport`) or non-access mode (trunk / dynamic / dot1q-tunnel)
+# marker in its block, not by a positive access line.
+_NO_SWITCHPORT = re.compile(r"^no switchport$")
+_SWITCHPORT_NONACCESS = re.compile(r"^switchport mode (?!access\b)")
+
+# EOS secures an access port's MAC table with `switchport port-security` (optionally with a
+# `maximum`, a violation action, or sticky learning). An access-mode port with no port-security
+# line learns any MAC, so the user edge is open to MAC flooding and rogue hosts.
+_PORT_SECURITY = re.compile(r"^switchport port-security")
+
+# Remote syslog and NTP: a `logging host` / `logging vrf ... host` line ships logs off-box, and
+# an `ntp server` line gives the device a time source. The absence of either is a posture gap:
+# logs that never leave the device are lost on compromise or reboot, and an unsynchronized clock
+# undermines log correlation and certificate checks.
+_LOGGING_HOST = re.compile(r"^logging (?:vrf \S+ )?host \S")
+_NTP_SERVER = re.compile(r"^ntp server ")
+# A login banner: EOS renders a configured one as a `banner login` header line (its text
+# follows, ending at an `EOF` terminator). Its absence is a posture/compliance gap.
+_LOGIN_BANNER = re.compile(r"^banner login$")
+
+
+def _indented(line: str) -> bool:
+    return line.startswith((" ", "\t"))
+
+
+def parse_management_protocols(running_config: str) -> list[str]:
+    """The management transports the EOS config leaves reachable (sorted, de-duplicated).
+
+    Reads two independent signals and unions them: a global ``management ssh`` / ``management
+    telnet`` block that is not ``shutdown``, and ``transport input ...`` on a management line. A
+    protocol named by either is enabled.
+    """
+    protocols: set[str] = set()
+    lines = running_config.splitlines()
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
+        service = _MGMT_SERVICE.match(stripped)
+        if service:
+            protocol = service.group(1)
+            shut = False
+            index += 1
+            while index < len(lines) and _indented(lines[index]):
+                if lines[index].strip() == "shutdown":
+                    shut = True
+                index += 1
+            if not shut:
+                protocols.add(protocol)
+            continue
+        transport = _TRANSPORT_INPUT.match(stripped)
+        if transport:
+            for word in transport.group(1).split():
+                if word in _MANAGEMENT_PROTOCOL_WORDS:
+                    protocols.add(word)
+        index += 1
+    return sorted(protocols)
+
+
+def parse_default_snmp_community_present(running_config: str) -> bool:
+    """True when the EOS config configures a well-known default SNMP community (public/private).
+
+    The running-config is complete evidence for this, so a device with no matching community line is
+    a definite False (not an abstention): either no SNMP community is configured, or only
+    non-default names are. The name is matched case-insensitively, since `Public` is just as
+    guessable as `public`, even though SNMP treats the two as distinct strings.
+    """
+    for line in running_config.splitlines():
+        match = _SNMP_COMMUNITY.match(line.strip())
+        if match and match.group(1).lower() in _DEFAULT_SNMP_COMMUNITIES:
+            return True
+    return False
+
+
+def parse_snmp_write_community_present(running_config: str) -> bool:
+    """True when any SNMPv1/v2c community grants read-write (rw) access.
+
+    EOS renders `snmp-server community <name> [view <v>] [ro|rw] [<acl>]`; the access mode is a
+    standalone token after the community name. A community with `rw` can change the device over SNMP,
+    independent of how guessable its name is. The running-config is complete evidence, so a device
+    with only read-only communities, or none, is a definite False.
+    """
+    for line in running_config.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("snmp-server community ") and "rw" in stripped.split()[3:]:
+            return True
+    return False
+
+
+def parse_remote_syslog_absent(running_config: str) -> bool:
+    """True when no remote syslog host is configured, so logs never leave the device.
+
+    The running-config is complete evidence: a device that binds any `logging host` (optionally in a
+    vrf) is a definite False.
+    """
+    return not any(_LOGGING_HOST.match(line.strip()) for line in running_config.splitlines())
+
+
+def parse_ntp_unconfigured(running_config: str) -> bool:
+    """True when no NTP time source is configured, so the device clock is unsynchronized.
+
+    The running-config is complete evidence: a device that configures any `ntp server` is a definite
+    False.
+    """
+    return not any(_NTP_SERVER.match(line.strip()) for line in running_config.splitlines())
+
+
+def parse_unencrypted_api_enabled(running_config: str) -> bool:
+    """True when an enabled HTTP management API binds plaintext `protocol http`.
+
+    EOS's `management api http-commands` defaults to HTTPS (no protocol line); a `protocol http`
+    inside a block that is not shutdown serves eAPI over plaintext. The running-config is complete
+    evidence, so a device with no management-api block, a shut one, or one on https only, is a
+    definite False.
+    """
+    lines = running_config.splitlines()
+    index = 0
+    while index < len(lines):
+        if lines[index].strip() == "management api http-commands":
+            shut = False
+            http = False
+            index += 1
+            while index < len(lines) and _indented(lines[index]):
+                stripped = lines[index].strip()
+                if stripped == "shutdown":
+                    shut = True
+                elif stripped == "protocol http" or stripped.startswith("protocol http "):
+                    http = True
+                index += 1
+            if not shut and http:
+                return True
+            continue
+        index += 1
+    return False
+
+
+def parse_login_banner_absent(running_config: str) -> bool:
+    """True when no login banner is configured.
+
+    EOS renders a configured banner as a `banner login` header line. The running-config is complete
+    evidence, so a device with a `banner login` line is a definite False.
+    """
+    return not any(_LOGIN_BANNER.match(line.strip()) for line in running_config.splitlines())
+
+
+def _ethernet_blocks(running_config: str) -> Iterator[list[str]]:
+    """Yield the stripped body lines of each `interface EthernetN` block."""
+    lines = running_config.splitlines()
+    index = 0
+    while index < len(lines):
+        header = _INTERFACE.match(lines[index].strip())
+        if header and header.group(1).lower().startswith("ethernet"):
+            index += 1
+            block: list[str] = []
+            while index < len(lines) and _indented(lines[index]):
+                block.append(lines[index].strip())
+                index += 1
+            yield block
+            continue
+        index += 1
+
+
+def _is_access_port(block: list[str]) -> bool:
+    """True when an Ethernet block is a switched access port.
+
+    EOS omits the default `switchport mode access`, so a port is access unless it is routed
+    (`no switchport`) or set to a non-access switchport mode (trunk / dynamic / dot1q-tunnel).
+    """
+    return not any(_NO_SWITCHPORT.match(line) or _SWITCHPORT_NONACCESS.match(line) for line in block)
+
+
+def parse_access_port_without_bpduguard(running_config: str) -> bool:
+    """True when a switched access port is covered by no BPDU guard.
+
+    A global `spanning-tree ... bpduguard default` protects every edge port, so its presence makes
+    this a definite False. Otherwise each access-mode Ethernet port must carry its own
+    `spanning-tree bpduguard enable`; one that does not is unprotected. Access mode is EOS's default
+    and is not rendered, so an access port is any switched Ethernet port (see `_is_access_port`). A
+    device whose Ethernet ports are all routed or trunks has nothing to flag and is a definite False.
+    """
+    lines = running_config.splitlines()
+    if any(_BPDUGUARD_DEFAULT.match(line.strip()) for line in lines):
+        return False
+    for block in _ethernet_blocks(running_config):
+        if _is_access_port(block) and not any(_BPDUGUARD_ENABLE.match(line) for line in block):
+            return True
+    return False
+
+
+def parse_access_port_without_port_security(running_config: str) -> bool:
+    """True when a switched access port enables no MAC port security.
+
+    Each access-mode Ethernet port must carry a `switchport port-security` line; one that does not
+    learns any MAC on the user edge. Access mode is EOS's default and is not rendered, so an access
+    port is any switched Ethernet port (see `_is_access_port`). A device whose Ethernet ports are all
+    routed or trunks has nothing to flag and is a definite False.
+    """
+    for block in _ethernet_blocks(running_config):
+        if _is_access_port(block) and not any(_PORT_SECURITY.match(line) for line in block):
+            return True
+    return False
+
+
+# BGP session authentication (RFC 2385 MD5 / TCP-AO). EOS renders a configured BGP adjacency as a
+# `neighbor <peer> remote-as <asn>` line inside the `router bgp` block, and its session key as a
+# `neighbor <peer> password ...` line (direct, or inherited from a peer group the neighbor joins). A
+# neighbor with a remote-as and no password runs an UNAUTHENTICATED BGP session, which a same-segment
+# attacker can hijack or reset. Only BGP is read here (not OSPF/EIGRP), so a device that runs no BGP
+# abstains rather than reading clean.
+_ROUTER_BGP = re.compile(r"^router bgp \d+")
+_BGP_NEIGHBOR_REMOTE_AS = re.compile(r"^neighbor (\S+) remote-as \d+")
+_BGP_NEIGHBOR_PASSWORD = re.compile(r"^neighbor (\S+) password ")
+_BGP_NEIGHBOR_PEER_GROUP = re.compile(r"^neighbor (\S+) peer[- ]group(?: (\S+))?$")
+
+
+def _router_bgp_block(running_config: str) -> list[str] | None:
+    """The stripped, indented lines of the `router bgp` block, or ``None`` when the device runs no
+    BGP. EOS renders the block header flush-left and its members indented."""
+    lines = running_config.splitlines()
+    for index, line in enumerate(lines):
+        if _ROUTER_BGP.match(line.rstrip()):
+            block: list[str] = []
+            for nxt in lines[index + 1 :]:
+                if _indented(nxt):
+                    block.append(nxt.strip())
+                elif nxt.strip() == "":
+                    continue
+                else:
+                    break
+            return block
+    return None
+
+
+def parse_routing_peer_authentication_missing(running_config: str) -> bool | None:
+    """True when a configured BGP adjacency names no session authentication key.
+
+    A `neighbor <peer> remote-as <asn>` with no matching `neighbor <peer> password` line (and no
+    password inherited from a peer group it joins) is an unauthenticated BGP session. Returns False
+    when every configured neighbor is authenticated. ABSTAINS (``None``) when the device runs no BGP,
+    or BGP is configured with no neighbors, so there is no routing adjacency to assess and the control
+    stays NOT_ASSESSED rather than reading clean. Scope: BGP only; OSPF/EIGRP adjacency authentication
+    is not read here, so an OSPF/EIGRP-only device abstains.
+    """
+    block = _router_bgp_block(running_config)
+    if block is None:
+        return None
+    remote_as_peers: list[str] = []
+    passworded: set[str] = set()
+    group_of: dict[str, str] = {}
+    for line in block:
+        remote_as = _BGP_NEIGHBOR_REMOTE_AS.match(line)
+        if remote_as:
+            remote_as_peers.append(remote_as.group(1))
+            continue
+        password = _BGP_NEIGHBOR_PASSWORD.match(line)
+        if password:
+            passworded.add(password.group(1))
+            continue
+        peer_group = _BGP_NEIGHBOR_PEER_GROUP.match(line)
+        if peer_group and peer_group.group(2):
+            group_of[peer_group.group(1)] = peer_group.group(2)
+    if not remote_as_peers:
+        return None  # BGP configured but with no adjacency to assess
+    for peer in remote_as_peers:
+        if peer in passworded:
+            continue
+        group = group_of.get(peer)
+        if group is not None and group in passworded:
+            continue
+        return True  # a neighbor with a remote-as but no direct or inherited password
+    return False
+
+
+# Which control fields this parser can extract, and how. Each returns the field's typed value, or
+# ``None`` to abstain when the config does not clearly show it (the collector then leaves that field
+# out and the control stays NOT_ASSESSED).
+_FIELD_EXTRACTORS = {
+    ("net.management.telnet", "management_protocols"): parse_management_protocols,
+    ("net.snmp.default_community", "default_snmp_community_present"): (
+        parse_default_snmp_community_present
+    ),
+    ("net.snmp.write_community", "snmp_write_community_present"): (
+        parse_snmp_write_community_present
+    ),
+    ("net.logging.no_remote_syslog", "remote_syslog_absent"): parse_remote_syslog_absent,
+    ("net.ntp.no_ntp", "ntp_unconfigured"): parse_ntp_unconfigured,
+    ("net.management.http_api_unencrypted", "unencrypted_api_enabled"): (
+        parse_unencrypted_api_enabled
+    ),
+    ("net.management.no_login_banner", "login_banner_absent"): parse_login_banner_absent,
+    ("net.l2.bpduguard_missing", "access_port_without_bpduguard"): (
+        parse_access_port_without_bpduguard
+    ),
+    ("net.l2.port_security_missing", "access_port_without_port_security"): (
+        parse_access_port_without_port_security
+    ),
+    ("net.routing.peer_authentication_missing", "routing_peer_authentication_missing"): (
+        parse_routing_peer_authentication_missing
+    ),
+}
+
+
+def collect_control_fields(running_config: str, control_id: str) -> dict[str, object] | None:
+    """The typed field values this parser can read for ``control_id`` from an EOS config, or ``None``
+    if the parser does not support that control (the collector then records it UNSUPPORTED).
+
+    A field whose extractor ABSTAINS (returns ``None``) is left out, so a supported control whose
+    evidence the config does not show returns a field-less (but gated) result that evaluates
+    NOT_ASSESSED, never a fabricated clean. A supported control with at least one readable field
+    returns those fields."""
+    supported = [
+        (field, extractor)
+        for (ctrl, field), extractor in _FIELD_EXTRACTORS.items()
+        if ctrl == control_id
+    ]
+    if not supported:
+        return None
+    fields: dict[str, object] = {}
+    for field, extractor in supported:
+        value = extractor(running_config)
+        if value is not None:
+            fields[field] = value
+    return fields
+
+
+# --- LLDP neighbours (a second show command: `show lldp neighbors detail`) ------------------------
+# Not a control field: topology evidence the control plane turns into adjacency edges. EOS prints one
+# block per local interface, then one or more neighbours, each advertising a System Name, the peer's
+# Port ID and (usually) a Management Address. The control plane keys an edge on that management
+# address and excludes management-interface neighbours, so this parser reports every neighbour
+# faithfully, the local interface included, and leaves the classification to the control plane.
+_LLDP_INTERFACE = re.compile(r"^Interface (\S+) detected \d+ LLDP neighbor")
+_LLDP_NEIGHBOR = re.compile(r"^Neighbor\b")
+_LLDP_SYSTEM_NAME = re.compile(r'^System Name:\s*"?([^"]*?)"?\s*$')
+_LLDP_PORT_ID = re.compile(r'^Port ID\s*:\s*"?([^"]*?)"?\s*$')
+_LLDP_MGMT_ADDRESS = re.compile(r"^Management Address\s+:\s*(\S+)")
+
+
+def parse_lldp_neighbours(lldp_output: str) -> list[dict[str, object]]:
+    """The device's LLDP neighbours, one dict per neighbour: the local interface it was seen on and
+    the peer's ``neighbour_id`` (system name), ``neighbour_interface`` (port id) and
+    ``neighbour_address`` (management address, None when the peer advertised none).
+
+    Parses ``show lldp neighbors detail``. A neighbour with no system name is skipped rather than
+    reported as a nameless ghost. Management-vs-data-plane classification is the control plane's, so
+    every interface's neighbours are reported here, the management interface included."""
+    neighbours: list[dict[str, object]] = []
+    local_interface: str | None = None
+    current: dict[str, object] | None = None
+
+    def flush() -> None:
+        nonlocal current
+        if current is not None and current.get("neighbour_id"):
+            neighbours.append(current)
+        current = None
+
+    for raw in lldp_output.splitlines():
+        line = raw.strip()
+        if line.startswith("- "):  # a TLV marker line; drop the bullet so the key matches
+            line = line[2:].strip()
+        interface = _LLDP_INTERFACE.match(line)
+        if interface:
+            flush()
+            local_interface = interface.group(1)
+            continue
+        if _LLDP_NEIGHBOR.match(line):
+            flush()
+            current = (
+                {
+                    "local_interface": local_interface,
+                    "neighbour_id": "",
+                    "neighbour_interface": None,
+                    "neighbour_address": None,
+                }
+                if local_interface is not None
+                else None
+            )
+            continue
+        if current is None:
+            continue
+        name = _LLDP_SYSTEM_NAME.match(line)
+        if name:
+            current["neighbour_id"] = name.group(1)
+            continue
+        port = _LLDP_PORT_ID.match(line)
+        if port and current["neighbour_interface"] is None:
+            current["neighbour_interface"] = port.group(1)
+            continue
+        address = _LLDP_MGMT_ADDRESS.match(line)
+        if address:
+            current["neighbour_address"] = address.group(1)
+    flush()
+    return neighbours

@@ -59,7 +59,7 @@ def test_an_unknown_key_is_ignored_rather_than_failing_the_load(tmp_path: Path) 
 
 
 def test_minted_with_recognises_only_the_token_it_recorded() -> None:
-    state = AgentState("a1", "agtk-1", fingerprint("ares_agt_one"))
+    state = AgentState("a1", "agtk-1", registration_token_fingerprint=fingerprint("ares_agt_one"))
 
     assert state.minted_with("ares_agt_one")
     assert not state.minted_with("ares_agt_two")
@@ -78,7 +78,7 @@ def test_the_registration_token_itself_is_never_written_to_the_file(tmp_path: Pa
     path = tmp_path / "agent-state.json"
     token = "ares_agt_the_actual_secret"
 
-    save_state(path, AgentState("a1", "agtk-1", fingerprint(token)))
+    save_state(path, AgentState("a1", "agtk-1", registration_token_fingerprint=fingerprint(token)))
 
     assert token not in path.read_text()
 
@@ -86,7 +86,7 @@ def test_the_registration_token_itself_is_never_written_to_the_file(tmp_path: Pa
 def test_the_identity_file_is_not_world_readable(tmp_path: Path) -> None:
     path = tmp_path / "agent-state.json"
 
-    save_state(path, AgentState("a1", "agtk-1", fingerprint("ares_agt_one")))
+    save_state(path, AgentState("a1", "agtk-1", registration_token_fingerprint=fingerprint("ares_agt_one")))
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 

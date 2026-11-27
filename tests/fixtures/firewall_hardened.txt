@@ -1,0 +1,7 @@
+running
+===LISTALL===
+public (active)
+  target: default
+  icmp-block-inversion: no
+  interfaces: eth0
+  services: ssh

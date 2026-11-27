@@ -21,3 +21,61 @@ websockets==14.1
 python-dotenv==1.0.1
 pydantic==2.10.3
 pydantic-settings==2.6.1
+
+# Ed25519 signature verification for Network Assessment jobs (agent/assessment.py): the agent
+# verifies the control plane's signature over a job before reading any target field, and signs its
+# own evidence back. Byte-compatible with ares/domain/assessment on the control plane. The builder
+# stage already has gcc + openssl-dev, so the wheel/build is available; floor matches the control
+# plane's CVE floor (ares-v2 pins cryptography>=50.0.0).
+cryptography==50.0.2
+
+# SSH client for credentialed read-only config collection (Network Assessment COLLECT). Pinned at
+# the latest to clear the image scan: asyncssh < 2.23.1 trips grype --fail-on high
+# (GHSA-2wxc-x7rj-hg8f), and 2.24.x also clears GHSA-rw4j-r22c-9gc3. API used (connect,
+# import_private_key, run) is stable across these minors.
+asyncssh==2.24.1
+
+# PostgreSQL client for the credentialed DATABASE collect tier (agent/collectors/db_query.py): a
+# read-only catalog query (e.g. the installed-extension list) under a reader login from the local
+# vault. Deliberately pg8000, the PURE-PYTHON driver (no C extension), so the Alpine image needs no
+# extra build toolchain and the wheel is platform-independent. Transitive: scramp (SCRAM auth) and
+# asn1crypto, both pure-Python.
+pg8000==1.31.6
+
+# LDAP client for the credentialed IDENTITY collect tier (agent/collectors/ldap_query.py): a
+# read-only LDAPS bind + scoped search of an Active Directory domain controller under a reader login
+# from the local vault. Deliberately ldap3, the PURE-PYTHON client (depends only on pyasn1, also
+# pure-Python), so the Alpine image needs no OpenLDAP C libraries, unlike python-ldap.
+ldap3==2.9.1
+
+# vSphere client for the credentialed VIRTUALIZATION collect tier (agent/collectors/vsphere_collect.py):
+# a read-only SOAP login + property read (e.g. ESXi host lockdown mode) of a vCenter/ESXi endpoint
+# under a reader login from the local vault. pyvmomi is PURE-PYTHON; the base package has no required
+# deps (the cryptography/lxml it names are only the optional `sso` extra, which simple user/pass auth
+# does not use), so the Alpine image needs no extra build toolchain.
+pyvmomi==9.1.2.0
+
+# MySQL/MariaDB client for the credentialed DATABASE query tier (agent/collectors/mysql_query.py): a
+# read-only catalog query (the account list) under a reader login from the local vault. Deliberately
+# PyMySQL, the PURE-PYTHON driver (no C extension, no required deps for password auth), so the Alpine
+# image needs no build toolchain, unlike mysqlclient.
+pymysql==1.1.1
+
+# The backup-repository posture tier (backup.repository.immutable / backup.data.unencrypted) reads an
+# S3/object-lock backup repository under an s3_login access key from the local vault. Deliberately the
+# minio client, PURE-PYTHON (urllib3 + certifi + argon2/pycryptodome wheels), so the Alpine image
+# needs no C build.
+minio==7.2.20
+
+# DNS resolver for the mail-domain posture tier (mail.spf.not_enforced / mail.dmarc.not_enforced):
+# resolves the mail host's own domain's SPF / DMARC TXT records (unauthenticated, no credential).
+# Deliberately dnspython, PURE-PYTHON, so the Alpine image needs no C build.
+dnspython==2.7.0
+
+# WinRM client for the credentialed WINDOWS host collect tier (agent/collectors/windows_host.py): a
+# read-only WinRM session (fixed PowerShell / registry / WMI reads, never arbitrary input) to a
+# Windows server under a winrm_login credential from the local vault. pywinrm's only non-pure-python
+# dependency is cryptography, which the image already pins at the same version for Ed25519 signing, so
+# the Alpine builder (gcc + openssl-dev) needs nothing new. NTLM auth via pyspnego (pure-python);
+# Kerberos (libkrb5) is deliberately not used.
+pywinrm==0.5.0

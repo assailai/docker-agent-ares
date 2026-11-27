@@ -11,14 +11,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import ipaddress
 import json
 import logging
 import os
 import resource
+import secrets
+import socket
 import ssl
 import sys
 import time
+from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 import httpx
@@ -30,6 +34,32 @@ from agent.hostpins import HostPins
 from agent.identify import IdentityProbe
 from agent.kubeinfo import KubeApi, KubeConfigError, KubernetesEvidence, safe_collect
 from agent.progress import ProgressReporter
+from agent import (
+    assessment,
+    assessment_artifact,
+    assessment_collect,
+    assessment_discover,
+    assessment_validate,
+    pcap_capture,
+    pentest_execute,
+    protocols,
+    snmp,
+)
+from agent.collectors import (
+    backup_collect,
+    db_query,
+    host_tier,
+    kube_collect,
+    ldap_query,
+    mail_dns,
+    mysql_query,
+    ssh_collect,
+    storage_mgmt,
+    vendor,
+    vsphere_collect,
+    windows_host,
+)
+from agent.credential_vault import CredentialVault
 from agent.state import AgentState, fingerprint, load_state, save_state
 from agent.tunnel import (
     TunnelManager,
@@ -190,13 +220,26 @@ def _server_name(resp: dict) -> str | None:
 async def _register(state: AgentState, networks: list[str]) -> AgentState:
     logger.info("Registering with %s (networks=%s)", settings.base_url, networks or "none")
     presented = settings.token.get_secret_value()
-    resp = await control_plane.register(settings, networks=networks, name=settings.agent_name)
+    # Generate the agent's signing keypair once, on first enrolment, and register only its public
+    # half; the control plane verifies the agent's signed results against it. Persisted below via
+    # save_state, so a restart reuses the same key.
+    if not state.signing_key_seed:
+        state.signing_key_seed = assessment.generate_signing_seed()
+    resp = await control_plane.register(
+        settings,
+        networks=networks,
+        name=settings.agent_name,
+        signing_public_key=assessment.public_key_b64_from_seed(state.signing_key_seed),
+    )
     state.agent_id = resp["agent_id"]
     state.agent_token = resp["agent_token"]
     # Bind the identity to the token that minted it. This is the whole point of the field: on a
     # later start it separates an ordinary restart (same token, keep serving) from an operator
     # re-running the installer with the token for a *different* agent. See _enroll.
     state.registration_token_fingerprint = fingerprint(presented)
+    keys = resp.get("assessment_signing_public_keys")
+    if isinstance(keys, list) and all(isinstance(k, str) for k in keys):
+        state.cp_assessment_public_keys = keys
     _cadence["heartbeat"] = resp.get("heartbeat_interval_seconds", _cadence["heartbeat"])
     _cadence["poll"] = resp.get("poll_interval_seconds", _cadence["poll"])
     save_state(settings.state_path, state)
@@ -236,6 +279,7 @@ async def _preflight(state: AgentState, ssl_context: ssl.SSLContext) -> None:
         # registration token, and this is the first proof the long-lived agent token works.
         logger.info("Preflight: control plane OK (%s)", settings.base_url)
         _apply_auto_rescan(resp.get("auto_rescan"), state=state)
+        _apply_cp_assessment_keys(resp.get("assessment_signing_public_keys"), state=state)
     except (httpx.HTTPError, OSError) as exc:
         logger.error("Preflight: control plane FAILED: %s%s", _reason(exc), _tls_hint(exc))
 
@@ -461,6 +505,7 @@ async def _heartbeat_loop(state: AgentState, tunnel: TunnelManager) -> None:
             _record_contact()  # feed the watchdog + refresh the healthcheck marker
             _cadence["heartbeat"] = resp.get("heartbeat_interval_seconds", _cadence["heartbeat"])
             _apply_auto_rescan(resp.get("auto_rescan"), state=state)
+            _apply_cp_assessment_keys(resp.get("assessment_signing_public_keys"), state=state)
             tunnel.sync(
                 bool(resp.get("tunnel_required")),
                 _allowed_hosts(resp.get("tunnel_allowed_hosts")),
@@ -748,8 +793,65 @@ async def _hand_back(token: str, task_id: str) -> None:
         logger.warning("Could not hand task %s back (%s); its lease will.", task_id, exc)
 
 
-async def _run_task(token: str, task: dict) -> None:
+# The task types THIS agent build knows how to run. A task type OUTSIDE this set (a new
+# network-assessment task dispatched to an un-upgraded agent, or a malformed one) must fail closed
+# BEFORE any target field is read, so it produces zero target activity. These mirror the control
+# plane's AgentTaskType values. The discover type is handled now (it verifies the signed job before
+# any probe); the credentialed COLLECT type is still deliberately absent until its collectors land,
+# so the fleet refuses it rather than running it as a sweep (the agent-first invariant during
+# rollout). Dispatch of discover stays control-plane-gated (the module ships dark) regardless.
+_HANDLED_TASK_TYPES = frozenset(
+    {
+        "local_network_scan",
+        "network_assessment_discover_v1",
+        "network_assessment_collect_v1",
+        "controlled_validation_v1",
+        "pentest_technique_v1",
+    }
+)
+
+
+async def _run_task(token: str, task: dict, *, state: AgentState | None = None) -> None:
+    # ``state`` is keyword-only and optional: the sweep path (``local_network_scan``) never needs it,
+    # so the existing callers that pass only (token, task) keep working. The signed discover path
+    # DOES need it (the control-plane keys to verify the job, the agent's own key to sign the
+    # result) and is only ever reached through _work_through, which threads the live state in.
     task_id = task["id"]
+    task_type = task.get("task_type")
+    if task_type not in _HANDLED_TASK_TYPES:
+        # Agent-first gate: classify the task type before reading any target field, so an unhandled
+        # type yields zero target activity and a typed rejection, never a fall-through to the
+        # scanner. Refused before task_started, so a task the agent will not run is never reported
+        # as one it began.
+        logger.warning("Refused task %s: unhandled task_type %r", task_id, task_type)
+        await control_plane.task_failed(
+            settings, token, task_id, reason=f"unsupported task type: {task_type!r}"
+        )
+        return
+    if task_type in (
+        "network_assessment_discover_v1",
+        "network_assessment_collect_v1",
+        "controlled_validation_v1",
+        "pentest_technique_v1",
+    ):
+        if state is None:  # defensive: the poll loop always threads state in on this path
+            await control_plane.task_failed(
+                settings, token, task_id, reason="internal: agent state unavailable"
+            )
+            return
+        # The signed-job path: verify the control plane's signature BEFORE reading any target field
+        # (agent-first), then act. Discover probes; collect reads a device config with a local cred;
+        # controlled validation runs one bounded read-only probe against a single signed endpoint;
+        # pentest runs one bounded, non-destructive read-only technique against a single signed target.
+        if task_type == "network_assessment_discover_v1":
+            await _run_assessment_discover(state, token, task)
+        elif task_type == "controlled_validation_v1":
+            await _run_controlled_validation(state, token, task)
+        elif task_type == "pentest_technique_v1":
+            await _run_pentest_technique(state, token, task)
+        else:
+            await _run_assessment_collect(state, token, task)
+        return
     cidr = task.get("target_network")
     config = task.get("tool_config") or {}
     ports = config.get("ports") or list(scan.DEFAULT_PORTS)
@@ -858,6 +960,1683 @@ async def _run_task(token: str, task: dict) -> None:
         await percentages.close()
 
 
+# The signature domain and envelope schema a discover JOB is sealed under by the control plane
+# (ares.infra.agent_runtime.network_assessment_dispatch.SIGN_DOMAIN_DISCOVER and
+# tasks.SCHEMA_DISCOVER_V1). The agent verifies against exactly these; a mismatch fails closed.
+_DISCOVER_JOB_DOMAIN = "ares.network-assessment.signed-task.discover:v1"
+_DISCOVER_JOB_SCHEMA = "ares.network-assessment.signed-task.discover.v1"
+
+
+# How many opening bytes to read from an open service to identify its protocol. A banner is small;
+# this bounds a server that would otherwise dribble bytes forever, and only the head is classified.
+_BANNER_MAX_BYTES = 512
+
+
+async def _read_banner(ip: str, port: int, *, timeout: float) -> bytes:
+    """Read up to ``_BANNER_MAX_BYTES`` a service sends FIRST, within ``timeout``; ``b""`` on a
+    timeout, refusal or silence.
+
+    A passive read: no bytes are sent, so it cannot drive a server-side action, and a service that
+    waits for the client to speak (HTTP) simply yields nothing and stays unidentified. Separated out
+    so the discover handler's probing stays testable by monkeypatching this one function."""
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=timeout)
+    except (OSError, asyncio.TimeoutError, TimeoutError):
+        return b""
+    try:
+        return await asyncio.wait_for(reader.read(_BANNER_MAX_BYTES), timeout=timeout) or b""
+    except (OSError, asyncio.TimeoutError, TimeoutError):
+        return b""
+    finally:
+        with contextlib.suppress(OSError):
+            writer.close()
+            await writer.wait_closed()
+
+
+async def _probe_specialist(ip: str, port: int, command: bytes, *, timeout: float) -> bytes:
+    """Open a connection, read and discard the greeting (the banner read already classified it), send
+    ONE bounded metadata command, and return its reply; ``b""`` on any failure.
+
+    This is the only place the discover path writes to a target, and it writes exactly one of the
+    allow-listed metadata commands (EHLO, FEAT), never DATA/MAIL/RCPT/STOR, so nothing is delivered
+    and no state changes. Separated out so the handler's active probing stays testable by
+    monkeypatching this one function."""
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=timeout)
+    except (OSError, asyncio.TimeoutError, TimeoutError):
+        return b""
+    try:
+        await asyncio.wait_for(reader.read(_BANNER_MAX_BYTES), timeout=timeout)  # greeting
+        writer.write(command)
+        await asyncio.wait_for(writer.drain(), timeout=timeout)
+        return await asyncio.wait_for(reader.read(_BANNER_MAX_BYTES), timeout=timeout) or b""
+    except (OSError, asyncio.TimeoutError, TimeoutError):
+        return b""
+    finally:
+        with contextlib.suppress(OSError):
+            writer.close()
+            await writer.wait_closed()
+
+
+# The active-specialist command for each protocol we enrich. Only SMTP and FTP today; a protocol with
+# no entry is left at passive identification, so nothing is written to it.
+_SPECIALIST_COMMANDS: dict[str, bytes] = {
+    "smtp": protocols.SMTP_EHLO_COMMAND,
+    "ftp": protocols.FTP_FEAT_COMMAND,
+}
+
+
+async def _specialist_capabilities(
+    ip: str, port: int, protocol_id: str | None, *, timeout: float
+) -> tuple[str, ...]:
+    """The capability tokens an active specialist reads for an identified service, or ``()``. For
+    SMTP this is the EHLO capability list (STARTTLS and friends); for FTP the FEAT feature list
+    (AUTH TLS and friends). Sorted for a deterministic observation. An unidentified service, or one
+    with no specialist, is never written to and returns ``()``."""
+    command = _SPECIALIST_COMMANDS.get(protocol_id or "")
+    if command is None:
+        return ()
+    reply = await _probe_specialist(ip, port, command, timeout=timeout)
+    if protocol_id == "smtp":
+        return tuple(sorted(protocols.smtp_ehlo_capabilities(reply)))
+    return tuple(sorted(protocols.ftp_feat_features(reply)))
+
+
+class _SnmpDatagramProtocol(asyncio.DatagramProtocol):
+    """Captures the first datagram a UDP endpoint receives into a future, so one bounded SNMP round
+    trip can await a single reply and then close."""
+
+    def __init__(self, future: asyncio.Future[bytes]) -> None:
+        self._future = future
+
+    def datagram_received(self, data: bytes, _addr: object) -> None:
+        if not self._future.done():
+            self._future.set_result(data)
+
+    def error_received(self, _exc: Exception) -> None:
+        # An ICMP port-unreachable surfaces here: it is "no SNMP answer", not an error to raise.
+        if not self._future.done():
+            self._future.set_result(b"")
+
+
+async def _snmp_round_trip(
+    ip: str, payload: bytes, *, request_id: int, timeout: float
+) -> snmp.SnmpGetResponse | None:
+    """Send one SNMP datagram to ``ip`` and parse the first reply within ``timeout``; ``None`` on a
+    timeout, an ICMP refusal, a socket error or a reply that is not our response. Separated from
+    ``_probe_snmp`` so the transport and the retry-per-community logic are each testable alone."""
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[bytes] = loop.create_future()
+    try:
+        transport, _ = await loop.create_datagram_endpoint(
+            lambda: _SnmpDatagramProtocol(future), remote_addr=(ip, snmp.SNMP_PORT)
+        )
+    except OSError:
+        return None
+    try:
+        transport.sendto(payload)
+        data = await asyncio.wait_for(future, timeout=timeout)
+    except (OSError, asyncio.TimeoutError, TimeoutError):
+        return None
+    finally:
+        transport.close()
+    if not data:
+        return None
+    return snmp.parse_snmp_response(data, expected_request_id=request_id)
+
+
+async def _probe_snmp(ip: str, *, timeout: float) -> snmp.SnmpGetResponse | None:
+    """One bounded, read-only SNMPv2c default-community probe of ``ip``: a GET for sysDescr.0 under
+    each well-known default community (at most two small datagrams), returning the first accepted
+    response or ``None``. A GET never changes device state and the community list is exactly the
+    documented defaults, so this is discovery of a misconfiguration, not credential guessing.
+    Separated out so the discover handler stays testable by monkeypatching it."""
+    for community in snmp.DEFAULT_COMMUNITIES:
+        request_id = secrets.randbelow(0x7FFFFFFE) + 1
+        payload = snmp.build_snmp_get(community=community, request_id=request_id)
+        response = await _snmp_round_trip(ip, payload, request_id=request_id, timeout=timeout)
+        if response is not None and response.accepted:
+            return response
+    return None
+
+
+def _scope_udp_hosts(scope: assessment_discover.DiscoverScope, *, cap: int) -> list[str]:
+    """In-scope individual host addresses to send a UDP probe to, capped so a UDP sweep never
+    outgrows the TCP sweep's own host ceiling."""
+    hosts: list[str] = []
+    for network in scope.networks:
+        for address in network.hosts():
+            ip = str(address)
+            if scope.in_scope(ip):
+                hosts.append(ip)
+                if len(hosts) >= cap:
+                    return hosts
+    return hosts
+
+
+async def _snmp_discover(scope: assessment_discover.DiscoverScope) -> list[dict]:
+    """Probe in-scope hosts for an SNMP agent that answers a default community, when the signed job
+    asked for it (``snmp.SNMP_DEFAULT_COMMUNITY_OP`` in its udp_operations). A responder becomes one
+    OPEN udp/161 observation with ``protocol_id = "snmp"`` (identification IS the finding the
+    ``net.snmp.default_community`` rule consumes); a non-responder is left silent, never reported as
+    closed, so a UDP no-response stays indeterminate rather than an implied clean."""
+    if snmp.SNMP_DEFAULT_COMMUNITY_OP not in scope.udp_operations:
+        return []
+    hosts = _scope_udp_hosts(scope, cap=settings.scan_max_hosts)
+    if not hosts:
+        return []
+
+    # A bounded worker pool, never one task per host: a large scope would otherwise materialise
+    # hundreds of thousands of tasks and sockets at once. At most `concurrency` probes are in flight.
+    queue: asyncio.Queue[str] = asyncio.Queue()
+    for ip in hosts:
+        queue.put_nowait(ip)
+    observations: list[dict] = []
+
+    async def _worker() -> None:
+        while True:
+            try:
+                ip = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            response = await _probe_snmp(ip, timeout=settings.scan_connect_timeout)
+            if response is None:
+                continue
+            descr = response.sys_descr or ""
+            observations.append(
+                assessment_discover.service_observation(
+                    address=ip,
+                    port=snmp.SNMP_PORT,
+                    transport="udp",
+                    outcome="open",
+                    protocol_id="snmp",
+                    banner_sha256=(
+                        hashlib.sha256(descr.encode("utf-8")).hexdigest() if descr else None
+                    ),
+                )
+            )
+
+    worker_count = min(max(1, _scan_limits["concurrency"]), len(hosts))
+    await asyncio.gather(*(_worker() for _ in range(worker_count)))
+    return observations
+
+
+# Matches ares.domain.assessment.enums.NetworkUdpOperation.FULL_SWEEP byte for byte (the wire
+# contract rides NetworkDiscoverTaskV1.udp_operations as plain text); the cross-repo golden-fixture
+# round trip is the guard. An older agent that lacks this token simply ignores it.
+_UDP_FULL_SWEEP_OP = "udp_full_sweep"
+
+
+async def _udp_port_open(ip: str, port: int, *, timeout: float) -> bool:
+    """Send one empty UDP datagram to ``ip:port`` and return True iff a non-empty reply arrives within
+    ``timeout``. A reply proves a listener (OPEN); silence or an ICMP port-unreachable (surfaced as an
+    empty result by :class:`_SnmpDatagramProtocol`) proves nothing we report, because UDP has no RST
+    and ICMP is rate-limited, so a non-open port stays INDETERMINATE and is never recorded. Read-only:
+    one empty datagram, no payload that could change device state."""
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[bytes] = loop.create_future()
+    try:
+        transport, _ = await loop.create_datagram_endpoint(
+            lambda: _SnmpDatagramProtocol(future), remote_addr=(ip, port)
+        )
+    except OSError:
+        return False
+    try:
+        transport.sendto(b"")
+        data = await asyncio.wait_for(future, timeout=timeout)
+    except (OSError, asyncio.TimeoutError, TimeoutError):
+        return False
+    finally:
+        transport.close()
+    return bool(data)
+
+
+async def _udp_full_sweep_discover(scope: assessment_discover.DiscoverScope) -> list[dict]:
+    """Exhaustive UDP port sweep, when the signed job asked for it (``_UDP_FULL_SWEEP_OP`` in its
+    udp_operations): the "replicate" parity with the retiring SERVICE port-inventory lane (ARES-2249),
+    whose distinctive output was the full UDP inventory. Each in-scope host is probed on every scope
+    port with one empty datagram; a port that REPLIES becomes one OPEN udp observation
+    (``protocol_id = None``, since an empty-probe reply identifies no protocol). A non-responder is
+    left silent, never reported closed, so a UDP no-response stays indeterminate. Bounded by the same
+    host cap and worker pool as the TCP/SNMP paths, so a wide scope never materialises a socket per
+    (host, port) at once."""
+    if _UDP_FULL_SWEEP_OP not in scope.udp_operations:
+        return []
+    hosts = [ip for ip in _scope_udp_hosts(scope, cap=settings.scan_max_hosts) if scope.in_scope(ip)]
+    ports = list(scope.ports)
+    if not hosts or not ports:
+        return []
+
+    queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
+    for ip in hosts:
+        for port in ports:
+            queue.put_nowait((ip, port))
+    observations: list[dict] = []
+
+    async def _worker() -> None:
+        while True:
+            try:
+                ip, port = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if await _udp_port_open(ip, port, timeout=settings.scan_connect_timeout):
+                observations.append(
+                    assessment_discover.service_observation(
+                        address=ip,
+                        port=port,
+                        transport="udp",
+                        outcome="open",
+                        protocol_id=None,
+                    )
+                )
+
+    worker_count = min(max(1, _scan_limits["concurrency"]), queue.qsize())
+    await asyncio.gather(*(_worker() for _ in range(worker_count)))
+    return observations
+
+
+async def _probe_discover_scope(scope: assessment_discover.DiscoverScope) -> list[dict] | None:
+    """Probe every in-scope network over the scope's ports, returning OPEN service observations, or
+    None if a pause landed first (the caller then hands the task back).
+
+    For each OPEN service a bounded, passive banner read identifies the protocol from what the
+    service EMITS (a telnet IAC negotiation, an SSH id string, an SMTP/FTP greeting), never from the
+    port: a service that answers with nothing distinctive stays ``protocol_id = None`` rather than
+    being guessed from the port it sits on. Every host is gated by ``scope.in_scope`` before it is
+    probed or counted, so an address outside the frozen scope is never reached even if the scanner,
+    handed a wider range, happened to see it."""
+    observations: list[dict] = []
+    for network in scope.networks:
+        hits = await _unless_paused(
+            asyncio.create_task(
+                scan.scan_cidr(
+                    str(network),
+                    list(scope.ports),
+                    timeout=settings.scan_connect_timeout,
+                    discovery_timeout=settings.scan_discovery_timeout,
+                    concurrency=_scan_limits["concurrency"],
+                    max_hosts=settings.scan_max_hosts,
+                    chunk_prefix=settings.scan_chunk_prefix,
+                )
+            )
+        )
+        if hits is None:
+            return None
+        for hit in hits:
+            ip, port = hit.get("ip"), hit.get("port")
+            if ip is None or port is None or not scope.in_scope(str(ip)):
+                continue
+            banner = await _read_banner(str(ip), int(port), timeout=settings.scan_connect_timeout)
+            protocol_id = protocols.identify_protocol(banner)
+            banner_sha256 = hashlib.sha256(banner).hexdigest() if banner else None
+            capabilities = await _specialist_capabilities(
+                str(ip), int(port), protocol_id, timeout=settings.scan_connect_timeout
+            )
+            observations.append(
+                assessment_discover.service_observation(
+                    address=str(ip),
+                    port=int(port),
+                    transport="tcp",
+                    outcome="open",
+                    protocol_id=protocol_id,
+                    banner_sha256=banner_sha256,
+                    capabilities=capabilities,
+                )
+            )
+    snmp_hits = await _unless_paused(asyncio.create_task(_snmp_discover(scope)))
+    if snmp_hits is None:
+        return None
+    observations.extend(snmp_hits)
+    udp_sweep = await _unless_paused(asyncio.create_task(_udp_full_sweep_discover(scope)))
+    if udp_sweep is None:
+        return None
+    observations.extend(udp_sweep)
+    return observations
+
+
+async def _resolve_hosts(hosts: tuple[str, ...]) -> dict[str, list[str]]:
+    """Resolve each public-host NAME to the addresses it answers with (IPv4 and IPv6), deduped.
+
+    One bounded ``getaddrinfo`` per host. A name that does not resolve maps to an empty list, which
+    ``fold_resolved_hosts`` records as an unavailable-coverage note rather than a silent gap, and an
+    IP literal resolves to itself so the caller never special-cases one. This step only resolves; the
+    public-only vetting of each resolved address is the folder's job (and ``in_scope``'s belt)."""
+    loop = asyncio.get_running_loop()
+    resolved: dict[str, list[str]] = {}
+    for host in hosts:
+        try:
+            infos = await loop.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+        except (OSError, UnicodeError):
+            resolved[host] = []
+            continue
+        resolved[host] = sorted({str(info[4][0]) for info in infos})
+    return resolved
+
+
+async def _run_assessment_discover(state: AgentState, token: str, task: dict) -> None:
+    """Run one signed Network Assessment discover job: verify, re-derive scope, probe, sign, submit.
+
+    Agent-first: the signed job is verified against the control plane's registered public keys
+    BEFORE any target field is read or any socket opened, so a forged, tampered or wrong-schema job
+    produces zero target activity and a typed rejection. The scope is then re-derived from the
+    VERIFIED job (never ambient config), every destination gated by ``scope.in_scope``, and the
+    result is signed with the agent's OWN enrolment key; the control plane verifies that signature
+    and binds the result to the frozen snapshot before persisting."""
+    task_id = task["id"]
+    envelope = (task.get("tool_config") or {}).get("envelope")
+    job = assessment.open_signed_job(
+        envelope,
+        public_keys=state.cp_assessment_public_keys or [],
+        domain=_DISCOVER_JOB_DOMAIN,
+        expected_schema=_DISCOVER_JOB_SCHEMA,
+    )
+    if job is None:
+        # Verified BEFORE task_started and BEFORE any probe: a job the agent cannot trust is refused
+        # with zero target activity. An empty key list (an agent that has not yet been told the
+        # control plane's keys) fails closed here too.
+        logger.warning("Refused assessment job %s: signature/schema verification failed", task_id)
+        await control_plane.task_failed(
+            settings, token, task_id, reason="signed assessment job failed verification"
+        )
+        return
+    if not state.signing_key_seed:
+        await control_plane.task_failed(
+            settings, token, task_id, reason="agent has no signing key to sign the result"
+        )
+        return
+    try:
+        scope = assessment_discover.derive_scope(job)
+    except ValueError as exc:
+        logger.warning("Refused assessment job %s: %s", task_id, exc)
+        await control_plane.task_failed(settings, token, task_id, reason=f"scope refused: {exc}")
+        return
+
+    await control_plane.task_started(settings, token, task_id)
+    try:
+        # A public-host job carries NAMES; resolving and vetting them is target activity, so it runs
+        # after task_started. The resolved, globally-routable addresses are folded into the scope as
+        # /32|/128 networks the probe path then sweeps; refused or unresolved hosts become coverage.
+        host_coverage: list[dict] = []
+        if scope.target_hosts:
+            resolved = await _resolve_hosts(scope.target_hosts)
+            scope, host_coverage = assessment_discover.fold_resolved_hosts(scope, resolved)
+        observations = await _probe_discover_scope(scope)
+        if observations is None:
+            logger.warning("Paused mid-discover; handing assessment task %s back.", task_id)
+            await _hand_back(token, task_id)
+            return
+        coverage = host_coverage + [
+            assessment_discover.coverage_entry(scope=str(network), state="assessed")
+            for network in scope.networks
+        ]
+        completed_at = datetime.now(UTC).isoformat()
+        result = assessment_discover.build_discover_result(
+            job,
+            services=observations,
+            coverage=coverage,
+            completed_at=completed_at,
+            partial=False,
+        )
+        sealed = assessment.seal_result(
+            result,
+            schema=assessment_discover.RESULT_SCHEMA,
+            seed_b64=state.signing_key_seed,
+            domain=assessment_discover.RESULT_DOMAIN,
+            signer_key_id=assessment.public_key_b64_from_seed(state.signing_key_seed),
+        )
+        await control_plane.submit_assessment_result(
+            settings, token, task_id, sealed, completed_at=completed_at
+        )
+        logger.info(
+            "Assessment discover %s: reported %d service(s) across %d network(s)",
+            task_id,
+            len(observations),
+            len(scope.networks),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - report any failure rather than dropping the task
+        logger.error("Assessment discover %s failed: %s", task_id, exc)
+        await control_plane.task_failed(
+            settings, token, task_id, reason=f"{type(exc).__name__}: {exc}"
+        )
+
+
+async def _run_controlled_validation(state: AgentState, token: str, task: dict) -> None:
+    """Run one control-plane-signed Controlled Validation plan: verify, bounded read-only probe, sign.
+
+    Agent-first and minimal-impact: the inline-signed plan is verified against the control plane's
+    registered keys BEFORE any endpoint field is read or any socket opened, the step's safety and
+    operation classes are checked against the agent's own envelope, and the single probe runs strictly
+    inside the SMALLER of the signed budget and the agent's hard local ceiling. The result is sealed
+    with the agent's own enrolment key; the control plane re-verifies it, binds it to the plan it
+    issued, and seals a receipt. A validator result is an OBSERVATION; it never sets a finding."""
+    task_id = task["id"]
+    plan = (task.get("tool_config") or {}).get("plan")
+    if not assessment_validate.verify_plan(
+        plan, cp_public_keys=state.cp_assessment_public_keys or []
+    ):
+        # Verified BEFORE task_started and BEFORE any socket: a plan the agent cannot trust is refused
+        # with zero target activity. An empty key list fails closed here too.
+        logger.warning("Refused validation plan %s: signature/schema verification failed", task_id)
+        await control_plane.task_failed(
+            settings, token, task_id, reason="signed validation plan failed verification"
+        )
+        return
+    if not state.signing_key_seed:
+        await control_plane.task_failed(
+            settings, token, task_id, reason="agent has no signing key to sign the result"
+        )
+        return
+    step = plan["steps"][0]
+    if not assessment_validate.step_is_runnable(step):
+        logger.warning(
+            "Refused validation plan %s: step outside the minimal-impact envelope", task_id
+        )
+        await control_plane.task_failed(
+            settings,
+            token,
+            task_id,
+            reason="validation step is outside the agent's minimal-impact envelope",
+        )
+        return
+    if assessment_validate.plan_is_expired(plan):
+        await control_plane.task_failed(
+            settings, token, task_id, reason="validation plan has expired"
+        )
+        return
+
+    await control_plane.task_started(settings, token, task_id)
+    try:
+        budget = assessment_validate.effective_budget(step["budget"])
+        started_at = datetime.now(UTC).isoformat()
+        observation = await assessment_validate.probe_endpoint(step["endpoint"], budget)
+        completed_at = datetime.now(UTC).isoformat()
+        evidence_entry, _payload_bytes, _descriptor_bytes = assessment_validate.build_evidence(
+            plan, observation, captured_at=completed_at
+        )
+        result = assessment_validate.build_validation_result(
+            plan,
+            observation=observation,
+            evidence_entry=evidence_entry,
+            started_at=started_at,
+            completed_at=completed_at,
+            budget_used={
+                "requests": observation["requests"],
+                "bytes_sent": observation["sent_bytes"],
+                "bytes_received": observation["received_bytes"],
+            },
+        )
+        sealed = assessment_validate.sign_validation_result(
+            result, seed_b64=state.signing_key_seed
+        )
+        await control_plane.submit_validation_result(
+            settings, token, task_id, result=sealed, completed_at=completed_at
+        )
+        logger.info(
+            "Controlled validation %s: %s on %s:%s (outcome %s)",
+            task_id,
+            step["endpoint"]["protocol"],
+            step["endpoint"]["address"],
+            step["endpoint"]["port"],
+            observation["outcome"],
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - report any failure rather than dropping the task
+        logger.error("Controlled validation %s failed: %s", task_id, exc)
+        await control_plane.task_failed(
+            settings, token, task_id, reason=f"{type(exc).__name__}: {exc}"
+        )
+
+
+async def _run_pentest_technique(state: AgentState, token: str, task: dict) -> None:
+    """Run one control-plane-signed, read-only pentest technique: verify, deny-first gate, probe, sign.
+
+    Agent-first and read-only: the plan's own signature AND its embedded approval's signature are
+    verified against the control plane's keys BEFORE any target field is read; the agent then re-runs
+    its own deny-first gate (a supported read-only technique, an approval bound to the plan, an
+    unexpired plan, a target that passes the immutable safety deny-list and the engagement scope). A
+    gate refusal emits a signed DENIED result with zero target activity; otherwise the one bounded,
+    non-destructive technique runs. The result is sealed with the agent's own key; the control plane
+    re-verifies it, binds it to the plan it dispatched, and records it. Never changes target state."""
+    task_id = task["id"]
+    plan = (task.get("tool_config") or {}).get("plan")
+    if not pentest_execute.verify_plan(plan, cp_public_keys=state.cp_assessment_public_keys or []):
+        logger.warning("Refused pentest plan %s: signature/schema verification failed", task_id)
+        await control_plane.task_failed(
+            settings, token, task_id, reason="signed pentest plan failed verification"
+        )
+        return
+    if not state.signing_key_seed:
+        await control_plane.task_failed(
+            settings, token, task_id, reason="agent has no signing key to sign the result"
+        )
+        return
+
+    await control_plane.task_started(settings, token, task_id)
+    try:
+        started_at = datetime.now(UTC).isoformat()
+        denial = pentest_execute.deny_first_reason(plan)
+        if denial is not None:
+            # Authentic plan, refused by the agent's own gate: record an auditable DENIED result with
+            # zero target activity rather than silently failing.
+            logger.warning("Pentest plan %s denied by the agent gate: %s", task_id, denial)
+            observation = {"outcome": "DENIED", "summary": denial, "attempts": 0}
+            completed_at = datetime.now(UTC).isoformat()
+            result = pentest_execute.build_result(
+                plan,
+                observation,
+                started_at=started_at,
+                completed_at=completed_at,
+                outcome="DENIED",
+            )
+        else:
+            # A lateral-reach technique authenticates with an engagement-approved credential the agent
+            # resolves from its LOCAL vault (the secret never leaves the box); every other technique
+            # resolves no credential. A credential_ref the vault does not hold leaves it None, and the
+            # technique then reports DENIED rather than reaching with nothing.
+            credential = None
+            credential_ref = plan.get("credential_ref")
+            if credential_ref:
+                credential = CredentialVault(settings.credential_vault_path).resolve(credential_ref)
+            observation = await pentest_execute.run_technique(plan, credential=credential)
+            completed_at = datetime.now(UTC).isoformat()
+            result = pentest_execute.build_result(
+                plan, observation, started_at=started_at, completed_at=completed_at
+            )
+        sealed = pentest_execute.sign_result(result, seed_b64=state.signing_key_seed)
+        await control_plane.submit_pentest_result(
+            settings, token, task_id, result=sealed, completed_at=completed_at
+        )
+        logger.info(
+            "Pentest technique %s: %s on %s (outcome %s)",
+            task_id,
+            plan["technique_id"],
+            plan["target"],
+            result["outcome"],
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - report any failure rather than dropping the task
+        logger.error("Pentest technique %s failed: %s", task_id, exc)
+        await control_plane.task_failed(
+            settings, token, task_id, reason=f"{type(exc).__name__}: {exc}"
+        )
+
+
+# The agent's HARD local ceilings for one credentialed collection: however generous the signed job's
+# budget is, a read on this box never waits longer or buys more than this. The control plane signs a
+# budget too (CollectBudgetV1), and the effective limit is the SMALLER of the two: the signed budget
+# can only ever tighten, never loosen, the agent's own bound. So a slow or chatty device cannot hang
+# the agent, and a forged-large budget cannot make it read unbounded either.
+_COLLECT_TIMEOUT_S = 20.0
+_COLLECT_MAX_BYTES = 2_000_000
+
+
+def _effective_collect_budget(job: dict) -> tuple[float, int]:
+    """(timeout_s, max_bytes) for the device read: the signed budget clamped to the agent ceilings.
+
+    Reads ``per_command_timeout_ms`` / ``max_received_bytes`` from the verified job's budget and
+    takes the smaller of each against the agent's own ceiling. A missing or malformed budget falls
+    back to the ceilings, so an older control plane that signs no budget still gets a bounded read."""
+    budget = job.get("budget")
+    timeout_s = _COLLECT_TIMEOUT_S
+    max_bytes = _COLLECT_MAX_BYTES
+    if isinstance(budget, dict):
+        ms = budget.get("per_command_timeout_ms")
+        if isinstance(ms, int) and ms > 0:
+            timeout_s = min(_COLLECT_TIMEOUT_S, ms / 1000)
+        cap = budget.get("max_received_bytes")
+        if isinstance(cap, int) and cap > 0:
+            max_bytes = min(_COLLECT_MAX_BYTES, cap)
+    return timeout_s, max_bytes
+
+
+async def _collect_neighbours(job: dict, credential, config: str, timeout_s: float, max_bytes: int):
+    """The device's LLDP neighbours, for the control plane's topology edges. Collected only for a
+    grammar that exposes LLDP (Arista); an FRR device has no LLDP daemon, so it reports none, which
+    the control plane records as an honest topology gap. A failed LLDP read is also no neighbours,
+    never a guess. Reported faithfully (management interfaces included); the control plane classifies
+    data-plane links apart from the shared management segment."""
+    if not vendor.has_lldp(config):
+        return []
+    try:
+        lldp_output = await ssh_collect.collect_lldp_output(
+            job["target_address"], credential, timeout=timeout_s, max_bytes=max_bytes
+        )
+    except Exception:  # noqa: BLE001 - a failed LLDP read is an honest topology gap, not a failure
+        return []
+    return [
+        assessment_collect.neighbour_entry(**neighbour)
+        for neighbour in vendor.collect_neighbours(config, lldp_output)
+    ]
+
+
+def _unavailable_coverage(target: str, control_ids: list[str], reason_code: str) -> list[dict]:
+    """One UNAVAILABLE coverage entry per control, so an unreadable source records an honest gap
+    rather than a guessed fact for every control it was asked to collect."""
+    return [
+        assessment_collect.coverage_entry(
+            scope=f"{target}:{cid}", state="unavailable", reason_code=reason_code
+        )
+        for cid in control_ids
+    ]
+
+
+async def _collect_network_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float, max_bytes: int
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """The network-device tier: read ``show running-config`` ONCE, normalise each requested control
+    via the vendor grammar, and read LLDP neighbours. A failed read makes every requested control
+    UNAVAILABLE and yields no neighbours; a control no vendor parser supports is UNSUPPORTED."""
+    target = job["target_address"]
+    try:
+        config = await ssh_collect.collect_running_config(
+            target, credential, timeout=timeout_s, max_bytes=max_bytes
+        )
+    except Exception as exc:  # noqa: BLE001 - any connect/auth/read failure is honest UNAVAILABLE
+        reason = f"collect_failed:{type(exc).__name__}"
+        return [], _unavailable_coverage(target, control_ids, reason), []
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    for control_id in control_ids:
+        fields = vendor.collect_control_fields(config, control_id)
+        if fields is None:
+            coverage.append(
+                assessment_collect.coverage_entry(
+                    scope=f"{target}:{control_id}", state="unsupported", reason_code="no_parser"
+                )
+            )
+            continue
+        controls.append(
+            assessment_collect.control_facts(control_id, fields, collection_complete=True)
+        )
+    neighbours = await _collect_neighbours(job, credential, config, timeout_s, max_bytes)
+    return controls, coverage, neighbours
+
+
+async def _collect_host_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float, max_bytes: int
+) -> tuple[list[dict], list[dict]]:
+    """The Linux-host tier: read each host evidence source a requested control needs (``sshd -T`` for
+    ``server.ssh.*``, ``sysctl -a`` for ``server.sysctl.*``) at most ONCE, then normalise each control
+    from its source via the host parser. A source whose read fails (a network device has no ``sshd`` /
+    ``sysctl``) makes every control reading it UNAVAILABLE, while the controls on a source that did
+    read are still assessed; a control the host parser does not support is UNSUPPORTED. No neighbours:
+    LLDP is a device grammar, not a host one."""
+    target = job["target_address"]
+    sources: dict[str, str] = {}
+    failed: dict[str, str] = {}
+    for source in host_tier.sources_for(control_ids):
+        collect = getattr(ssh_collect, host_tier.SOURCE_READERS[source])
+        try:
+            sources[source] = await collect(
+                target, credential, timeout=timeout_s, max_bytes=max_bytes
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed read is honest UNAVAILABLE, not a crash
+            failed[source] = f"collect_failed:{type(exc).__name__}"
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    for control_id in control_ids:
+        # A control is UNAVAILABLE only when EVERY source it could be read from failed to read; if any
+        # candidate source succeeded, the control is collected from it (a control an engine expresses
+        # two ways, like a database listener, is answered by whichever engine's config is present).
+        control_sources = host_tier.sources_for_control(control_id)
+        if control_sources and control_sources <= failed.keys():
+            coverage.append(
+                assessment_collect.coverage_entry(
+                    scope=f"{target}:{control_id}",
+                    state="unavailable",
+                    reason_code=failed[next(iter(control_sources))],
+                )
+            )
+            continue
+        fields = host_tier.collect_control_fields(sources, control_id)
+        if fields is None:
+            coverage.append(
+                assessment_collect.coverage_entry(
+                    scope=f"{target}:{control_id}", state="unsupported", reason_code="no_parser"
+                )
+            )
+            continue
+        # A baseline-comparison host control (server.localadmin.unapproved) sends the RAW observed set
+        # and leaves the policy gate for the control plane to earn from the tenant baseline.
+        controls.append(
+            assessment_collect.control_facts(
+                control_id,
+                fields,
+                collection_complete=True,
+                include_policy_gate=not host_tier.is_baseline_control(control_id),
+            )
+        )
+    return controls, coverage
+
+
+def _append_resource_control(
+    target: str,
+    control_id: str,
+    requested_ids: list[str],
+    resource: dict,
+    field_fn,
+    controls: list[dict],
+    coverage: list[dict],
+    *,
+    include_policy_gate: bool = True,
+) -> None:
+    """Append one control's facts (or an UNSUPPORTED coverage entry) when it was requested. Generic
+    across the fetch-once tiers (Kubernetes LIST, storage management-API GET): ``field_fn`` maps the
+    already-fetched resource document to the control's field dict, or ``None`` to abstain (recorded
+    UNSUPPORTED). ``include_policy_gate=False`` for a baseline-comparison control, whose policy gate the
+    control plane earns from the tenant baseline, not the agent."""
+    if control_id not in requested_ids:
+        return
+    fields = field_fn(resource)
+    if fields is None:
+        coverage.append(
+            assessment_collect.coverage_entry(
+                scope=f"{target}:{control_id}", state="unsupported", reason_code="no_parser"
+            )
+        )
+        return
+    controls.append(
+        assessment_collect.control_facts(
+            control_id, fields, collection_complete=True, include_policy_gate=include_policy_gate
+        )
+    )
+
+
+async def _collect_kube_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float
+) -> tuple[list[dict], list[dict]]:
+    """The Kubernetes API tier: authenticate to the target's API server with the ``k8s_token``
+    credential and LIST read-only, normalising each requested control. A wrong credential kind (not a
+    k8s_token), or a failed read (unreachable / unauthorized), makes every requested control
+    UNAVAILABLE; a control the kube collector does not support is UNSUPPORTED. No SSH is opened: this
+    tier talks to the API server, not a host shell."""
+    target = job["target_address"]
+    if credential.kind != "k8s_token":
+        return [], _unavailable_coverage(
+            target, control_ids, "wrong_credential_kind:expected_k8s_token"
+        )
+    api = kube_collect.api_for(target, credential.secret, timeout=timeout_s)
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    # Each control LISTs a different resource; fetch a resource once, only when a requested control
+    # needs it, and a failed fetch makes only that resource's controls UNAVAILABLE.
+    pod_ids = [cid for cid in control_ids if cid in kube_collect.POD_CONTROLS]
+    if pod_ids:
+        try:
+            pods = await kube_collect.fetch_pods(api)
+        except Exception as exc:  # noqa: BLE001 - a failed read is honest UNAVAILABLE, not a crash
+            coverage += _unavailable_coverage(
+                target, pod_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            _append_resource_control(
+                target, "kubernetes.workload.privileged", pod_ids, pods,
+                kube_collect.privileged_workloads_field, controls, coverage,
+            )
+    netpol_ids = [cid for cid in control_ids if cid in kube_collect.NETPOL_CONTROLS]
+    if netpol_ids:
+        try:
+            netpols = await kube_collect.fetch_networkpolicies(api)
+        except Exception as exc:  # noqa: BLE001 - a failed read is honest UNAVAILABLE, not a crash
+            coverage += _unavailable_coverage(
+                target, netpol_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            _append_resource_control(
+                target, "kubernetes.network.no_default_deny", netpol_ids, netpols,
+                kube_collect.default_deny_field, controls, coverage,
+            )
+    namespace_ids = [cid for cid in control_ids if cid in kube_collect.NAMESPACE_CONTROLS]
+    if namespace_ids:
+        try:
+            namespaces = await kube_collect.fetch_namespaces(api)
+        except Exception as exc:  # noqa: BLE001 - a failed read is honest UNAVAILABLE, not a crash
+            coverage += _unavailable_coverage(
+                target, namespace_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            _append_resource_control(
+                target, "kubernetes.admission.pod_security_disabled", namespace_ids, namespaces,
+                kube_collect.pod_security_field, controls, coverage,
+            )
+    # The RBAC baseline-comparison control: LIST ClusterRoleBindings and send the RAW set of named
+    # principals bound to cluster-admin, with NO policy gate (include_policy_gate=False), so the
+    # control plane judges "unapproved" against the tenant baseline instead of the agent guessing.
+    rbac_ids = [cid for cid in control_ids if cid in kube_collect.RBAC_CONTROLS]
+    if rbac_ids:
+        try:
+            bindings = await kube_collect.fetch_clusterrolebindings(api)
+        except Exception as exc:  # noqa: BLE001 - a failed read is honest UNAVAILABLE, not a crash
+            coverage += _unavailable_coverage(
+                target, rbac_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            _append_resource_control(
+                target, "kubernetes.rbac.cluster_admin_bindings", rbac_ids, bindings,
+                kube_collect.cluster_admin_members_field, controls, coverage,
+                include_policy_gate=False,
+            )
+    return controls, coverage
+
+
+async def _collect_storage_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float
+) -> tuple[list[dict], list[dict]]:
+    """The storage-management tier: authenticate to the target array's management API with the
+    ``storage_mgmt`` bearer token and GET read-only, normalising each requested control. A wrong
+    credential kind (not storage_mgmt), or a failed read (unreachable / unauthorized), makes every
+    requested control UNAVAILABLE; a control the storage collector does not support is UNSUPPORTED. No
+    SSH is opened: this tier talks to the array's management API, not a host shell."""
+    target = job["target_address"]
+    if credential.kind != "storage_mgmt":
+        return [], _unavailable_coverage(
+            target, control_ids, "wrong_credential_kind:expected_storage_mgmt"
+        )
+    secret = credential.secret
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    # The five factual-absolute posture controls all read the one posture document: fetch it once, only
+    # when a requested control needs it, and a failed fetch makes only those controls UNAVAILABLE.
+    posture_ids = [cid for cid in control_ids if cid in storage_mgmt.POSTURE_CONTROLS]
+    if posture_ids:
+        try:
+            posture = await storage_mgmt.fetch_posture(target, secret, timeout=timeout_s)
+        except Exception as exc:  # noqa: BLE001 - a failed read is honest UNAVAILABLE, not a crash
+            coverage += _unavailable_coverage(
+                target, posture_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            _append_resource_control(
+                target, "storage.mgmt.plaintext_protocol", posture_ids, posture,
+                storage_mgmt.management_encryption_field, controls, coverage,
+            )
+            _append_resource_control(
+                target, "storage.auth.mfa_not_enforced", posture_ids, posture,
+                storage_mgmt.admin_mfa_field, controls, coverage,
+            )
+            _append_resource_control(
+                target, "storage.audit.data_access_logging_disabled", posture_ids, posture,
+                storage_mgmt.data_access_logging_field, controls, coverage,
+            )
+            _append_resource_control(
+                target, "storage.snapshot.unprotected", posture_ids, posture,
+                storage_mgmt.snapshot_protection_field, controls, coverage,
+            )
+            _append_resource_control(
+                target, "storage.immutability.bypassable", posture_ids, posture,
+                storage_mgmt.immutability_bypass_field, controls, coverage,
+            )
+            _append_resource_control(
+                target, "storage.volume.encryption", posture_ids, posture,
+                storage_mgmt.volume_encryption_field, controls, coverage,
+            )
+            _append_resource_control(
+                target, "storage.replication.untrusted", posture_ids, posture,
+                storage_mgmt.replication_untrusted_field, controls, coverage,
+            )
+            _append_resource_control(
+                target, "storage.lifecycle.unsupported_firmware", posture_ids, posture,
+                storage_mgmt.lifecycle_firmware_field, controls, coverage,
+            )
+            _append_resource_control(
+                target, "storage.multipath.inconsistent_access", posture_ids, posture,
+                storage_mgmt.multipath_inconsistency_field, controls, coverage,
+            )
+            _append_resource_control(
+                target, "storage.recovery.unseparated_evidence", posture_ids, posture,
+                storage_mgmt.recovery_evidence_field, controls, coverage,
+            )
+    # The RBAC baseline-comparison control: GET the administrators document and send the RAW observed
+    # admin set, with NO policy gate (include_policy_gate=False), so the control plane judges
+    # "unapproved" against the tenant baseline instead of the agent guessing.
+    rbac_ids = [cid for cid in control_ids if cid in storage_mgmt.RBAC_CONTROLS]
+    if rbac_ids:
+        try:
+            admins = await storage_mgmt.fetch_administrators(target, secret, timeout=timeout_s)
+        except Exception as exc:  # noqa: BLE001 - a failed read is honest UNAVAILABLE, not a crash
+            coverage += _unavailable_coverage(
+                target, rbac_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            _append_resource_control(
+                target, "storage.rbac.unapproved_admins", rbac_ids, admins,
+                storage_mgmt.admin_members_field, controls, coverage,
+                include_policy_gate=False,
+            )
+    return controls, coverage
+
+
+async def _collect_windows_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float
+) -> tuple[list[dict], list[dict]]:
+    """The Windows host tier: authenticate to the target over WinRM with the ``winrm_login`` credential
+    and run ONE fixed read-only PowerShell gather, normalising each requested control from the single
+    posture document it returns. A wrong credential kind (not winrm_login), or a failed read
+    (unreachable / unauthorized), makes every requested control UNAVAILABLE; a control the collector
+    does not support is UNSUPPORTED. No SSH is opened: this tier talks WinRM, not a host shell."""
+    target = job["target_address"]
+    if credential.kind != "winrm_login":
+        return [], _unavailable_coverage(
+            target, control_ids, "wrong_credential_kind:expected_winrm_login"
+        )
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    # Every Windows control reads the one posture document: fetch it once, and a failed fetch makes
+    # every requested control UNAVAILABLE.
+    try:
+        posture = await windows_host.fetch_posture(target, credential, timeout=timeout_s)
+    except Exception as exc:  # noqa: BLE001 - a failed read is honest UNAVAILABLE, not a crash
+        return [], _unavailable_coverage(target, control_ids, f"collect_failed:{type(exc).__name__}")
+    posture_ids = [cid for cid in control_ids if cid in windows_host.POSTURE_CONTROLS]
+    if posture_ids:
+        _append_resource_control(
+            target, "server.remote.rdp_nla_disabled", posture_ids, posture,
+            windows_host.rdp_nla_field, controls, coverage,
+        )
+        _append_resource_control(
+            target, "server.service.smbv1_enabled", posture_ids, posture,
+            windows_host.smbv1_field, controls, coverage,
+        )
+        _append_resource_control(
+            target, "server.share.smb_signing_not_required", posture_ids, posture,
+            windows_host.smb_signing_field, controls, coverage,
+        )
+        _append_resource_control(
+            target, "server.firewall.enabled", posture_ids, posture,
+            windows_host.firewall_enabled_field, controls, coverage,
+        )
+        _append_resource_control(
+            target, "server.firewall.permissive", posture_ids, posture,
+            windows_host.firewall_permissive_field, controls, coverage,
+        )
+    # The local-admins baseline control: send the RAW observed set with NO policy gate, so the control
+    # plane diffs it against the tenant baseline (the same control, and the same wire key, as Linux).
+    rbac_ids = [cid for cid in control_ids if cid in windows_host.BASELINE_CONTROLS]
+    if rbac_ids:
+        _append_resource_control(
+            target, "server.localadmin.unapproved", rbac_ids, posture,
+            windows_host.local_admins_field, controls, coverage,
+            include_policy_gate=False,
+        )
+    return controls, coverage
+
+
+async def _collect_kube_probe_controls(
+    job: dict, control_ids: list[str], timeout_s: float
+) -> tuple[list[dict], list[dict]]:
+    """The no-credential Kubernetes PROBE tier: check whether the API server accepts the anonymous
+    identity, WITHOUT any token (a GET to the API root with no Authorization header). Needs no local
+    credential; a failed probe (unreachable) makes the control UNAVAILABLE."""
+    target = job["target_address"]
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    for control_id in control_ids:
+        try:
+            if control_id == "kubernetes.api.anonymous":
+                enabled = await kube_collect.fetch_anonymous_auth(target, timeout=timeout_s)
+                fields = kube_collect.anonymous_auth_field(enabled)
+            elif control_id == "kubernetes.kubelet.unauthenticated":
+                enabled = await kube_collect.fetch_kubelet_anonymous(target, timeout=timeout_s)
+                fields = kube_collect.kubelet_anonymous_field(enabled)
+            else:
+                fields = None
+        except Exception as exc:  # noqa: BLE001 - a failed probe is honest UNAVAILABLE
+            coverage += _unavailable_coverage(target, [control_id], f"probe_failed:{type(exc).__name__}")
+            continue
+        _record_control(target, control_id, fields, controls, coverage)
+    return controls, coverage
+
+
+async def _collect_db_query_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float
+) -> tuple[list[dict], list[dict]]:
+    """The database-query tier: open ONE read-only TLS SQL session to the target with the ``db_login``
+    reader credential, run a fixed catalog query, and normalise each requested control. A wrong
+    credential kind (not db_login), or a failed connect/query, makes every requested control
+    UNAVAILABLE; a control this tier does not support is UNSUPPORTED. One fixed query, no arbitrary
+    SQL, no row sampling."""
+    target = job["target_address"]
+    if credential.kind != "db_login":
+        return [], _unavailable_coverage(
+            target, control_ids, "wrong_credential_kind:expected_db_login"
+        )
+    # Fetch each read-only query at most once, and only when a requested control needs it. A query that
+    # fails marks the controls that depend on it UNAVAILABLE, while controls on a query that succeeded
+    # are still assessed.
+    extension_names: list[str] | None = None
+    ext_failed: str | None = None
+    if "database.extension.dangerous_enabled" in control_ids:
+        try:
+            extension_names = await db_query.fetch_extension_names(
+                target, credential, timeout=timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - any failure is honest UNAVAILABLE
+            ext_failed = f"collect_failed:{type(exc).__name__}"
+    version_num: object = None
+    version_failed: str | None = None
+    if "database.lifecycle.unsupported_engine" in control_ids:
+        try:
+            version_num = await db_query.fetch_server_version_num(
+                target, credential, timeout=timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - any failure is honest UNAVAILABLE
+            version_failed = f"collect_failed:{type(exc).__name__}"
+    settings: object = None
+    settings_failed: str | None = None
+    if "database.config.baseline_drift" in control_ids:
+        try:
+            settings = await db_query.fetch_security_settings(
+                target, credential, timeout=timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - any failure is honest UNAVAILABLE
+            settings_failed = f"collect_failed:{type(exc).__name__}"
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    for control_id in control_ids:
+        if control_id == "database.extension.dangerous_enabled":
+            if ext_failed:
+                coverage.append(
+                    assessment_collect.coverage_entry(
+                        scope=f"{target}:{control_id}", state="unavailable", reason_code=ext_failed
+                    )
+                )
+                continue
+            fields = db_query.dangerous_extensions_field(extension_names)
+        elif control_id == "database.lifecycle.unsupported_engine":
+            if version_failed:
+                coverage.append(
+                    assessment_collect.coverage_entry(
+                        scope=f"{target}:{control_id}",
+                        state="unavailable",
+                        reason_code=version_failed,
+                    )
+                )
+                continue
+            fields = db_query.engine_eol_field(version_num)
+        elif control_id == "database.config.baseline_drift":
+            if settings_failed:
+                coverage.append(
+                    assessment_collect.coverage_entry(
+                        scope=f"{target}:{control_id}",
+                        state="unavailable",
+                        reason_code=settings_failed,
+                    )
+                )
+                continue
+            fields = db_query.security_settings_field(settings)
+        else:
+            fields = None
+        if fields is None:
+            coverage.append(
+                assessment_collect.coverage_entry(
+                    scope=f"{target}:{control_id}", state="unsupported", reason_code="no_parser"
+                )
+            )
+            continue
+        # A baseline-comparison control (database.config.baseline_drift) sends the RAW observed set
+        # and leaves the policy gate for the control plane to earn from the tenant baseline.
+        controls.append(
+            assessment_collect.control_facts(
+                control_id,
+                fields,
+                collection_complete=True,
+                include_policy_gate=control_id not in db_query.BASELINE_CONTROLS,
+            )
+        )
+    return controls, coverage
+
+
+def _record_control(
+    target: str,
+    control_id: str,
+    fields: dict | None,
+    controls: list[dict],
+    coverage: list[dict],
+    *,
+    include_policy_gate: bool = True,
+) -> None:
+    """Append a control's facts, or an UNSUPPORTED coverage entry when the parser abstained (``fields``
+    is ``None``). ``include_policy_gate=False`` for a baseline-comparison control, whose policy gate the
+    control plane earns from the tenant baseline rather than the agent asserting it."""
+    if fields is None:
+        coverage.append(
+            assessment_collect.coverage_entry(
+                scope=f"{target}:{control_id}", state="unsupported", reason_code="no_parser"
+            )
+        )
+        return
+    controls.append(
+        assessment_collect.control_facts(
+            control_id, fields, collection_complete=True, include_policy_gate=include_policy_gate
+        )
+    )
+
+
+async def _collect_mysql_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float
+) -> tuple[list[dict], list[dict]]:
+    """The MySQL/MariaDB query tier: open ONE read-only TLS session with the ``mysql_login`` reader
+    credential, run a fixed account query, and normalise each requested control. A wrong credential
+    kind, or a failed connect/query, makes every requested control UNAVAILABLE; a control this tier
+    does not support is UNSUPPORTED."""
+    target = job["target_address"]
+    if credential.kind != "mysql_login":
+        return [], _unavailable_coverage(
+            target, control_ids, "wrong_credential_kind:expected_mysql_login"
+        )
+    try:
+        usernames = await mysql_query.fetch_usernames(target, credential, timeout=timeout_s)
+    except Exception as exc:  # noqa: BLE001 - any connect/auth/query failure is honest UNAVAILABLE
+        return [], _unavailable_coverage(
+            target, control_ids, f"collect_failed:{type(exc).__name__}"
+        )
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    for control_id in control_ids:
+        fields = (
+            mysql_query.default_accounts_field(usernames)
+            if control_id == "database.auth.default_accounts"
+            else None
+        )
+        _record_control(target, control_id, fields, controls, coverage)
+    return controls, coverage
+
+
+async def _collect_vsphere_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float
+) -> tuple[list[dict], list[dict]]:
+    """The virtualization (vSphere) tier: log in to the target vCenter/ESXi endpoint over TLS with the
+    ``vsphere_login`` reader credential, read a host property, and normalise each requested control. A
+    wrong credential kind (not vsphere_login), or a failed login/read, makes every requested control
+    UNAVAILABLE; a control this tier does not support is UNSUPPORTED."""
+    target = job["target_address"]
+    if credential.kind != "vsphere_login":
+        return [], _unavailable_coverage(
+            target, control_ids, "wrong_credential_kind:expected_vsphere_login"
+        )
+    # Read each vSphere property only when a requested control needs it, once; a failed read makes
+    # only that property's controls UNAVAILABLE.
+    lockdown_modes: object = None
+    lockdown_failed: str | None = None
+    if "virtualization.host.lockdown_disabled" in control_ids:
+        try:
+            lockdown_modes = await vsphere_collect.fetch_host_lockdown_modes(
+                target, credential, timeout=timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - any login/read failure is honest UNAVAILABLE
+            lockdown_failed = f"collect_failed:{type(exc).__name__}"
+    promiscuous_readings: object = None
+    promiscuous_failed: str | None = None
+    if "virtualization.network.promiscuous_allowed" in control_ids:
+        try:
+            promiscuous_readings = await vsphere_collect.fetch_promiscuous_readings(
+                target, credential, timeout=timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - any login/read failure is honest UNAVAILABLE
+            promiscuous_failed = f"collect_failed:{type(exc).__name__}"
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    for control_id in control_ids:
+        if control_id == "virtualization.host.lockdown_disabled":
+            if lockdown_failed:
+                coverage += _unavailable_coverage(target, [control_id], lockdown_failed)
+                continue
+            fields = vsphere_collect.host_lockdown_field(lockdown_modes)
+        elif control_id == "virtualization.network.promiscuous_allowed":
+            if promiscuous_failed:
+                coverage += _unavailable_coverage(target, [control_id], promiscuous_failed)
+                continue
+            fields = vsphere_collect.promiscuous_allowed_field(promiscuous_readings)
+        else:
+            fields = None
+        _record_control(target, control_id, fields, controls, coverage)
+    return controls, coverage
+
+
+async def _collect_ldap_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float
+) -> tuple[list[dict], list[dict]]:
+    """The identity (LDAP) tier: bind to the target domain controller over LDAPS with the ``ldap_bind``
+    reader credential, run a scoped read-only search per control, and normalise each. A wrong
+    credential kind (not ldap_bind), or a failed bind/search, makes that search's controls UNAVAILABLE;
+    a control this tier does not support is UNSUPPORTED."""
+    target = job["target_address"]
+    if credential.kind != "ldap_bind":
+        return [], _unavailable_coverage(
+            target, control_ids, "wrong_credential_kind:expected_ldap_bind"
+        )
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    delegation_ids = [cid for cid in control_ids if cid in ldap_query.DELEGATION_CONTROLS]
+    if delegation_ids:
+        try:
+            delegation_uac = await ldap_query.fetch_delegation_uac(
+                target, credential, timeout=timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - any bind/search failure is honest UNAVAILABLE
+            coverage += _unavailable_coverage(
+                target, delegation_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            for control_id in delegation_ids:
+                fields = (
+                    ldap_query.unconstrained_delegation_field(delegation_uac)
+                    if control_id == "identity.delegation.unconstrained"
+                    else None
+                )
+                _record_control(target, control_id, fields, controls, coverage)
+    krbtgt_ids = [cid for cid in control_ids if cid in ldap_query.KRBTGT_CONTROLS]
+    if krbtgt_ids:
+        try:
+            pwdlastset = await ldap_query.fetch_krbtgt_pwdlastset(
+                target, credential, timeout=timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - any bind/search failure is honest UNAVAILABLE
+            coverage += _unavailable_coverage(
+                target, krbtgt_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            now = datetime.now(UTC)
+            for control_id in krbtgt_ids:
+                fields = (
+                    ldap_query.krbtgt_age_field(pwdlastset, now)
+                    if control_id == "identity.krbtgt.rotation_stale"
+                    else None
+                )
+                _record_control(target, control_id, fields, controls, coverage)
+    stale_ids = [cid for cid in control_ids if cid in ldap_query.STALE_CONTROLS]
+    if stale_ids:
+        try:
+            lastlogon = await ldap_query.fetch_privileged_lastlogon(
+                target, credential, timeout=timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - any bind/search failure is honest UNAVAILABLE
+            coverage += _unavailable_coverage(
+                target, stale_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            now = datetime.now(UTC)
+            for control_id in stale_ids:
+                fields = (
+                    ldap_query.inactive_privileged_field(lastlogon, now)
+                    if control_id == "identity.stale.privileged_principals"
+                    else None
+                )
+                _record_control(target, control_id, fields, controls, coverage)
+    repl_ids = [cid for cid in control_ids if cid in ldap_query.REPLICATION_CONTROLS]
+    if repl_ids:
+        try:
+            replication_sd = await ldap_query.fetch_replication_sd(
+                target, credential, timeout=timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - any bind/search failure is honest UNAVAILABLE
+            coverage += _unavailable_coverage(
+                target, repl_ids, f"collect_failed:{type(exc).__name__}"
+            )
+        else:
+            for control_id in repl_ids:
+                fields = (
+                    ldap_query.replication_trustees_field(replication_sd)
+                    if control_id == "identity.replication.unapproved"
+                    else None
+                )
+                # baseline-comparison: leave the policy gate for the control plane to earn.
+                _record_control(target, control_id, fields, controls, coverage, include_policy_gate=False)
+    return controls, coverage
+
+
+def _partition_host_tiers(
+    control_ids: list[str], *, is_winrm: bool
+) -> tuple[list[str], list[str]]:
+    """Split the host controls between the SSH (Linux) and WinRM (Windows) tiers by credential kind,
+    returning ``(host_ids, windows_ids)``.
+
+    A `server.*` control is read over SSH or WinRM depending on the job's credential. The one control
+    both tiers serve, `server.localadmin.unapproved`, is routed by that kind: to the Windows tier for a
+    winrm_login job, to the SSH host tier otherwise, so it never gets double coverage. A Windows-only
+    control always goes to the Windows tier, which reports UNAVAILABLE for a non-winrm credential
+    (honest: a Windows control needs a Windows credential)."""
+    host_ids = [
+        cid
+        for cid in control_ids
+        if host_tier.serves(cid) and not (is_winrm and windows_host.serves(cid))
+    ]
+    windows_ids = [
+        cid
+        for cid in control_ids
+        if windows_host.serves(cid) and (is_winrm or not host_tier.serves(cid))
+    ]
+    return host_ids, windows_ids
+
+
+async def _collect_controls(
+    job: dict, control_ids: list[str], credential
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Normalise each requested control from its evidence source, and read the device's neighbours.
+    Returns (controls, coverage, neighbours).
+
+    A collect job's controls are partitioned by evidence source: a host control is read over SSH from
+    the host's own config, a ``kubernetes.*`` control from the API server (token-authenticated LIST),
+    every other control from the device running-config. Each transport is opened at most once and only
+    when a control needs it, so a host-only job never dials for a running-config it would not use. No
+    local credential makes every CREDENTIALED control UNAVAILABLE (honest coverage), never a guess;
+    an unauthenticated PROBE control (the anonymous-auth check) runs with no credential."""
+    target = job["target_address"]
+    timeout_s, max_bytes = _effective_collect_budget(job)
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    neighbours: list[dict] = []
+    # Unauthenticated probe controls run WITHOUT a credential and are not subject to the no-credential
+    # gate below.
+    probe_ids = [cid for cid in control_ids if kube_collect.probes(cid)]
+    if probe_ids:
+        probe_controls, probe_coverage = await _collect_kube_probe_controls(job, probe_ids, timeout_s)
+        controls += probe_controls
+        coverage += probe_coverage
+    credentialed_ids = [cid for cid in control_ids if not kube_collect.probes(cid)]
+    if not credentialed_ids:
+        return controls, coverage, neighbours
+    if credential is None:
+        coverage += _unavailable_coverage(target, credentialed_ids, "no_local_credential")
+        return controls, coverage, neighbours
+    control_ids = credentialed_ids
+    host_ids, windows_ids = _partition_host_tiers(
+        control_ids, is_winrm=credential.kind == "winrm_login"
+    )
+    kube_ids = [cid for cid in control_ids if kube_collect.serves(cid)]
+    db_query_ids = [cid for cid in control_ids if db_query.serves(cid)]
+    ldap_ids = [cid for cid in control_ids if ldap_query.serves(cid)]
+    vsphere_ids = [cid for cid in control_ids if vsphere_collect.serves(cid)]
+    mysql_ids = [cid for cid in control_ids if mysql_query.serves(cid)]
+    backup_ids = [cid for cid in control_ids if backup_collect.serves(cid)]
+    storage_ids = [cid for cid in control_ids if storage_mgmt.serves(cid)]
+    mail_dns_ids = [cid for cid in control_ids if mail_dns.serves(cid)]
+    network_ids = [
+        cid
+        for cid in control_ids
+        if not host_tier.serves(cid)
+        and not kube_collect.serves(cid)
+        and not db_query.serves(cid)
+        and not ldap_query.serves(cid)
+        and not vsphere_collect.serves(cid)
+        and not mysql_query.serves(cid)
+        and not backup_collect.serves(cid)
+        and not storage_mgmt.serves(cid)
+        and not windows_host.serves(cid)
+        and not mail_dns.serves(cid)
+    ]
+    if network_ids:
+        net_controls, net_coverage, net_neighbours = await _collect_network_controls(
+            job, network_ids, credential, timeout_s, max_bytes
+        )
+        controls += net_controls
+        coverage += net_coverage
+        neighbours += net_neighbours
+    if host_ids:
+        host_controls, host_coverage = await _collect_host_controls(
+            job, host_ids, credential, timeout_s, max_bytes
+        )
+        controls += host_controls
+        coverage += host_coverage
+    if kube_ids:
+        kube_controls, kube_coverage = await _collect_kube_controls(
+            job, kube_ids, credential, timeout_s
+        )
+        controls += kube_controls
+        coverage += kube_coverage
+    if db_query_ids:
+        db_controls, db_coverage = await _collect_db_query_controls(
+            job, db_query_ids, credential, timeout_s
+        )
+        controls += db_controls
+        coverage += db_coverage
+    if ldap_ids:
+        ldap_controls, ldap_coverage = await _collect_ldap_controls(
+            job, ldap_ids, credential, timeout_s
+        )
+        controls += ldap_controls
+        coverage += ldap_coverage
+    if vsphere_ids:
+        vsphere_controls, vsphere_coverage = await _collect_vsphere_controls(
+            job, vsphere_ids, credential, timeout_s
+        )
+        controls += vsphere_controls
+        coverage += vsphere_coverage
+    if mysql_ids:
+        mysql_controls, mysql_coverage = await _collect_mysql_controls(
+            job, mysql_ids, credential, timeout_s
+        )
+        controls += mysql_controls
+        coverage += mysql_coverage
+    if backup_ids:
+        backup_controls, backup_coverage = await _collect_backup_controls(
+            job, backup_ids, credential, timeout_s
+        )
+        controls += backup_controls
+        coverage += backup_coverage
+    if storage_ids:
+        storage_controls, storage_coverage = await _collect_storage_controls(
+            job, storage_ids, credential, timeout_s
+        )
+        controls += storage_controls
+        coverage += storage_coverage
+    if windows_ids:
+        windows_controls, windows_coverage = await _collect_windows_controls(
+            job, windows_ids, credential, timeout_s
+        )
+        controls += windows_controls
+        coverage += windows_coverage
+    if mail_dns_ids:
+        mail_dns_controls, mail_dns_coverage = await _collect_mail_dns_controls(
+            job, mail_dns_ids, credential, timeout_s, max_bytes
+        )
+        controls += mail_dns_controls
+        coverage += mail_dns_coverage
+    return controls, coverage, neighbours
+
+
+async def _collect_mail_dns_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float, max_bytes: int
+) -> tuple[list[dict], list[dict]]:
+    """The mail-domain DNS tier: derive the mail host's domain from its Postfix ``main.cf`` (read over
+    SSH, the same evidence the host tier uses), then resolve that domain's SPF / DMARC TXT records and
+    normalise each requested control. No credential beyond the SSH login that reads the config; the DNS
+    records are public. A host with no Postfix config (no derivable domain), or a read that fails,
+    makes every requested control UNAVAILABLE."""
+    target = job["target_address"]
+    try:
+        main_cf = await ssh_collect.collect_postfix_main_cf(
+            target, credential, timeout=timeout_s, max_bytes=max_bytes
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed read is honest UNAVAILABLE
+        return [], _unavailable_coverage(target, control_ids, f"collect_failed:{type(exc).__name__}")
+    domain = mail_dns.domain_from_postfix(main_cf)
+    if not domain:
+        return [], _unavailable_coverage(target, control_ids, "no_mail_domain_in_config")
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    for control_id in control_ids:
+        try:
+            if control_id == "mail.spf.not_enforced":
+                fields = mail_dns.spf_field(await mail_dns.fetch_spf_txt(domain, timeout=timeout_s))
+            elif control_id == "mail.dmarc.not_enforced":
+                fields = mail_dns.dmarc_field(
+                    await mail_dns.fetch_dmarc_txt(domain, timeout=timeout_s)
+                )
+            elif control_id == "mail.mtasts.not_enforced":
+                published, mode = await mail_dns.fetch_mtasts_posture(domain, timeout=timeout_s)
+                fields = mail_dns.mtasts_field(published, mode)
+            else:
+                fields = None
+        except Exception as exc:  # noqa: BLE001 - a failed resolve is honest UNAVAILABLE
+            coverage += _unavailable_coverage(target, [control_id], f"dns_failed:{type(exc).__name__}")
+            continue
+        _record_control(target, control_id, fields, controls, coverage)
+    return controls, coverage
+
+
+async def _collect_backup_controls(
+    job: dict, control_ids: list[str], credential, timeout_s: float
+) -> tuple[list[dict], list[dict]]:
+    """The backup-repository tier: open an S3/object-lock client to the target object store with the
+    ``s3_login`` reader access key, read each bucket's object-lock + encryption posture, and normalise
+    each requested control. A wrong credential kind (not s3_login), or a failed connect/list, makes
+    every requested control UNAVAILABLE; a control this tier does not support is UNSUPPORTED."""
+    target = job["target_address"]
+    if credential.kind != "s3_login":
+        return [], _unavailable_coverage(
+            target, control_ids, "wrong_credential_kind:expected_s3_login"
+        )
+    try:
+        posture = await backup_collect.fetch_bucket_posture(target, credential, timeout=timeout_s)
+    except Exception as exc:  # noqa: BLE001 - any connect/list failure is honest UNAVAILABLE
+        return [], _unavailable_coverage(
+            target, control_ids, f"collect_failed:{type(exc).__name__}"
+        )
+    controls: list[dict] = []
+    coverage: list[dict] = []
+    for control_id in control_ids:
+        if control_id == "backup.repository.immutable":
+            fields = backup_collect.repository_immutable_field(posture)
+        elif control_id == "backup.data.unencrypted":
+            fields = backup_collect.backup_encrypted_field(posture)
+        else:
+            fields = None
+        _record_control(target, control_id, fields, controls, coverage)
+    return controls, coverage
+
+
+async def _run_assessment_collect(state: AgentState, token: str, task: dict) -> None:
+    """Run one signed credentialed COLLECT job: verify, resolve the LOCAL credential, read the
+    device config read-only, normalise to facts, sign and submit.
+
+    Agent-first: the signed job is verified against the control plane's keys BEFORE any field is
+    read or any session opened. The credential is resolved from the agent's OWN vault (the secret
+    never leaves the box); a reference the vault does not hold yields an honest UNAVAILABLE rather
+    than a failure. The result is signed with the agent's enrolment key."""
+    task_id = task["id"]
+    envelope = (task.get("tool_config") or {}).get("envelope")
+    job = assessment.open_signed_job(
+        envelope,
+        public_keys=state.cp_assessment_public_keys or [],
+        domain=assessment_collect.JOB_DOMAIN,
+        expected_schema=assessment_collect.JOB_SCHEMA,
+    )
+    if job is None:
+        logger.warning("Refused collect job %s: signature/schema verification failed", task_id)
+        await control_plane.task_failed(
+            settings, token, task_id, reason="signed collect job failed verification"
+        )
+        return
+    if not state.signing_key_seed:
+        await control_plane.task_failed(
+            settings, token, task_id, reason="agent has no signing key to sign the result"
+        )
+        return
+    try:
+        control_ids = assessment_collect.require_fields(job)
+    except ValueError as exc:
+        logger.warning("Refused collect job %s: %s", task_id, exc)
+        await control_plane.task_failed(settings, token, task_id, reason=f"malformed job: {exc}")
+        return
+
+    credential = CredentialVault(settings.credential_vault_path).resolve(job["credential_ref"])
+    await control_plane.task_started(settings, token, task_id)
+    try:
+        capture = await pcap_capture.start([job["target_address"]])
+        try:
+            controls, coverage, neighbours = await _collect_controls(
+                job, control_ids, credential
+            )
+        finally:
+            pcap_bytes = (await capture.stop()) if capture is not None else None
+        completed_at = datetime.now(UTC).isoformat()
+        result = assessment_collect.build_collect_result(
+            job, controls=controls, coverage=coverage, neighbours=neighbours,
+            completed_at=completed_at, partial=not controls,
+        )
+        sealed = assessment.seal_result(
+            result,
+            schema=assessment_collect.RESULT_SCHEMA,
+            seed_b64=state.signing_key_seed,
+            domain=assessment_collect.RESULT_DOMAIN,
+            signer_key_id=assessment.public_key_b64_from_seed(state.signing_key_seed),
+        )
+        await control_plane.submit_assessment_result(
+            settings, token, task_id, sealed, completed_at=completed_at
+        )
+        await _upload_assessment_pcap(
+            state, token, task_id, job, pcap_bytes=pcap_bytes, captured_at=completed_at
+        )
+        logger.info(
+            "Assessment collect %s: %d control(s), %d coverage gap(s), %d neighbour(s) on %s",
+            task_id, len(controls), len(coverage), len(neighbours), job["target_address"],
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - report any failure rather than dropping the task
+        logger.error("Assessment collect %s failed: %s", task_id, exc)
+        await control_plane.task_failed(
+            settings, token, task_id, reason=f"{type(exc).__name__}: {exc}"
+        )
+
+
+async def _upload_assessment_pcap(
+    state: AgentState,
+    token: str,
+    task_id: str,
+    job: dict,
+    *,
+    pcap_bytes: bytes | None,
+    captured_at: str,
+) -> None:
+    """Best-effort: seal and upload a captured pcap as a ``packet_capture`` artifact.
+
+    Never raises, so a capture or upload hiccup cannot fail an assessment that already reported its
+    result. Does nothing when capture was disabled or produced no bytes (the common path)."""
+    if not pcap_bytes or not state.signing_key_seed:
+        return
+    try:
+        descriptor = assessment_artifact.build_artifact_descriptor(
+            job,
+            kind=assessment_artifact.KIND_PACKET_CAPTURE,
+            body=pcap_bytes,
+            captured_at=captured_at,
+        )
+        sealed = assessment.seal_result(
+            descriptor,
+            schema=assessment_artifact.ARTIFACT_SCHEMA,
+            seed_b64=state.signing_key_seed,
+            domain=assessment_artifact.ARTIFACT_DOMAIN,
+            signer_key_id=assessment.public_key_b64_from_seed(state.signing_key_seed),
+        )
+        await control_plane.submit_assessment_artifact(
+            settings,
+            token,
+            task_id,
+            descriptor_envelope=sealed,
+            body=pcap_bytes,
+            content_type="application/vnd.tcpdump.pcap",
+        )
+        logger.info(
+            "Assessment collect %s: uploaded a %d-byte agent-origin packet capture",
+            task_id,
+            len(pcap_bytes),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - the pcap is best-effort evidence, never the assessment
+        logger.warning(
+            "Assessment collect %s: pcap upload failed (%s); continuing",
+            task_id,
+            type(exc).__name__,
+        )
+
+
 def _detection_scope() -> str:
     """The settings a stored reachability answer is only good for (see AgentState.detected_scope).
 
@@ -906,6 +2685,22 @@ def _apply_auto_rescan(value: object, *, state: AgentState) -> None:
             "Automatic rescans turned off from the dashboard: keeping the networks already found "
             "and not probing again until they are turned back on."
         )
+
+
+def _apply_cp_assessment_keys(value: object, *, state: AgentState) -> None:
+    """Store the control plane's assessment signing public keys, as a register/heartbeat reported.
+
+    Only a list of strings counts. A response without the field (a control plane older than it)
+    changes nothing, so the agent keeps verifying against the last set it was told, and a key
+    rotation that reaches the fleet on the next beat replaces the set. Persisted with the identity
+    so a restart can verify a job before its first successful beat.
+    """
+    if not isinstance(value, list) or not all(isinstance(k, str) for k in value):
+        return
+    if value == state.cp_assessment_public_keys:
+        return
+    state.cp_assessment_public_keys = value
+    _persist(state)
 
 
 def _publish_reachable(networks: list[str], tunnel: TunnelManager | None) -> None:
@@ -1007,14 +2802,14 @@ async def _redetect_loop(state: AgentState, tunnel: TunnelManager | None = None)
         await asyncio.sleep(tick if delay is None else min(delay, tick))
 
 
-async def _work_through(token: str, tasks: list[dict]) -> None:
+async def _work_through(state: AgentState, token: str, tasks: list[dict]) -> None:
     """Run a polled batch in order. A poll claims several tasks at once, so a pause can land with
     some not yet started: those go straight back rather than sitting out their lease."""
     for task in tasks:
         if _paused.is_set():
             await _hand_back(token, task["id"])
             continue
-        await _run_task(token, task)
+        await _run_task(token, task, state=state)
 
 
 async def _poll_loop(state: AgentState) -> None:
@@ -1028,7 +2823,7 @@ async def _poll_loop(state: AgentState) -> None:
                     logger.info("Task polling recovered after %d failed attempt(s).", failures)
                     failures = 0
                 _record_contact()  # a successful poll is also live contact with Ares
-                await _work_through(state.agent_token or "", tasks)
+                await _work_through(state, state.agent_token or "", tasks)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - keep polling through any transient error

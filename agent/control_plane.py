@@ -7,6 +7,7 @@ unless ``ARES_INSECURE`` is set (local dev against plain http / self-signed).
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import socket
@@ -35,6 +36,12 @@ CAPABILITIES = [
     # off, stop re-probing reachability and reuse the stored answer across restarts. ares reads its
     # absence as "this build still re-probes on its own" and says so next to the setting.
     "auto_rescan",
+    # the signed Network Assessment protocol (discover + credentialed collect). The agent ships the
+    # handlers for network_assessment_discover_v1 / network_assessment_collect_v1 (see
+    # main._HANDLED_TASK_TYPES), and the control plane will only dispatch either task type to an agent
+    # that advertised this. Collect needs a provisioned local vault; without a matching credential_ref
+    # it reports honest UNAVAILABLE coverage rather than guessing, so advertising this is always safe.
+    "network_assessment",
 ]
 # read Services, EndpointSlices and workloads from a cluster API. Reported only when the operator
 # turned it on, unlike the list above, which is what the build can do. The distinction is the
@@ -79,7 +86,9 @@ def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-async def register(settings: Settings, *, networks: list[str], name: str) -> dict:
+async def register(
+    settings: Settings, *, networks: list[str], name: str, signing_public_key: str | None = None
+) -> dict:
     body = {
         "registration_token": settings.token.get_secret_value(),
         "internal_networks": networks,
@@ -87,6 +96,7 @@ async def register(settings: Settings, *, networks: list[str], name: str) -> dic
         "hostname": socket.gethostname(),
         "agent_version": settings.agent_version,
         "capabilities": capabilities(settings),
+        "signing_public_key": signing_public_key,
         "system_info": system_info(),
     }
     async with _client(settings) as client:
@@ -202,6 +212,110 @@ async def task_completed(
         resp = await client.post(
             f"/api/v1/agent/tasks/{task_id}/complete",
             json=body,
+            headers=_auth(token),
+        )
+    resp.raise_for_status()
+
+
+async def submit_assessment_result(
+    settings: Settings,
+    token: str,
+    task_id: str,
+    envelope: dict,
+    *,
+    completed_at: str | None = None,
+) -> None:
+    """Submit a signed Network Assessment discovery result: the sealed ``SignedEnvelope``.
+
+    The control plane verifies the signature against the agent's REGISTERED public key and binds the
+    result to the frozen snapshot before persisting, so a tamper in transit is refused there. The
+    agent only delivers; a non-2xx is raised so the task loop reports the failure."""
+    body: dict[str, object] = {"envelope": envelope}
+    if completed_at is not None:
+        body["completed_at"] = completed_at
+    async with _client(settings) as client:
+        resp = await client.post(
+            f"/api/v1/agent/tasks/{task_id}/assessment-result",
+            json=body,
+            headers=_auth(token),
+        )
+    resp.raise_for_status()
+
+
+async def submit_validation_result(
+    settings: Settings,
+    token: str,
+    task_id: str,
+    *,
+    result: dict,
+    completed_at: str | None = None,
+) -> None:
+    """Submit a signed Controlled Validation result for a controlled-validation task.
+
+    ``result`` is the agent-sealed ``ValidationResult`` (inline ``result_signature``). The control
+    plane verifies that signature against the agent's REGISTERED result key, binds the result to the
+    plan it dispatched, and seals a receipt; the agent only delivers, and a non-2xx is raised so the
+    task loop reports the failure."""
+    body: dict[str, object] = {"result": result}
+    if completed_at is not None:
+        body["completed_at"] = completed_at
+    async with _client(settings) as client:
+        resp = await client.post(
+            f"/api/v1/agent/tasks/{task_id}/validation-result",
+            json=body,
+            headers=_auth(token),
+        )
+    resp.raise_for_status()
+
+
+async def submit_pentest_result(
+    settings: Settings,
+    token: str,
+    task_id: str,
+    *,
+    result: dict,
+    completed_at: str | None = None,
+) -> None:
+    """Submit a signed pentest technique result for a pentest-technique task.
+
+    ``result`` is the agent-sealed ``PentestTechniqueResult`` (inline ``result_signature``). The
+    control plane verifies that signature against the agent's REGISTERED result key, binds the result
+    to the plan it dispatched (and its embedded signed approval), and records it; the agent only
+    delivers, and a non-2xx is raised so the task loop reports the failure."""
+    body: dict[str, object] = {"result": result}
+    if completed_at is not None:
+        body["completed_at"] = completed_at
+    async with _client(settings) as client:
+        resp = await client.post(
+            f"/api/v1/agent/tasks/{task_id}/pentest-result",
+            json=body,
+            headers=_auth(token),
+        )
+    resp.raise_for_status()
+
+
+async def submit_assessment_artifact(
+    settings: Settings,
+    token: str,
+    task_id: str,
+    *,
+    descriptor_envelope: dict,
+    body: bytes,
+    content_type: str = "application/octet-stream",
+    filename: str = "artifact.bin",
+) -> None:
+    """Upload one signed raw-evidence artifact (e.g. a packet capture) for a task, as multipart.
+
+    ``body`` is the raw bytes (the ``file`` part); ``descriptor_envelope`` is the agent-sealed
+    ``SignedEnvelope`` over an artifact descriptor (the ``descriptor`` part, as JSON). The control
+    plane verifies the signature against the agent's registered key, checks the bytes hash to the
+    sealed ``content_sha256`` and match ``byte_size``, and binds them to the frozen snapshot before
+    storing; the agent only delivers, and a non-2xx is raised so the caller can report it."""
+    async with _client(settings) as client:
+        resp = await client.post(
+            f"/api/v1/agent/tasks/{task_id}/assessment-artifact",
+            data={"descriptor": json.dumps(descriptor_envelope)},
+            files={"file": (filename, body, content_type)},
             headers=_auth(token),
         )
     resp.raise_for_status()
