@@ -35,6 +35,10 @@ CAPABILITIES = [
     # off, stop re-probing reachability and reuse the stored answer across restarts. ares reads its
     # absence as "this build still re-probes on its own" and says so next to the setting.
     "auto_rescan",
+    # reach a local BYOM model through the tunnel: dial only the exact model
+    # host and port ares pushes for a live hunt, re-vetted against this agent's
+    # registered networks before every dial (3.16.0, ARES-2424).
+    "llm_probe",
 ]
 # read Services, EndpointSlices and workloads from a cluster API. Reported only when the operator
 # turned it on, unlike the list above, which is what the build can do. The distinction is the
